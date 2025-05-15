@@ -74,37 +74,43 @@ def _speculator_patched_attention_forward_method(
     return attention_output, None 
 
 class SpeculativePrefillPipeline:
-    def __init__(self, base_model_name: str, speculator_model_name: str,
-                 attn_implementation: str = "eager", 
+    def __init__(self, base_model_name: str, speculator_model_name: Optional[str],
                  share_kv_cache: bool = False):
         self.base_model_name = base_model_name
         self.speculator_model_name = speculator_model_name
-        self.spec_attn_impl_f = "eager" 
-        self.base_attn_impl = attn_implementation
         self.share_kv_cache = share_kv_cache
         
         self.base_config = AutoConfig.from_pretrained(self.base_model_name, trust_remote_code=True)
         self.tokenizer = self._load_tokenizer()
         
-        spec_config = self.base_config if self.speculator_model_name == self.base_model_name else \
-                      AutoConfig.from_pretrained(self.speculator_model_name, trust_remote_code=True)
-        self.speculator_model = self._load_model_with_config(self.speculator_model_name, self.spec_attn_impl_f, spec_config)
-        
-        self.device = self.speculator_model.device
-        self.dtype = self.speculator_model.dtype
-        
-        if self.base_model_name == self.speculator_model_name and self.base_attn_impl == self.spec_attn_impl_f:
-            self.base_model = self.speculator_model
-        else:
-            self.base_model = self._load_model_with_config(self.base_model_name, self.base_attn_impl, self.base_config)
+        self.speculator_model: Optional[AutoModelForCausalLM] = None
+        self.device: Optional[torch.device] = None # type: ignore
+        self.dtype: Optional[torch.dtype] = None # type: ignore
 
-        if self.share_kv_cache: self._check_model_compatibility()
+        if self.speculator_model_name is not None:
+            spec_config_name = self.speculator_model_name
+            spec_config = self.base_config if spec_config_name == self.base_model_name else \
+                          AutoConfig.from_pretrained(spec_config_name, trust_remote_code=True)
+            self.speculator_model = self._load_model_with_config(spec_config_name, "eager", spec_config)
+            self.device = self.speculator_model.device
+            self.dtype = self.speculator_model.dtype
+        
+        self.base_model = self._load_model_with_config(self.base_model_name, None, self.base_config)
+
+        if self.device is None: 
+            self.device = self.base_model.device
+            self.dtype = self.base_model.dtype
+            
+        if self.share_kv_cache and self.speculator_model is not None: 
+            self._check_model_compatibility()
         
         self.captured_qs: List[List[torch.Tensor]] = []
         self.orig_spec_fwds: Dict[int, Any] = {}
         self.is_generating_lookaheads = False
 
     def _check_model_compatibility(self):
+        if self.speculator_model is None: return 
+
         scfg = self.speculator_model.config; bcfg = self.base_model.config
         compatible = (scfg.num_hidden_layers == bcfg.num_hidden_layers and
                       scfg.hidden_size == bcfg.hidden_size and
@@ -124,24 +130,35 @@ class SpeculativePrefillPipeline:
         elif isinstance(eos_id_val, list):
             self.eos_token_ids = list(eos_id_val) 
         elif eos_id_val is None: 
-            self.eos_token_ids = []
+            self.eos_token_ids = [] 
         else: 
-            self.eos_token_ids = []
+            self.eos_token_ids = [] 
             
         return tok
 
-    def _load_model_with_config(self, model_name: str, attn_impl: str, config_obj: AutoConfig):
-        model = AutoModelForCausalLM.from_pretrained(
-            model_name, torch_dtype="auto", config=config_obj, trust_remote_code=True, # type: ignore
-            device_map="auto", attn_implementation=attn_impl)
-        return model.eval()
+    def _load_model_with_config(self, model_name: str, attn_impl: Optional[str], config_obj: AutoConfig) -> AutoModelForCausalLM:
+        load_kwargs: Dict[str, Any] = {
+            "torch_dtype": "auto",
+            "config": config_obj,
+            "trust_remote_code": True,
+            "device_map": "auto"
+        }
+        if attn_impl is not None:
+            load_kwargs["attn_implementation"] = attn_impl
+        
+        model = AutoModelForCausalLM.from_pretrained(model_name, **load_kwargs) # type: ignore
+        return model.eval() # type: ignore
 
     def _patch_speculator(self):
+        if self.speculator_model is None: return 0
+        if not hasattr(self.speculator_model, 'model') or not hasattr(self.speculator_model.model, 'layers'): # type: ignore
+            return 0
+
         num_layers = self.speculator_model.config.num_hidden_layers
         self.captured_qs = [[] for _ in range(num_layers)]
         num_patched_layers = 0
-        for i, layer in enumerate(self.speculator_model.model.layers):
-            if isinstance(layer.self_attn, LlamaAttention):
+        for i, layer in enumerate(self.speculator_model.model.layers): # type: ignore
+            if hasattr(layer, 'self_attn') and isinstance(layer.self_attn, LlamaAttention):
                 attention_module = layer.self_attn
                 if i not in self.orig_spec_fwds: self.orig_spec_fwds[i] = attention_module.forward
                 
@@ -156,40 +173,59 @@ class SpeculativePrefillPipeline:
         timing_info: Dict[str, float] = {}
         overall_start_time = time.perf_counter()
 
-        num_patched_layers = self._patch_speculator()
-        max_prompt_len_calculated = self.speculator_model.config.max_position_embeddings - max_generation_length - look_ahead_k - 20
-        max_prompt_length = max(1, max_prompt_len_calculated) 
+        num_patched_layers = 0
+        if self.speculator_model is not None:
+            num_patched_layers = self._patch_speculator()
+
+        limit_due_to_base = self.base_model.config.max_position_embeddings - max_generation_length
+        max_prompt_len_calculated: float
+        if self.speculator_model is not None:
+            limit_due_to_speculator = self.speculator_model.config.max_position_embeddings - look_ahead_k
+            max_prompt_len_calculated = float(min(limit_due_to_base, limit_due_to_speculator) - 20)
+        else:
+            max_prompt_len_calculated = float(limit_due_to_base - 20)
+        max_prompt_length = max(1, int(max_prompt_len_calculated))
         
-        # Tokenization now happens on the string input to `run`
         inputs = self.tokenizer(prompt_text, return_tensors="pt", padding=False, truncation=True, max_length=max_prompt_length).to(self.device)
         prompt_input_ids, prompt_length, batch_size = inputs.input_ids, inputs.input_ids.shape[1], inputs.input_ids.shape[0]
 
         if prompt_length == 0: 
-            timing_info["total_run_time"] = time.perf_counter() - overall_start_time
+            timing_info["total_time"] = time.perf_counter() - overall_start_time
             return "", timing_info
 
-        stage_start_time = time.perf_counter()
-        self.is_generating_lookaheads = False
-        speculator_prompt_cache_position = torch.arange(prompt_length, device=self.device)
-        with torch.no_grad():
-            speculator_prefill_output = self.speculator_model(input_ids=prompt_input_ids, use_cache=True, cache_position=speculator_prompt_cache_position)
+        speculator_prefill_cache: Optional[Cache] = None
+        speculator_prefill_cache_as_tuple: Optional[Tuple[Tuple[torch.Tensor, torch.Tensor], ...]] = None
+        speculator_next_token_ids: Optional[torch.Tensor] = None
         
-        speculator_prefill_cache: Cache = speculator_prefill_output.past_key_values # type: ignore 
-        speculator_prefill_cache_as_tuple = speculator_prefill_cache.to_legacy_cache()
+        speculation_prefill_time = 0.0
+        if self.speculator_model is not None:
+            stage_start_time = time.perf_counter()
+            self.is_generating_lookaheads = False 
+            speculator_prompt_cache_position = torch.arange(prompt_length, device=self.device)
+            with torch.no_grad():
+                speculator_prefill_output = self.speculator_model(input_ids=prompt_input_ids, use_cache=True, cache_position=speculator_prompt_cache_position)
+            
+            speculator_prefill_cache = speculator_prefill_output.past_key_values # type: ignore 
+            if speculator_prefill_cache is not None: 
+                 speculator_prefill_cache_as_tuple = speculator_prefill_cache.to_legacy_cache()
 
-        speculator_next_token_ids = torch.argmax(speculator_prefill_output.logits[:, -1, :], dim=-1, keepdim=True)
-        for q_list in self.captured_qs: q_list.clear()
-        timing_info["speculation_prefill"] = time.perf_counter() - stage_start_time
+            speculator_next_token_ids = torch.argmax(speculator_prefill_output.logits[:, -1, :], dim=-1, keepdim=True)
+            if num_patched_layers > 0: 
+                for q_list in self.captured_qs: q_list.clear()
+            speculation_prefill_time = time.perf_counter() - stage_start_time
+        timing_info["speculation_prefill"] = speculation_prefill_time
 
-        stage_start_time = time.perf_counter()
         generated_speculator_ids = []
-        current_speculator_cache: Cache = speculator_prefill_cache
-        
-        if num_patched_layers > 0 and look_ahead_k > 0:
+        current_speculator_cache: Optional[Cache] = speculator_prefill_cache
+        speculation_decode_time = 0.0
+
+        if self.speculator_model is not None and num_patched_layers > 0 and look_ahead_k > 0 and \
+           speculator_next_token_ids is not None and current_speculator_cache is not None:
+            stage_start_time = time.perf_counter()
             self.is_generating_lookaheads = True
             current_speculator_token_ids, current_speculator_position = speculator_next_token_ids, prompt_length
             for _ in range(look_ahead_k):
-                current_cache_len = current_speculator_cache.get_seq_length(0)
+                current_cache_len = current_speculator_cache.get_seq_length(0) # type: ignore
                 lookahead_cache_position = torch.tensor([current_cache_len], device=self.device, dtype=torch.long)
                 lookahead_position_ids = torch.tensor([[current_speculator_position]], device=self.device, dtype=torch.long)
 
@@ -202,43 +238,60 @@ class SpeculativePrefillPipeline:
                 generated_speculator_ids.append(token_id); current_speculator_position += 1
                 if token_id in self.eos_token_ids: break
             self.is_generating_lookaheads = False
-        timing_info["speculation_decode"] = time.perf_counter() - stage_start_time
+            speculation_decode_time = time.perf_counter() - stage_start_time
+        timing_info["speculation_decode"] = speculation_decode_time
         
-        stage_start_time = time.perf_counter()
         importance_scores = torch.zeros(batch_size, prompt_length, device=self.device, dtype=self.dtype)
         num_lookahead_steps = len(generated_speculator_ids)
         
-        if num_lookahead_steps > 0 and num_patched_layers > 0:
-            example_attn_layer = self.speculator_model.model.layers[0].self_attn 
-            head_dim = example_attn_layer.head_dim
-            num_kv_groups = example_attn_layer.num_key_value_groups 
-            for layer_idx in range(self.speculator_model.config.num_hidden_layers):
-                key_layer_prompt = speculator_prefill_cache_as_tuple[layer_idx][0].detach()
-                key_layer_prompt_repeated = hf_repeat_kv(key_layer_prompt, num_kv_groups)
-                for spec_idx in range(num_lookahead_steps):
-                    query_speculator_lookahead = self.captured_qs[layer_idx][spec_idx]
-                    logits = torch.matmul(query_speculator_lookahead, key_layer_prompt_repeated.transpose(-1, -2)) / math.sqrt(head_dim)
-                    importance_scores += logits.sum(dim=1).squeeze(dim=1) 
+        if self.speculator_model is not None and num_lookahead_steps > 0 and num_patched_layers > 0 and \
+           speculator_prefill_cache_as_tuple is not None and hasattr(self.speculator_model.model, 'layers'): # type: ignore
+            example_attn_layer_obj = self.speculator_model.model.layers[0].self_attn # type: ignore
+            if isinstance(example_attn_layer_obj, LlamaAttention): 
+                head_dim = example_attn_layer_obj.head_dim
+                num_kv_groups = example_attn_layer_obj.num_key_value_groups 
+                for layer_idx in range(self.speculator_model.config.num_hidden_layers):
+                    key_layer_prompt = speculator_prefill_cache_as_tuple[layer_idx][0].detach()
+                    key_layer_prompt_repeated = hf_repeat_kv(key_layer_prompt, num_kv_groups)
+                    for spec_idx in range(num_lookahead_steps):
+                        if spec_idx < len(self.captured_qs[layer_idx]): 
+                            query_speculator_lookahead = self.captured_qs[layer_idx][spec_idx]
+                            logits = torch.matmul(query_speculator_lookahead, key_layer_prompt_repeated.transpose(-1, -2)) / math.sqrt(head_dim)
+                            importance_scores += logits.sum(dim=1).squeeze(dim=1) 
 
-        num_tokens_to_keep_from_prompt = max(1, math.ceil(prompt_length * prompt_keep_percentage))
-        num_top_k_to_select = min(num_tokens_to_keep_from_prompt, prompt_length)
-        
-        if num_top_k_to_select > 0 :
-             _, top_k_indices = torch.topk(importance_scores[0], k=num_top_k_to_select)
-             sorted_top_k_indices = torch.sort(top_k_indices)[0]
-        else: 
+        sorted_top_k_indices: torch.Tensor
+        if self.speculator_model is not None and num_lookahead_steps > 0 and num_patched_layers > 0:
+            num_tokens_to_keep_from_prompt = max(1, math.ceil(prompt_length * prompt_keep_percentage))
+            num_top_k_to_select = min(int(num_tokens_to_keep_from_prompt), prompt_length)
+            
+            if num_top_k_to_select > 0 and importance_scores.sum().item() != 0: 
+                 _, top_k_indices = torch.topk(importance_scores[0], k=num_top_k_to_select)
+                 sorted_top_k_indices = torch.sort(top_k_indices)[0]
+            else: 
+                sorted_top_k_indices = torch.empty(0, dtype=torch.long, device=self.device)
+        else:
             sorted_top_k_indices = torch.empty(0, dtype=torch.long, device=self.device)
 
-        base_model_cache_after_prefill: Cache 
+        base_model_first_token_gen_start_time = time.perf_counter()
+        base_model_cache_after_prefill: Optional[Cache] = None
+        base_model_next_token_ids: Optional[torch.Tensor] = None
 
-        if self.share_kv_cache:
+        if self.speculator_model is None: 
+            base_prefill_cache_position = torch.arange(prompt_length, device=self.device)
+            with torch.no_grad():
+                base_prefill_output = self.base_model(input_ids=prompt_input_ids, use_cache=True, cache_position=base_prefill_cache_position)
+            base_model_next_token_ids = torch.argmax(base_prefill_output.logits[:, -1, :], dim=-1, keepdim=True)
+            base_model_cache_after_prefill = base_prefill_output.past_key_values # type: ignore
+        
+        elif self.share_kv_cache: 
             pruned_kv_cache = DynamicCache()
             n_pruned_tokens_for_cache = 0
-            if len(sorted_top_k_indices) > 0:
+            if len(sorted_top_k_indices) > 0 and speculator_prefill_cache is not None:
                 for layer_idx in range(self.base_model.config.num_hidden_layers): 
-                    pruned_key = speculator_prefill_cache.key_cache[layer_idx][:, :, sorted_top_k_indices, :]
-                    pruned_value = speculator_prefill_cache.value_cache[layer_idx][:, :, sorted_top_k_indices, :]
-                    pruned_kv_cache.update(pruned_key, pruned_value, layer_idx)
+                    if hasattr(speculator_prefill_cache, 'key_cache') and hasattr(speculator_prefill_cache, 'value_cache'):
+                        pruned_key = speculator_prefill_cache.key_cache[layer_idx][:, :, sorted_top_k_indices, :] # type: ignore
+                        pruned_value = speculator_prefill_cache.value_cache[layer_idx][:, :, sorted_top_k_indices, :] # type: ignore
+                        pruned_kv_cache.update(pruned_key, pruned_value, layer_idx)
                 n_pruned_tokens_for_cache = len(sorted_top_k_indices)
             
             knockout_token_ids, knockout_position_ids = prompt_input_ids[:, -1:], torch.tensor([[prompt_length - 1]], device=self.device, dtype=torch.long)
@@ -258,69 +311,78 @@ class SpeculativePrefillPipeline:
                 base_model_next_token_ids = torch.argmax(selective_prefill_output.logits[:, -1, :], dim=-1, keepdim=True)
                 base_model_cache_after_prefill = selective_prefill_output.past_key_values # type: ignore
             else: 
-                fallback_token_ids, fallback_position_ids = prompt_input_ids[:, -1:], torch.tensor([[prompt_length-1]], device=self.device, dtype=torch.long)
-                fallback_cache_position = torch.tensor([0], device=self.device, dtype=torch.long)
-                with torch.no_grad():
-                     fallback_output = self.base_model(fallback_token_ids, position_ids=fallback_position_ids, past_key_values=selective_prefill_cache, use_cache=True, cache_position=fallback_cache_position)
-                base_model_next_token_ids = torch.argmax(fallback_output.logits[:, -1, :], dim=-1, keepdim=True)
-                base_model_cache_after_prefill = fallback_output.past_key_values # type: ignore
-        
-        timing_info["base_prefill"] = time.perf_counter() - stage_start_time
+                 base_prefill_cache_position = torch.arange(prompt_length, device=self.device)
+                 with torch.no_grad():
+                     base_prefill_output = self.base_model(input_ids=prompt_input_ids, use_cache=True, cache_position=base_prefill_cache_position, past_key_values=selective_prefill_cache) 
+                 base_model_next_token_ids = torch.argmax(base_prefill_output.logits[:, -1, :], dim=-1, keepdim=True)
+                 base_model_cache_after_prefill = base_prefill_output.past_key_values # type: ignore
 
-        stage_start_time = time.perf_counter()
-        first_generated_token_id = base_model_next_token_ids.item(); generated_token_ids = [first_generated_token_id]
+        base_model_first_token_gen_time = time.perf_counter() - base_model_first_token_gen_start_time
+        timing_info["base_ttft"] = speculation_prefill_time + speculation_decode_time + base_model_first_token_gen_time
         
-        current_decode_token_ids = base_model_next_token_ids
-        current_decode_cache: Cache = base_model_cache_after_prefill
+        generated_token_ids: List[int] = []
+        final_generated_text = ""
         
-        current_real_position = prompt_length 
-        current_cache_write_position = current_decode_cache.get_seq_length(0)
+        if base_model_next_token_ids is not None and base_model_cache_after_prefill is not None:
+            first_generated_token_id = base_model_next_token_ids.item(); generated_token_ids.append(first_generated_token_id)
+            
+            current_decode_token_ids = base_model_next_token_ids
+            current_decode_cache: Cache = base_model_cache_after_prefill
+            
+            current_real_position = prompt_length 
+            current_cache_write_position = current_decode_cache.get_seq_length(0)
 
-        if first_generated_token_id not in self.eos_token_ids:
-            for _ in range(max_generation_length - 1):
-                decode_position_ids = torch.tensor([[current_real_position]], device=self.device, dtype=torch.long)
-                decode_cache_position = torch.tensor([current_cache_write_position], device=self.device, dtype=torch.long)
-                with torch.no_grad():
-                    decode_output = self.base_model(current_decode_token_ids, position_ids=decode_position_ids, past_key_values=current_decode_cache, use_cache=True, cache_position=decode_cache_position)
-                next_base_token_ids = torch.argmax(decode_output.logits[:, -1, :], dim=-1, keepdim=True)
-                next_base_token_id = next_base_token_ids.item()
-                generated_token_ids.append(next_base_token_id)
-                
-                current_decode_token_ids = next_base_token_ids
-                current_decode_cache = decode_output.past_key_values # type: ignore
-                
-                current_real_position += 1
-                current_cache_write_position +=1 
-                
-                if next_base_token_id in self.eos_token_ids: break
+            if first_generated_token_id not in self.eos_token_ids:
+                for _ in range(max_generation_length - 1):
+                    decode_position_ids = torch.tensor([[current_real_position]], device=self.device, dtype=torch.long)
+                    decode_cache_position = torch.tensor([current_cache_write_position], device=self.device, dtype=torch.long)
+                    with torch.no_grad():
+                        decode_output = self.base_model(current_decode_token_ids, position_ids=decode_position_ids, past_key_values=current_decode_cache, use_cache=True, cache_position=decode_cache_position)
+                    next_base_token_ids = torch.argmax(decode_output.logits[:, -1, :], dim=-1, keepdim=True)
+                    next_base_token_id = next_base_token_ids.item()
+                    generated_token_ids.append(next_base_token_id)
+                    
+                    current_decode_token_ids = next_base_token_ids
+                    current_decode_cache = decode_output.past_key_values # type: ignore
+                    
+                    current_real_position += 1
+                    current_cache_write_position +=1 
+                    
+                    if next_base_token_id in self.eos_token_ids: break
+            
+            final_generated_text = self.tokenizer.decode(generated_token_ids, skip_special_tokens=True)
+            
+        timing_info["total_time"] = time.perf_counter() - overall_start_time
         
-        final_generated_text = self.tokenizer.decode(generated_token_ids, skip_special_tokens=True)
-        timing_info["base_decode"] = time.perf_counter() - stage_start_time
-        timing_info["total_run_time"] = time.perf_counter() - overall_start_time
-        return final_generated_text, timing_info
+        # Final cleanup of timing_info for reporting
+        reported_timing_info = {
+            "speculation_prefill": timing_info["speculation_prefill"],
+            "speculation_decode": timing_info["speculation_decode"],
+            "base_ttft": timing_info["base_ttft"],
+            "total_time": timing_info["total_time"]
+        }
+        return final_generated_text, reported_timing_info
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Speculative Prefill Pipeline")
     parser.add_argument("--base_model_name", type=str, default="meta-llama/Llama-3.2-1B-Instruct")
-    parser.add_argument("--speculator_model_name", type=str, default="meta-llama/Llama-3.2-1B-Instruct")
+    parser.add_argument("--speculator_model_name", type=str, default=None, help="Path to speculator model. If None, speculative part is skipped.")
     parser.add_argument("--dataset_name", type=str, default="hotpotqa") 
     parser.add_argument("--look_ahead_k", type=int, default=1)
     parser.add_argument("--prompt_keep_percentage", type=float, default=0.2)
     parser.add_argument("--max_generation_length", type=int, default=32)
-    parser.add_argument("--base_attn_implementation", type=str, default="eager", choices=["eager", "sdpa", "flash_attention_2"])
     parser.add_argument("--share_kv_cache", action="store_true", default=False)
     args = parser.parse_args()
 
     pipeline = SpeculativePrefillPipeline(
-        base_model_name=args.base_model_name, speculator_model_name=args.speculator_model_name,
-        attn_implementation=args.base_attn_implementation, 
+        base_model_name=args.base_model_name, 
+        speculator_model_name=args.speculator_model_name,
         share_kv_cache=args.share_kv_cache)
 
     prompt_to_run_str: str
     if args.dataset_name:
         dataset = load_dataset('THUDM/LongBench', args.dataset_name, split='test') # type: ignore
-        sample = dataset[0]
-        # Construct a messages list for chat template
+        sample = dataset[0] # type: ignore
         messages = [
             {"role": "user", "content": f"Context: {sample.get('context', '')}\nQuestion: {sample.get('input', '')}\nAnswer:"} # type: ignore
         ]
