@@ -138,7 +138,7 @@ class SpeculativePrefillPipeline:
 
     def _load_model_with_config(self, model_name: str, attn_impl: Optional[str], config_obj: AutoConfig) -> AutoModelForCausalLM:
         load_kwargs: Dict[str, Any] = {
-            "torch_dtype": "auto",
+            "torch_dtype": "float16",
             "config": config_obj,
             "trust_remote_code": True,
             "device_map": "auto"
