@@ -658,6 +658,7 @@ class SpeculativePrefillPipeline:
         
         base_model_first_token_gen_time = time.perf_counter() - base_model_first_token_gen_start_time
         
+        timing_info["base_prefill"] = base_model_first_token_gen_time
         if self.speculator_model is not None:
             timing_info["base_ttft"] = speculation_prefill_time + speculation_decode_time + base_model_first_token_gen_time
         else:
