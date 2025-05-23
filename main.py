@@ -23,12 +23,71 @@ sys.path.append(os.path.join(os.path.dirname(__file__), 'qtip'))
 try:
     from lib.linear import QuantizedLinear
     from lib.utils.unsafe_import import model_from_hf_path as qtip_model_from_hf_path
+    from model.llama import LlamaAttention as QTIP_LlamaAttention
     QTIP_AVAILABLE = True
 except ImportError:
     QTIP_AVAILABLE = False
     print("Warning: QTIP modules not found. QTIP model support disabled.")
 
-def _universal_patched_attention_forward_method(
+def _hf_patched_attention_forward_method(
+    self_attn: LlamaAttention,
+    pipeline_instance: 'SpeculativePrefillPipeline',
+    hidden_states: torch.Tensor,
+    attention_mask: Optional[torch.Tensor] = None,
+    position_ids: Optional[torch.LongTensor] = None,
+    past_key_value: Optional[Cache] = None,
+    output_attentions: bool = False,
+    use_cache: bool = False,
+    cache_position: Optional[torch.LongTensor] = None,
+    position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    **kwargs
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+
+    batch_size, query_length, _ = hidden_states.size()
+
+    query_projection = self_attn.q_proj(hidden_states)
+    key_projection = self_attn.k_proj(hidden_states)
+    value_projection = self_attn.v_proj(hidden_states)
+
+    query_states = query_projection.view(batch_size, query_length, self_attn.config.num_attention_heads, self_attn.head_dim).transpose(1, 2)
+    key_states_before_rope = key_projection.view(batch_size, query_length, self_attn.config.num_key_value_heads, self_attn.head_dim).transpose(1, 2)
+    value_states_for_cache = value_projection.view(batch_size, query_length, self_attn.config.num_key_value_heads, self_attn.head_dim).transpose(1, 2)
+
+    cos, sin = position_embeddings # type: ignore
+
+    query_states_rotated, key_states_rotated = hf_apply_rotary_pos_emb(query_states, key_states_before_rope, cos, sin)
+
+    if pipeline_instance.is_generating_lookaheads:
+        pipeline_instance.captured_qs[self_attn.layer_idx].append(query_states_rotated.detach().clone())
+
+    if use_cache:
+        cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+        key_states_for_sdpa, value_states_for_sdpa = past_key_value.update(key_states_rotated, value_states_for_cache, self_attn.layer_idx, cache_kwargs) # type: ignore
+    else:
+        key_states_for_sdpa, value_states_for_sdpa = key_states_rotated, value_states_for_cache
+
+    key_states_for_sdpa = hf_repeat_kv(key_states_for_sdpa, self_attn.num_key_value_groups)
+    value_states_for_sdpa = hf_repeat_kv(value_states_for_sdpa, self_attn.num_key_value_groups)
+
+    attn_mask_input = attention_mask
+    is_sdpa_causal = (query_length > 1) and (attn_mask_input is None)
+
+    if attn_mask_input is not None:
+        is_sdpa_causal = False
+        actual_kv_sequence_length = key_states_for_sdpa.shape[-2]
+        if attn_mask_input.shape[-1] > actual_kv_sequence_length:
+            attn_mask_input = attn_mask_input[:, :, :, :actual_kv_sequence_length]
+
+    attention_output = F.scaled_dot_product_attention(
+        query_states_rotated, key_states_for_sdpa, value_states_for_sdpa, attn_mask=attn_mask_input, dropout_p=0.0, is_causal=is_sdpa_causal, **kwargs
+    )
+
+    attention_output = attention_output.transpose(1, 2).contiguous().reshape(batch_size, query_length, self_attn.o_proj.in_features)
+    attention_output = self_attn.o_proj(attention_output)
+
+    return attention_output, None
+
+def _qtip_patched_attention_forward_method(
     self_attn: LlamaAttention,
     pipeline_instance: 'SpeculativePrefillPipeline',
     hidden_states: torch.Tensor,
@@ -117,7 +176,7 @@ def _universal_patched_attention_forward_method(
     # Output projection - works with both Linear and QuantizedLinear
     attention_output = self_attn.o_proj(attention_output)
     
-    return attention_output, None
+    return attention_output, None, past_key_value
 
 
 class SpeculativePrefillPipeline:
@@ -175,7 +234,7 @@ class SpeculativePrefillPipeline:
         
         if is_qtip_model:
             print(f"Loading QTIP model: {model_name}")
-            model, _ = qtip_model_from_hf_path(model_name, max_mem_ratio=0.7)
+            model, _ = qtip_model_from_hf_path(model_name, max_mem_ratio=0.7, attn_implementation="eager")
             return model.eval()
         else:
             print(f"Loading standard HF model: {model_name}")
@@ -294,7 +353,20 @@ class SpeculativePrefillPipeline:
                 
                 # Apply universal patch that works with both Linear and QuantizedLinear
                 partially_applied_func = partial(
-                    _universal_patched_attention_forward_method, 
+                    _hf_patched_attention_forward_method, 
+                    pipeline_instance=self
+                )
+                attention_module.forward = types.MethodType(partially_applied_func, attention_module)
+                num_patched_layers += 1
+            elif QTIP_AVAILABLE and isinstance(layer.self_attn, QTIP_LlamaAttention):
+
+                # QTIP model - patch with QTIP-specific method
+                attention_module = layer.self_attn
+                if i not in self.orig_spec_fwds:
+                    self.orig_spec_fwds[i] = attention_module.forward
+                
+                partially_applied_func = partial(
+                    _qtip_patched_attention_forward_method, 
                     pipeline_instance=self
                 )
                 attention_module.forward = types.MethodType(partially_applied_func, attention_module)
@@ -365,6 +437,7 @@ class SpeculativePrefillPipeline:
                     speculator_prefill_cache_as_tuple = speculator_prefill_cache.to_legacy_cache()
                 else:
                     speculator_prefill_cache_as_tuple = speculator_prefill_cache
+                    speculator_prefill_cache = DynamicCache(speculator_prefill_cache)
             
             speculator_next_token_ids = torch.argmax(
                 speculator_prefill_output.logits[:, -1, :], 
@@ -393,6 +466,8 @@ class SpeculativePrefillPipeline:
             self.is_generating_lookaheads = True
             current_speculator_token_ids = speculator_next_token_ids
             current_speculator_position = prompt_length
+            if type(current_speculator_cache) is tuple:
+                current_speculator_cache = DynamicCache(current_speculator_cache)
             
             for _ in range(look_ahead_k):
                 current_cache_len = current_speculator_cache.get_seq_length(0)
@@ -436,22 +511,22 @@ class SpeculativePrefillPipeline:
             hasattr(self.speculator_model.model, 'layers')):
             
             example_attn_layer_obj = self.speculator_model.model.layers[0].self_attn
-            if isinstance(example_attn_layer_obj, LlamaAttention):
-                head_dim = example_attn_layer_obj.head_dim
-                num_kv_groups = example_attn_layer_obj.num_key_value_groups
+            head_dim = example_attn_layer_obj.head_dim
+            num_kv_groups = example_attn_layer_obj.num_key_value_groups
+            
+            for layer_idx in range(self.speculator_model.config.num_hidden_layers):
+                key_layer_prompt = speculator_prefill_cache_as_tuple[layer_idx][0].detach()
+                key_layer_prompt_repeated = hf_repeat_kv(key_layer_prompt, num_kv_groups)
                 
-                for layer_idx in range(self.speculator_model.config.num_hidden_layers):
-                    key_layer_prompt = speculator_prefill_cache_as_tuple[layer_idx][0].detach()
-                    key_layer_prompt_repeated = hf_repeat_kv(key_layer_prompt, num_kv_groups)
-                    
-                    for spec_idx in range(num_lookahead_steps):
-                        if spec_idx < len(self.captured_qs[layer_idx]):
-                            query_speculator_lookahead = self.captured_qs[layer_idx][spec_idx]
-                            logits = torch.matmul(
-                                query_speculator_lookahead, 
-                                key_layer_prompt_repeated.transpose(-1, -2)
-                            ) / math.sqrt(head_dim)
-                            importance_scores += logits.sum(dim=1).squeeze(dim=1)
+                for spec_idx in range(num_lookahead_steps):
+                    if spec_idx < len(self.captured_qs[layer_idx]):
+                        query_speculator_lookahead = self.captured_qs[layer_idx][spec_idx]
+                        logits = torch.matmul(
+                            query_speculator_lookahead, 
+                            key_layer_prompt_repeated.transpose(-1, -2)
+                        ) / math.sqrt(head_dim)
+                        importance_scores += logits.sum(dim=1).squeeze(dim=1)
+
         
         # Select important tokens
         sorted_top_k_indices: torch.Tensor
@@ -464,9 +539,10 @@ class SpeculativePrefillPipeline:
                 sorted_top_k_indices = torch.sort(top_k_indices)[0]
             else:
                 sorted_top_k_indices = torch.empty(0, dtype=torch.long, device=self.device)
+
         else:
             sorted_top_k_indices = torch.empty(0, dtype=torch.long, device=self.device)
-        
+
         # Base model generation
         base_model_first_token_gen_start_time = time.perf_counter()
         base_model_cache_after_prefill: Optional[Cache] = None
@@ -498,6 +574,10 @@ class SpeculativePrefillPipeline:
                     if hasattr(speculator_prefill_cache, 'key_cache') and hasattr(speculator_prefill_cache, 'value_cache'):
                         pruned_key = speculator_prefill_cache.key_cache[layer_idx][:, :, sorted_top_k_indices, :]
                         pruned_value = speculator_prefill_cache.value_cache[layer_idx][:, :, sorted_top_k_indices, :]
+                        if pruned_key.dtype != self.base_model.dtype:
+                            pruned_key = pruned_key.to(self.base_model.dtype)
+                        if pruned_value.dtype != self.base_model.dtype:
+                            pruned_value = pruned_value.to(self.base_model.dtype)
                         pruned_kv_cache.update(pruned_key, pruned_value, layer_idx)
                 n_pruned_tokens_for_cache = len(sorted_top_k_indices)
             
