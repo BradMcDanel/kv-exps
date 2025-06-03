@@ -130,6 +130,7 @@ def _qtip_patched_attention_forward_method(
     
     # Capture queries if we're generating lookaheads
     if pipeline_instance.is_generating_lookaheads:
+        print(f"Capturing query states for layer {self_attn.layer_idx}")
         pipeline_instance.captured_qs[self_attn.layer_idx].append(
             query_states_rotated.detach().clone()
         )
@@ -234,7 +235,7 @@ class SpeculativePrefillPipeline:
         
         if is_qtip_model:
             print(f"Loading QTIP model: {model_name}")
-            model, _ = qtip_model_from_hf_path(model_name, max_mem_ratio=0.7, attn_implementation="eager")
+            model, _ = qtip_model_from_hf_path(model_name, max_mem_ratio=0.7, attn_implementation="sdpa")
             return model.eval()
         else:
             print(f"Loading standard HF model: {model_name}")
