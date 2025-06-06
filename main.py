@@ -702,11 +702,13 @@ class SpeculativePrefillPipeline:
         prompt_input_ids = inputs.input_ids
         prompt_length = inputs.input_ids.shape[1]
         batch_size = inputs.input_ids.shape[0]
+        num_kept_tokens_for_base_prefill = prompt_length # Default to full prefill
 
         run_metadata["prompt_input_length"] = prompt_length 
         
         if prompt_length == 0:
             run_metadata["total_time"] = time.perf_counter() - overall_start_time
+            run_metadata["token_keep_rate"] = 100.0
             return "", run_metadata
         
         speculator_prefill_cache: Optional[Cache] = None
@@ -836,6 +838,7 @@ class SpeculativePrefillPipeline:
                     n_tokens_in_knockout_cache = spec_cache_original_len
                 
                 run_metadata["spec_cache_len_after_prune"] = n_tokens_in_knockout_cache 
+                num_kept_tokens_for_base_prefill = n_tokens_in_knockout_cache
                 
                 if pruned_kv_tuple_result is not None:
                     for layer_idx, (k, v) in enumerate(pruned_kv_tuple_result):
@@ -907,6 +910,7 @@ class SpeculativePrefillPipeline:
             else: # Not applicable for pruning, so full prefill
                 final_indices_for_selective_prefill = torch.arange(prompt_length, device=self.device)
 
+            num_kept_tokens_for_base_prefill = final_indices_for_selective_prefill.numel()
             run_metadata["selective_prefill_original_len"] = prompt_length
             run_metadata["selective_prefill_kept_token_count"] = final_indices_for_selective_prefill.numel()
 
@@ -946,6 +950,11 @@ class SpeculativePrefillPipeline:
                     )
                 base_model_next_token_ids = torch.argmax(base_out.logits[:, -1, :], dim=-1, keepdim=True)
                 base_model_cache_after_prefill = base_out.past_key_values
+        
+        if prompt_length > 0:
+            run_metadata["token_keep_rate"] = (num_kept_tokens_for_base_prefill / prompt_length) * 100.0
+        else:
+            run_metadata["token_keep_rate"] = 100.0
         
         base_model_first_token_time = time.perf_counter() - base_model_first_token_gen_start_time
         run_metadata["base_prefill"] = base_model_first_token_time
