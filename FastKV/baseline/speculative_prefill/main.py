@@ -94,7 +94,7 @@ def _hf_patched_attention_forward_method(
         batch_size, query_length, self_attn.o_proj.in_features
     )
     attention_output = self_attn.o_proj(attention_output)
-
+    
     return attention_output, None, past_key_value
 
 
@@ -146,7 +146,7 @@ class SpeculativePrefillPipeline:
         }
         model = AutoModelForCausalLM.from_pretrained(model_name, **load_kwargs)
         return model.eval()
-        
+
     def _get_chat_template(self, model_name: str) -> str:
         if "llama-3" in model_name.lower():
             return "{% set loop_messages = messages %}{% for message in loop_messages %}{% set content = '<|start_header_id|>' + message['role'] + '<|end_header_id|>\n\n'+ message['content'] | trim + '<|eot_id|>' %}{% if loop.index0 == 0 %}{% set content = bos_token + content %}{% endif %}{{ content }}{% endfor %}{% if add_generation_prompt %}{{ '<|start_header_id|>assistant<|end_header_id|>\n\n' }}{% endif %}"
@@ -316,45 +316,58 @@ class SpeculativePrefillPipeline:
         
         self._compute_qk_scores(speculator_prefill_cache_as_tuple, prompt_length, batch_size)
 
-        # --- Base Model Selective Prefill (Corrected Logic) ---
-        base_model_first_token_gen_start_time = time.perf_counter()
-
+        # --- Base Model Selective Prefill ---
         final_indices_for_selective_prefill = self._get_indices_for_selective_prefill(
             prompt_length, batch_size, self.device
         )
-
-        # Ensure the last token index is always included for next-token prediction
-        last_token_index = torch.tensor([prompt_length - 1], device=self.device, dtype=torch.long)
-        if last_token_index.item() not in final_indices_for_selective_prefill:
-            # Simple append; for strict capacity, one could drop the least important token
-            final_indices_for_selective_prefill = torch.cat([final_indices_for_selective_prefill, last_token_index])
         
-        # Sort indices to maintain causal order for the model's internal masking
-        final_indices_for_selective_prefill = torch.sort(final_indices_for_selective_prefill)[0]
+        if final_indices_for_selective_prefill.numel() == 0 and prompt_length > 0:
+            raise ValueError(
+                "Selective prefill resulted in zero tokens being kept. "
+                "This can happen if `max_capacity_prompt` is too small or zero."
+            )
 
         num_kept_tokens_for_base_prefill = final_indices_for_selective_prefill.numel()
         run_metadata["selective_prefill_original_len"] = prompt_length
         run_metadata["selective_prefill_kept_token_count"] = num_kept_tokens_for_base_prefill
-
-        # Prepare inputs for the single, unified base model pass
-        selected_ids = prompt_input_ids[:, final_indices_for_selective_prefill]
-        selected_pos_ids = final_indices_for_selective_prefill.unsqueeze(0)
-        prefill_cache_pos = final_indices_for_selective_prefill
-
-        with torch.no_grad():
-            base_out = self.base_model(
-                input_ids=selected_ids,
-                position_ids=selected_pos_ids,
-                use_cache=True,
-                cache_position=prefill_cache_pos,
-                past_key_values=DynamicCache()
-            )
-
-        # Extract the next token and the cache directly from this single pass.
-        # The logits for the next token correspond to the *last token in our input sequence*,
-        # which we ensured was the last token of the original prompt.
-        base_model_next_token_ids = torch.argmax(base_out.logits[:, -1, :], dim=-1, keepdim=True)
-        base_model_cache_after_prefill = base_out.past_key_values
+        base_model_first_token_gen_start_time = time.perf_counter()
+        
+        base_model_cache_after_prefill: Optional[Cache] = None
+        base_model_next_token_ids: Optional[torch.Tensor] = None
+        is_full_contiguous_prefill = torch.equal(final_indices_for_selective_prefill, torch.arange(prompt_length, device=self.device))
+        
+        if is_full_contiguous_prefill:
+            base_prefill_cache_pos = torch.arange(prompt_length, device=self.device)
+            with torch.no_grad():
+                base_out = self.base_model(
+                    input_ids=prompt_input_ids, use_cache=True,
+                    cache_position=base_prefill_cache_pos, past_key_values=DynamicCache()
+                )
+            base_model_next_token_ids = torch.argmax(base_out.logits[:, -1, :], dim=-1, keepdim=True)
+            base_model_cache_after_prefill = base_out.past_key_values
+        else: # Selective prefill case
+            selected_ids = prompt_input_ids[:, final_indices_for_selective_prefill]
+            selected_pos_ids = final_indices_for_selective_prefill.unsqueeze(0).to(torch.long)
+            selective_cache_pos = torch.arange(selected_ids.shape[1], device=self.device)
+            with torch.no_grad():
+                selective_out = self.base_model(
+                    selected_ids, position_ids=selected_pos_ids,
+                    past_key_values=DynamicCache(), use_cache=True,
+                    cache_position=selective_cache_pos
+                )
+            base_model_cache_after_sel_prefill = selective_out.past_key_values
+            knockout_tokens = prompt_input_ids[:, -1:]
+            knockout_pos_ids = torch.tensor([[prompt_length - 1]], device=self.device, dtype=torch.long)
+            cache_len_after_sel = base_model_cache_after_sel_prefill.get_seq_length(0)
+            knockout_cache_pos_base = torch.tensor([cache_len_after_sel], device=self.device, dtype=torch.long)
+            with torch.no_grad():
+                first_token_out = self.base_model(
+                    knockout_tokens, position_ids=knockout_pos_ids,
+                    past_key_values=base_model_cache_after_sel_prefill, use_cache=True,
+                    cache_position=knockout_cache_pos_base
+                )
+            base_model_next_token_ids = torch.argmax(first_token_out.logits[:, -1, :], dim=-1, keepdim=True)
+            base_model_cache_after_prefill = first_token_out.past_key_values
         
         if prompt_length > 0:
             run_metadata["token_keep_rate"] = (num_kept_tokens_for_base_prefill / prompt_length) * 100.0
@@ -364,53 +377,37 @@ class SpeculativePrefillPipeline:
         base_model_first_token_time = time.perf_counter() - base_model_first_token_gen_start_time
         run_metadata["base_prefill"] = base_model_first_token_time
         run_metadata["base_ttft"] = speculation_prefill_time + speculation_decode_time + base_model_first_token_time
-        
         gen_token_ids_list: List[int] = []
         final_gen_text = ""
-        decode_total_time = 0.0
-
+        
         if base_model_next_token_ids is not None and base_model_cache_after_prefill is not None:
             first_gen_token_id = base_model_next_token_ids.item()
             gen_token_ids_list.append(first_gen_token_id)
             current_decode_tokens = base_model_next_token_ids
             current_decode_kv_cache: Cache = base_model_cache_after_prefill
-            
-            # The "real" position of the next token is the original prompt length
             current_real_pos = prompt_length
-            # The position to write in the cache is after the tokens we just prefilled
             current_cache_write_pos = current_decode_kv_cache.get_seq_length(0)
-            
             if first_gen_token_id not in self.eos_token_ids:
                 for _ in range(max_generation_length - 1):
-                    decode_step_start_time = time.perf_counter()
                     decode_pos_ids = torch.tensor([[current_real_pos]], device=self.device, dtype=torch.long)
                     decode_cache_pos = torch.tensor([current_cache_write_pos], device=self.device, dtype=torch.long)
-                    
                     with torch.no_grad():
                         decode_out = self.base_model(
-                            current_decode_tokens, 
-                            position_ids=decode_pos_ids,
-                            past_key_values=current_decode_kv_cache, 
-                            use_cache=True,
+                            current_decode_tokens, position_ids=decode_pos_ids,
+                            past_key_values=current_decode_kv_cache, use_cache=True,
                             cache_position=decode_cache_pos
                         )
-                    decode_total_time += time.perf_counter() - decode_step_start_time
-                    
                     next_tokens = torch.argmax(decode_out.logits[:, -1, :], dim=-1, keepdim=True)
                     next_token_id = next_tokens.item()
                     gen_token_ids_list.append(next_token_id)
-                    
                     current_decode_tokens = next_tokens
                     current_decode_kv_cache = decode_out.past_key_values
                     current_real_pos += 1
                     current_cache_write_pos += 1
-                    
                     if next_token_id in self.eos_token_ids:
                         break
             final_gen_text = self.tokenizer.decode(gen_token_ids_list, skip_special_tokens=True)
-
-        run_metadata["decode_time"] = decode_total_time
-        run_metadata["generated_tokens"] = len(gen_token_ids_list)
+        
         run_metadata["total_time"] = time.perf_counter() - overall_start_time
         if final_gen_text.startswith("assistant\n\n"):
             final_gen_text = final_gen_text[len("assistant\n\n"):]

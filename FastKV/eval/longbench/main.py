@@ -18,91 +18,153 @@ from datasets import load_dataset
 
 from utils import utils
 
-def build_chat(tokenizer, prompt, model_name):
-    if "Llama-2" in model_name:
-        prompt = f"[INST]{prompt}[/INST]"
-    else:
-        messages = [{"role": "user", "content": prompt}]
-        prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+# =====================================================================================
+# 1. STARTUP PHASE: Functions for one-time setup
+# =====================================================================================
+
+def setup_model_and_tokenizer(args):
+    """
+    Handles all one-time setup for the chosen mode.
+    This includes monkey-patching, model/tokenizer/pipeline loading, and any
+    post-load configuration like compression.
     
-    return prompt
-            
-@torch.inference_mode()
-def generate_longbench(data, max_length, max_gen, prompt_format, 
-                       dataset, model, tokenizer,
-                       out_path, args):
+    Returns:
+        - A fully configured model object (or None if using a pipeline).
+        - A fully configured pipeline object (or None if not using a pipeline).
+        - A tokenizer object.
+    """
+    logging.info(f"Setting up for mode: {args.mode}")
+    
+    # Load tokenizer once, as it's needed by all modes for prompt prep.
+    tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
+    
+    model = None
+    pipeline = None
 
     if args.mode in ["speculative_prefill", "echo_cache"]:
+        # Pipeline-based modes handle their own model loading internally.
+        logging.info(f"Initializing pipeline for {args.mode}...")
         if args.mode == "speculative_prefill":
             from baseline.speculative_prefill.main import SpeculativePrefillPipeline as Pipeline
         else: # echo_cache
             from baseline.echo_cache.main import EchoCachePipeline as Pipeline
         
-        # The pipeline handles its own model and tokenizer loading.
         pipeline = Pipeline(
             base_model_name=args.model,
             speculator_model_name=args.speculator_model_name,
             max_capacity_prompt=args.max_capacity_prompt
         )
-        for json_obj in tqdm(data, desc=f"Generating Responses for {args.mode}..."):
-            prompt = prompt_format.format(**json_obj)
-            pred, _ = pipeline.run(prompt, look_ahead_k=1, max_generation_length=max_gen)
-
-            with open(out_path, "a", encoding="utf-8") as f:
-                json.dump({"pred": pred, "answers": json_obj["answers"], "all_classes": json_obj["all_classes"], "length": json_obj["length"]}, f, ensure_ascii=False)
-                f.write('\n')
     else:
-        # Standard logic for all other modes
-        device = model.device
-        for json_obj in tqdm(data, desc=f"Generating Responses for {args.mode}..."):
-            # load compress args
-            if args.mode == 'fastkv':
-                from baseline.fastkv.fastkv_utils import compress
-                compress(model, args)
-            elif args.mode == 'snapkv':
-                from baseline.snapkv.snapkv_utils import compress
-                compress(model, args)
-            elif args.mode == 'gemfilter':
-                from baseline.gemfilter.gemfilter_utils import gemfilter_generate_selection, set_topk
-                set_topk(model, args.max_capacity_prompt, mode='gemfilter')
-            elif args.mode == 'adakv':
-                from baseline.adakv.adaptive_snapkv.snapkv_utils import compress
-                compress(model, args)
-            elif args.mode == 'headkv':
-                from baseline.headkv.headkv.snapkv_utils import compress
-                compress(model, args)
+        # Standard modes require explicit model loading and configuration.
+        # A) Monkey-patching before model load
+        if args.mode == 'fullkv':
+            from baseline.fullkv.monkeypatch import replace_llama, replace_mistral
+            replace_llama(); replace_mistral()
+        elif args.mode == 'fastkv':
+            from baseline.fastkv.monkeypatch import replace_llama, replace_mistral
+            replace_llama(); replace_mistral()
+        elif args.mode == 'snapkv':
+            from baseline.snapkv.monkeypatch import replace_llama, replace_mistral, replace_phi3
+            replace_llama(); replace_mistral(); replace_phi3()
+        elif args.mode == 'gemfilter':
+            from baseline.gemfilter.monkeypatch import replace_llama, replace_mistral
+            replace_llama(); replace_mistral()
+        elif args.mode == 'adakv':
+            from baseline.adakv.adaptive_snapkv.monkeypatch import replace_llama_adaptive, replace_mistral_adaptive
+            replace_llama_adaptive(); replace_mistral_adaptive()
+        elif args.mode == 'headkv':
+            from baseline.headkv.headkv.monkeypatch import replace_llama, replace_mistral
+            replace_llama(args.method); replace_mistral(args.method)
 
-            prompt = prompt_format.format(**json_obj)
+        # B) Load the model
+        logging.info(f'Loading Model for {args.mode}...')
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model, 
+            device_map='auto', 
+            attn_implementation='flash_attention_2', 
+            torch_dtype=torch.float16
+        )
+        model.eval()
 
-            # truncate to fit max_length
-            tokenized_prompt = tokenizer(prompt, truncation=False, return_tensors="pt").input_ids[0]
-            if len(tokenized_prompt) > max_length:
-                half = int(max_length/2)
-                prompt = tokenizer.decode(tokenized_prompt[:half], skip_special_tokens=True)+tokenizer.decode(tokenized_prompt[-half:], skip_special_tokens=True)
-            
-            if dataset not in ["trec", "triviaqa", "samsum", "lsht", "lcc", "repobench-p"]: 
-                prompt = build_chat(tokenizer, prompt, args.model)
+        # C) Post-load configuration (compression, etc.)
+        if args.mode == 'fastkv':
+            from baseline.fastkv.fastkv_utils import compress
+            compress(model, args)
+        elif args.mode == 'snapkv':
+            from baseline.snapkv.snapkv_utils import compress
+            compress(model, args)
+        elif args.mode == 'gemfilter':
+            from baseline.gemfilter.gemfilter_utils import set_topk
+            set_topk(model, args.max_capacity_prompt, mode='gemfilter')
+        elif args.mode == 'adakv':
+            from baseline.adakv.adaptive_snapkv.snapkv_utils import compress
+            compress(model, args)
+        elif args.mode == 'headkv':
+            from baseline.headkv.headkv.snapkv_utils import compress
+            compress(model, args)
 
+    return model, pipeline, tokenizer
+
+def build_chat(tokenizer, prompt, model_name):
+    """Applies the chat template to a prompt string."""
+    if "Llama-2" in model_name:
+        return f"[INST]{prompt}[/INST]"
+    else:
+        messages = [{"role": "user", "content": prompt}]
+        return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+
+# =====================================================================================
+# 2. RUNTIME PHASE: Functions for repetitive processing
+# =====================================================================================
+
+@torch.inference_mode()
+def generate_longbench(data, max_length, max_gen, prompt_format, 
+                       dataset, model, pipeline, tokenizer,
+                       out_path, args):
+
+    device = model.device if model is not None else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    for json_obj in tqdm(data, desc=f"Generating Responses for {args.mode}..."):
+        # A) Prepare the prompt for the current data point (truncation and chat template)
+        prompt = prompt_format.format(**json_obj)
+        tokenized_prompt = tokenizer(prompt, truncation=False, return_tensors="pt").input_ids[0]
+        if len(tokenized_prompt) > max_length:
+            half = int(max_length / 2)
+            prompt = tokenizer.decode(tokenized_prompt[:half], skip_special_tokens=True) + tokenizer.decode(tokenized_prompt[-half:], skip_special_tokens=True)
+        if dataset not in ["trec", "triviaqa", "samsum", "lsht", "lcc", "repobench-p"]: 
+            prompt = build_chat(tokenizer, prompt, args.model)
+        
+        # B) Generate a prediction using the appropriate pre-configured method
+        pred = ""
+        if pipeline is not None:
+            # Pipeline-based modes
+            pred, _ = pipeline.run(prompt, look_ahead_k=1, max_generation_length=max_gen)
+        else:
+            # Standard model-based modes
             input_ids = tokenizer(prompt, truncation=False, return_tensors="pt").to(device)
             context_length = input_ids.input_ids.shape[-1]
 
             if args.mode == 'gemfilter':
-                pred = gemfilter_generate_selection(input_ids['input_ids'], input_ids['attention_mask'], 
-                    model, tokenizer, max_gen_len=max_gen, select_layer_idx=args.filter_idx)
+                from baseline.gemfilter.gemfilter_utils import gemfilter_generate_selection
+                pred = gemfilter_generate_selection(
+                    input_ids['input_ids'], input_ids['attention_mask'], 
+                    model, tokenizer, max_gen_len=max_gen, select_layer_idx=args.filter_idx
+                )
             else:
                 output = model.generate(
-                        **input_ids,
-                        max_new_tokens=max_gen,
-                        num_beams=1,
-                        do_sample=False,
-                        temperature=1.0,
-                        top_p=1.0,
+                        **input_ids, max_new_tokens=max_gen, num_beams=1,
+                        do_sample=False, temperature=1.0, top_p=1.0,
                         )[0]
                 pred = tokenizer.decode(output[context_length:], skip_special_tokens=True)
-            
-            with open(out_path, "a", encoding="utf-8") as f:
-                json.dump({"pred": pred, "answers": json_obj["answers"], "all_classes": json_obj["all_classes"], "length": json_obj["length"]}, f, ensure_ascii=False)
-                f.write('\n')
+        
+        # C) Write the result to a file
+        with open(out_path, "a", encoding="utf-8") as f:
+            json.dump({"pred": pred, "answers": json_obj["answers"], "all_classes": json_obj["all_classes"], "length": json_obj["length"]}, f, ensure_ascii=False)
+            f.write('\n')
+
+# =====================================================================================
+# 3. MAIN ORCHESTRATION
+# =====================================================================================
 
 def main(args):
     set_seed(args.seed)
@@ -115,75 +177,40 @@ def main(args):
         save_path = os.path.join(f"outputs/{args.model}/longbench", f_name)
     Path(save_path).mkdir(parents=True, exist_ok=True)  
 
-    utils.config_logging(os.path.join(save_path, f'process.log'))
-    logging.info('Arguments: ')
-    logging.info(pprint.pformat(vars(args)))
+    utils.config_logging(os.path.join(save_path, 'process.log'))
+    logging.info('Arguments: \n' + pprint.pformat(vars(args)))
     logging.info('--' * 30)
 
+    # --- STARTUP ---
+    # Load configs
     model2maxlen = json.load(open("eval/longbench/config/model2maxlen.json", "r"))
-    max_length = model2maxlen[args.model]
-
-    dataset_list = ["narrativeqa", "qasper", "multifieldqa_en", "hotpotqa", "2wikimqa", "musique", "gov_report", "qmsum", "multi_news", "trec", "triviaqa", "samsum", "passage_count", "passage_retrieval_en", "lcc", "repobench-p"]
-    if args.longbench_type == "longbench-e":
-        dataset_list = ["qasper", "multifieldqa_en", "hotpotqa", "2wikimqa", "gov_report", "multi_news", "trec", "triviaqa", "samsum", "passage_count", "passage_retrieval_en", "lcc", "repobench-p"]
-
-    if args.dataset not in dataset_list:
-        raise ValueError(f"Dataset {args.dataset} not found in the supported list for {args.longbench_type}")
-    
     dataset2prompt = json.load(open("eval/longbench/config/dataset2prompt.json", "r"))
     dataset2maxlen = json.load(open("eval/longbench/config/dataset2maxlen.json", "r"))
-
-    dataset = args.dataset
-    model, tokenizer = None, None
-
-    # For pipeline-based modes, model and tokenizer are loaded inside the pipeline.
-    # For other modes, load them here.
-    if args.mode not in ["speculative_prefill", "echo_cache"]:
-        if args.mode == 'fullkv':
-            from baseline.fullkv.monkeypatch import replace_llama, replace_mistral
-            replace_llama()
-            replace_mistral()
-        elif args.mode == 'fastkv':
-            from baseline.fastkv.monkeypatch import replace_llama, replace_mistral
-            replace_llama()
-            replace_mistral()
-        elif args.mode == 'snapkv':
-            from baseline.snapkv.monkeypatch import replace_llama, replace_mistral, replace_phi3
-            replace_llama()
-            replace_mistral()
-            replace_phi3()
-        elif args.mode == 'gemfilter':
-            from baseline.gemfilter.monkeypatch import replace_llama, replace_mistral
-            replace_llama()
-            replace_mistral()
-        elif args.mode == 'adakv':
-            from baseline.adakv.adaptive_snapkv.monkeypatch import replace_llama_adaptive, replace_mistral_adaptive
-            replace_llama_adaptive()
-            replace_mistral_adaptive()
-        elif args.mode == 'headkv':
-            from baseline.headkv.headkv.monkeypatch import replace_llama, replace_mistral
-            replace_llama(args.method)
-            replace_mistral(args.method)
-
-        logging.info(f'Loading Model & Tokenizer for {args.mode}...')
-        tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
-        model = AutoModelForCausalLM.from_pretrained(args.model, device_map='auto', attn_implementation='flash_attention_2', torch_dtype=torch.float16)
-        model.eval()
-
+    
+    # Perform all one-time setup for the selected mode
+    model, pipeline, tokenizer = setup_model_and_tokenizer(args)
+    
+    # Load dataset
+    dataset_name = args.dataset
     if args.longbench_type == "longbench-e":
-        data = load_dataset('THUDM/LongBench', f"{dataset}_e", split='test')
+        data = load_dataset('THUDM/LongBench', f"{dataset_name}_e", split='test')
     else:
-        data = load_dataset('THUDM/LongBench', dataset, split='test')
-
-    out_path = os.path.join(save_path, f"{dataset}.jsonl")
-    prompt_format = dataset2prompt[dataset]
-    max_gen = dataset2maxlen[dataset]
+        data = load_dataset('THUDM/LongBench', dataset_name, split='test')
+    
+    # Prepare for run phase
+    out_path = os.path.join(save_path, f"{dataset_name}.jsonl")
+    prompt_format = dataset2prompt[dataset_name]
+    max_gen = dataset2maxlen[dataset_name]
+    max_length = model2maxlen[args.model]
     data_all = [data_sample for data_sample in data]
 
-    generate_longbench(data=data_all, max_length=max_length, max_gen=max_gen, prompt_format=prompt_format, 
-                       dataset=dataset, model=model, tokenizer=tokenizer,
-                       out_path=out_path, args=args)
- 
+    # --- RUN ---
+    generate_longbench(
+        data=data_all, max_length=max_length, max_gen=max_gen, 
+        prompt_format=prompt_format, dataset=dataset_name, 
+        model=model, pipeline=pipeline, tokenizer=tokenizer,
+        out_path=out_path, args=args
+    )
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -225,4 +252,12 @@ if __name__ == "__main__":
     parser.add_argument('--longbench_type', type=str, default='longbench', choices=['longbench', 'longbench-e'])
 
     args = parser.parse_args()
+    
+    # Basic validation for dataset names
+    dataset_list = ["narrativeqa", "qasper", "multifieldqa_en", "hotpotqa", "2wikimqa", "musique", "gov_report", "qmsum", "multi_news", "trec", "triviaqa", "samsum", "passage_count", "passage_retrieval_en", "lcc", "repobench-p"]
+    if args.longbench_type == "longbench-e":
+        dataset_list = ["qasper", "multifieldqa_en", "hotpotqa", "2wikimqa", "gov_report", "multi_news", "trec", "triviaqa", "samsum", "passage_count", "passage_retrieval_en", "lcc", "repobench-p"]
+    if args.dataset not in dataset_list:
+        raise ValueError(f"Dataset '{args.dataset}' not found in the supported list for {args.longbench_type}")
+
     main(args)
