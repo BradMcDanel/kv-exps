@@ -146,6 +146,14 @@ class SpeculativePrefillPipeline:
         }
         model = AutoModelForCausalLM.from_pretrained(model_name, **load_kwargs)
         return model.eval()
+        
+    def _get_chat_template(self, model_name: str) -> str:
+        if "llama-3" in model_name.lower():
+            return "{% set loop_messages = messages %}{% for message in loop_messages %}{% set content = '<|start_header_id|>' + message['role'] + '<|end_header_id|>\n\n'+ message['content'] | trim + '<|eot_id|>' %}{% if loop.index0 == 0 %}{% set content = bos_token + content %}{% endif %}{{ content }}{% endfor %}{% if add_generation_prompt %}{{ '<|start_header_id|>assistant<|end_header_id|>\n\n' }}{% endif %}"
+        elif "llama-2" in model_name.lower():
+            return "{% if messages[0]['role'] == 'system' %}{% set loop_messages = messages[1:] %}{% set system_message = messages[0]['content'] %}{% else %}{% set loop_messages = messages %}{% set system_message = false %}{% endif %}{% for message in loop_messages %}{% if (message['role'] == 'user') != (loop.index0 % 2 == 0) %}{{ raise_exception('Conversation roles must alternate user/assistant/user/assistant/...') }}{% endif %}{% if loop.index0 == 0 and system_message != false %}{% set content = '<<SYS>>\\n' + system_message + '\\n<</SYS>>\\n\\n' + message['content'] %}{% else %}{% set content = message['content'] %}{% endif %}{% if message['role'] == 'user' %}{{ bos_token + '[INST] ' + content.strip() + ' [/INST]' }}{% elif message['role'] == 'assistant' %}{{ ' '  + content.strip() + ' ' + eos_token }}{% endif %}{% endfor %}"
+        else:
+            return "{% if not add_generation_prompt is defined %}{% set add_generation_prompt = false %}{% endif %}{% for message in messages %}{{'<|im_start|>' + message['role'] + '\n' + message['content'] + '<|im_end|>' + '\n'}}{% endfor %}{% if add_generation_prompt %}{{ '<|im_start|>assistant\n' }}{% endif %}"
 
     def _load_tokenizer(self):
         tokenizer = AutoTokenizer.from_pretrained(self.base_model_name, trust_remote_code=True)
@@ -308,58 +316,45 @@ class SpeculativePrefillPipeline:
         
         self._compute_qk_scores(speculator_prefill_cache_as_tuple, prompt_length, batch_size)
 
-        # --- Base Model Selective Prefill ---
+        # --- Base Model Selective Prefill (Corrected Logic) ---
+        base_model_first_token_gen_start_time = time.perf_counter()
+
         final_indices_for_selective_prefill = self._get_indices_for_selective_prefill(
             prompt_length, batch_size, self.device
         )
+
+        # Ensure the last token index is always included for next-token prediction
+        last_token_index = torch.tensor([prompt_length - 1], device=self.device, dtype=torch.long)
+        if last_token_index.item() not in final_indices_for_selective_prefill:
+            # Simple append; for strict capacity, one could drop the least important token
+            final_indices_for_selective_prefill = torch.cat([final_indices_for_selective_prefill, last_token_index])
         
-        if final_indices_for_selective_prefill.numel() == 0 and prompt_length > 0:
-            raise ValueError(
-                "Selective prefill resulted in zero tokens being kept. "
-                "This can happen if `max_capacity_prompt` is too small or zero."
-            )
+        # Sort indices to maintain causal order for the model's internal masking
+        final_indices_for_selective_prefill = torch.sort(final_indices_for_selective_prefill)[0]
 
         num_kept_tokens_for_base_prefill = final_indices_for_selective_prefill.numel()
         run_metadata["selective_prefill_original_len"] = prompt_length
         run_metadata["selective_prefill_kept_token_count"] = num_kept_tokens_for_base_prefill
-        base_model_first_token_gen_start_time = time.perf_counter()
-        
-        base_model_cache_after_prefill: Optional[Cache] = None
-        base_model_next_token_ids: Optional[torch.Tensor] = None
-        is_full_contiguous_prefill = torch.equal(final_indices_for_selective_prefill, torch.arange(prompt_length, device=self.device))
-        
-        if is_full_contiguous_prefill:
-            base_prefill_cache_pos = torch.arange(prompt_length, device=self.device)
-            with torch.no_grad():
-                base_out = self.base_model(
-                    input_ids=prompt_input_ids, use_cache=True,
-                    cache_position=base_prefill_cache_pos, past_key_values=DynamicCache()
-                )
-            base_model_next_token_ids = torch.argmax(base_out.logits[:, -1, :], dim=-1, keepdim=True)
-            base_model_cache_after_prefill = base_out.past_key_values
-        else: # Selective prefill case
-            selected_ids = prompt_input_ids[:, final_indices_for_selective_prefill]
-            selected_pos_ids = final_indices_for_selective_prefill.unsqueeze(0).to(torch.long)
-            selective_cache_pos = torch.arange(selected_ids.shape[1], device=self.device)
-            with torch.no_grad():
-                selective_out = self.base_model(
-                    selected_ids, position_ids=selected_pos_ids,
-                    past_key_values=DynamicCache(), use_cache=True,
-                    cache_position=selective_cache_pos
-                )
-            base_model_cache_after_sel_prefill = selective_out.past_key_values
-            knockout_tokens = prompt_input_ids[:, -1:]
-            knockout_pos_ids = torch.tensor([[prompt_length - 1]], device=self.device, dtype=torch.long)
-            cache_len_after_sel = base_model_cache_after_sel_prefill.get_seq_length(0)
-            knockout_cache_pos_base = torch.tensor([cache_len_after_sel], device=self.device, dtype=torch.long)
-            with torch.no_grad():
-                first_token_out = self.base_model(
-                    knockout_tokens, position_ids=knockout_pos_ids,
-                    past_key_values=base_model_cache_after_sel_prefill, use_cache=True,
-                    cache_position=knockout_cache_pos_base
-                )
-            base_model_next_token_ids = torch.argmax(first_token_out.logits[:, -1, :], dim=-1, keepdim=True)
-            base_model_cache_after_prefill = first_token_out.past_key_values
+
+        # Prepare inputs for the single, unified base model pass
+        selected_ids = prompt_input_ids[:, final_indices_for_selective_prefill]
+        selected_pos_ids = final_indices_for_selective_prefill.unsqueeze(0)
+        prefill_cache_pos = final_indices_for_selective_prefill
+
+        with torch.no_grad():
+            base_out = self.base_model(
+                input_ids=selected_ids,
+                position_ids=selected_pos_ids,
+                use_cache=True,
+                cache_position=prefill_cache_pos,
+                past_key_values=DynamicCache()
+            )
+
+        # Extract the next token and the cache directly from this single pass.
+        # The logits for the next token correspond to the *last token in our input sequence*,
+        # which we ensured was the last token of the original prompt.
+        base_model_next_token_ids = torch.argmax(base_out.logits[:, -1, :], dim=-1, keepdim=True)
+        base_model_cache_after_prefill = base_out.past_key_values
         
         if prompt_length > 0:
             run_metadata["token_keep_rate"] = (num_kept_tokens_for_base_prefill / prompt_length) * 100.0
@@ -369,26 +364,34 @@ class SpeculativePrefillPipeline:
         base_model_first_token_time = time.perf_counter() - base_model_first_token_gen_start_time
         run_metadata["base_prefill"] = base_model_first_token_time
         run_metadata["base_ttft"] = speculation_prefill_time + speculation_decode_time + base_model_first_token_time
+        
         gen_token_ids_list: List[int] = []
         final_gen_text = ""
-        
         decode_total_time = 0.0
+
         if base_model_next_token_ids is not None and base_model_cache_after_prefill is not None:
             first_gen_token_id = base_model_next_token_ids.item()
             gen_token_ids_list.append(first_gen_token_id)
             current_decode_tokens = base_model_next_token_ids
             current_decode_kv_cache: Cache = base_model_cache_after_prefill
+            
+            # The "real" position of the next token is the original prompt length
             current_real_pos = prompt_length
+            # The position to write in the cache is after the tokens we just prefilled
             current_cache_write_pos = current_decode_kv_cache.get_seq_length(0)
+            
             if first_gen_token_id not in self.eos_token_ids:
                 for _ in range(max_generation_length - 1):
                     decode_step_start_time = time.perf_counter()
                     decode_pos_ids = torch.tensor([[current_real_pos]], device=self.device, dtype=torch.long)
                     decode_cache_pos = torch.tensor([current_cache_write_pos], device=self.device, dtype=torch.long)
+                    
                     with torch.no_grad():
                         decode_out = self.base_model(
-                            current_decode_tokens, position_ids=decode_pos_ids,
-                            past_key_values=current_decode_kv_cache, use_cache=True,
+                            current_decode_tokens, 
+                            position_ids=decode_pos_ids,
+                            past_key_values=current_decode_kv_cache, 
+                            use_cache=True,
                             cache_position=decode_cache_pos
                         )
                     decode_total_time += time.perf_counter() - decode_step_start_time
@@ -396,10 +399,12 @@ class SpeculativePrefillPipeline:
                     next_tokens = torch.argmax(decode_out.logits[:, -1, :], dim=-1, keepdim=True)
                     next_token_id = next_tokens.item()
                     gen_token_ids_list.append(next_token_id)
+                    
                     current_decode_tokens = next_tokens
                     current_decode_kv_cache = decode_out.past_key_values
                     current_real_pos += 1
                     current_cache_write_pos += 1
+                    
                     if next_token_id in self.eos_token_ids:
                         break
             final_gen_text = self.tokenizer.decode(gen_token_ids_list, skip_special_tokens=True)
@@ -412,3 +417,67 @@ class SpeculativePrefillPipeline:
         elif final_gen_text.startswith(" assistant\n"):
             final_gen_text = final_gen_text[len(" assistant\n"):]
         return final_gen_text, run_metadata
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Selective Prefill Pipeline")
+    parser.add_argument("--base_model_name", type=str, default="meta-llama/Llama-3.1-8B-Instruct")
+    parser.add_argument("--speculator_model_name", type=str, required=True,
+                        help="Path to a smaller model for scoring tokens. This argument is required.")
+    parser.add_argument("--dataset_name", type=str, default="hotpotqa",
+                        help="Dataset from THUDM/LongBench to use for the prompt (e.g., 'hotpotqa').")
+    parser.add_argument("--look_ahead_k", type=int, default=1,
+                        help="Number of lookahead steps for the speculator (1 is sufficient for scoring).")
+    parser.add_argument("--max_capacity_prompt", type=int, default=256,
+                        help="The maximum number of prompt tokens to keep for the base model's prefill.")
+    parser.add_argument("--max_generation_length", type=int, default=32)
+    args = parser.parse_args()
+
+    pipeline = SpeculativePrefillPipeline(
+        base_model_name=args.base_model_name,
+        speculator_model_name=args.speculator_model_name,
+        max_capacity_prompt=args.max_capacity_prompt
+    )
+    prompt_str: str
+    try:
+        dataset = load_dataset('THUDM/LongBench', args.dataset_name, split='test', trust_remote_code=True)
+        sample = dataset[0]
+        context = sample.get('context', '') if isinstance(sample, dict) else ''
+        input_text = sample.get('input', '') if isinstance(sample, dict) else ''
+        messages = [{"role": "user", "content": f"Context: {context}\nQuestion: {input_text}\nAnswer:"}]
+        prompt_str = pipeline.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    except Exception as e:
+        print(f"Could not load dataset '{args.dataset_name}'. Using a default prompt. Error: {e}")
+        messages = [{"role": "user", "content": "Explain the theory of relativity in simple terms."}]
+        prompt_str = pipeline.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    
+    print(f"--- Running Selective Prefill ---")
+    print(f"Base Model: {args.base_model_name}")
+    print(f"Speculator Model: {args.speculator_model_name}")
+    print(f"Max Prompt Capacity: {args.max_capacity_prompt}")
+    print("-" * 35)
+
+    generated_text, run_metadata = pipeline.run(
+        prompt_text=prompt_str,
+        look_ahead_k=args.look_ahead_k,
+        max_generation_length=args.max_generation_length
+    )
+
+    print(f"\n--- Generated Text ---")
+    print(generated_text)
+    print("-" * 22)
+
+    print("\n--- Performance Metrics ---")
+    print(f"Prompt Length (Tokens): {run_metadata.get('prompt_input_length', 'N/A')}")
+    print(f"Kept for Prefill (Tokens): {run_metadata.get('selective_prefill_kept_token_count', 'N/A')}")
+    print(f"Token Keep Rate: {run_metadata.get('token_keep_rate', 0):.2f}%")
+    print(f"Time to First Token (TTFT): {run_metadata.get('base_ttft', 0):.4f} seconds")
+    print(f"  - Speculator Prefill: {run_metadata.get('speculation_prefill', 0):.4f} s")
+    print(f"  - Speculator Decode/Scoring: {run_metadata.get('speculation_decode', 0):.4f} s")
+    print(f"  - Base Model Prefill: {run_metadata.get('base_prefill', 0):.4f} s")
+    print(f"Total Pipeline Time: {run_metadata.get('total_time', 0):.4f} seconds")
+    print("-" * 27)
+
+
+if __name__ == "__main__":
+    main()
