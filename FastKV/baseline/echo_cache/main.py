@@ -1,3 +1,4 @@
+
 import torch
 import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
@@ -19,7 +20,7 @@ import os
 
 # --- QTIP Imports and Setup ---
 # This section remains unchanged as it handles module availability, not generation fallbacks.
-sys.path.append(os.path.join(os.path.dirname(__file__), '../../qtip'))
+sys.path.append(os.path.join(os.path.dirname(__file__), 'qtip'))
 
 try:
     from lib.linear import QuantizedLinear
@@ -32,6 +33,8 @@ except ImportError:
     qtip_model_from_hf_path = None
     QTIP_LlamaAttention = None
 # --- End QTIP Imports ---
+
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 
 def _hf_patched_attention_forward_method(
@@ -389,10 +392,7 @@ class EchoCachePipeline:
         inputs = self.tokenizer(prompt_text, return_tensors="pt", padding=False, truncation=True, max_length=max_prompt_length).to(self.device)
         prompt_input_ids, prompt_length, batch_size = inputs.input_ids, inputs.input_ids.shape[1], inputs.input_ids.shape[0]
         run_metadata["prompt_input_length"] = prompt_length
-        if prompt_length == 0:
-            run_metadata["total_time"] = time.perf_counter() - overall_start_time
-            run_metadata["token_keep_rate"] = 100.0
-            return "", run_metadata
+        if prompt_length == 0: run_metadata["total_time"] = time.perf_counter() - overall_start_time; run_metadata["token_keep_rate"] = 100.0; return "", run_metadata
         
         stage_start_time = time.perf_counter()
         self.is_generating_lookaheads = False
@@ -403,10 +403,8 @@ class EchoCachePipeline:
         speculator_prefill_cache = spec_out.past_key_values
         speculator_prefill_cache_as_tuple: Optional[Tuple[Tuple[torch.Tensor, torch.Tensor], ...]] = None
         if speculator_prefill_cache is not None:
-            if not isinstance(speculator_prefill_cache, tuple):
-                speculator_prefill_cache_as_tuple = speculator_prefill_cache.to_legacy_cache()
-            else:
-                speculator_prefill_cache_as_tuple, speculator_prefill_cache = speculator_prefill_cache, DynamicCache.from_legacy_cache(speculator_prefill_cache)
+            if not isinstance(speculator_prefill_cache, tuple): speculator_prefill_cache_as_tuple = speculator_prefill_cache.to_legacy_cache()
+            else: speculator_prefill_cache_as_tuple, speculator_prefill_cache = speculator_prefill_cache, DynamicCache.from_legacy_cache(speculator_prefill_cache)
         
         if speculator_prefill_cache_as_tuple is None:
             raise RuntimeError("Speculator prefill did not return a past_key_values cache.")
@@ -433,8 +431,7 @@ class EchoCachePipeline:
         
         injected_cache_dynamic = DynamicCache()
         if sliced_kv_tuple:
-            for layer_idx, (k, v) in enumerate(sliced_kv_tuple):
-                injected_cache_dynamic.update(k, v, layer_idx)
+            for layer_idx, (k, v) in enumerate(sliced_kv_tuple): injected_cache_dynamic.update(k, v, layer_idx)
         
         knockout_tokens, knockout_pos_ids = prompt_input_ids[:, -1:], torch.tensor([[prompt_length - 1]], device=self.device)
         knockout_cache_pos = torch.tensor([injected_cache_dynamic.get_seq_length(0)], device=self.device)
@@ -448,35 +445,86 @@ class EchoCachePipeline:
         run_metadata["base_ttft"] = run_metadata["speculation_prefill"] + run_metadata["speculation_decode"] + base_model_first_token_time
         
         gen_token_ids_list, final_gen_text = [], ""
-        decode_total_time = 0.0
         if base_model_next_token_ids is not None and base_model_cache_after_prefill is not None:
             gen_token_ids_list.append(base_model_next_token_ids.item())
             current_decode_tokens, current_decode_kv_cache, current_real_pos = base_model_next_token_ids, base_model_cache_after_prefill, prompt_length
             if not isinstance(current_decode_kv_cache, DynamicCache):
-                if isinstance(current_decode_kv_cache, tuple):
-                    current_decode_kv_cache = DynamicCache.from_legacy_cache(current_decode_kv_cache)
-                elif not isinstance(current_decode_kv_cache, Cache):
-                    raise TypeError(f"Unexpected cache type: {type(current_decode_kv_cache)}")
+                if isinstance(current_decode_kv_cache, tuple): current_decode_kv_cache = DynamicCache.from_legacy_cache(current_decode_kv_cache)
+                elif not isinstance(current_decode_kv_cache, Cache): raise TypeError(f"Unexpected cache type: {type(current_decode_kv_cache)}")
             current_cache_write_pos = current_decode_kv_cache.get_seq_length(0)
             if gen_token_ids_list[-1] not in self.eos_token_ids:
                 for _ in range(max_generation_length - 1):
-                    decode_step_start_time = time.perf_counter()
                     with torch.no_grad():
                         decode_out = self.base_model(current_decode_tokens, position_ids=torch.tensor([[current_real_pos]], device=self.device), past_key_values=current_decode_kv_cache, use_cache=True, cache_position=torch.tensor([current_cache_write_pos], device=self.device))
-                    decode_total_time += time.perf_counter() - decode_step_start_time
-
                     next_tokens = torch.argmax(decode_out.logits[:, -1, :], dim=-1, keepdim=True)
                     gen_token_ids_list.append(next_tokens.item())
                     current_decode_tokens, current_decode_kv_cache, current_real_pos, current_cache_write_pos = next_tokens, decode_out.past_key_values, current_real_pos + 1, current_cache_write_pos + 1
-                    if gen_token_ids_list[-1] in self.eos_token_ids:
-                        break
+                    if gen_token_ids_list[-1] in self.eos_token_ids: break
             final_gen_text = self.tokenizer.decode(gen_token_ids_list, skip_special_tokens=True)
         
-        run_metadata["decode_time"] = decode_total_time
-        run_metadata["generated_tokens"] = len(gen_token_ids_list)
         run_metadata["total_time"] = time.perf_counter() - overall_start_time
-        if final_gen_text.startswith("assistant\n\n"):
-            final_gen_text = final_gen_text[len("assistant\n\n"):]
-        elif final_gen_text.startswith(" assistant\n"):
-            final_gen_text = final_gen_text[len(" assistant\n"):]
+        if final_gen_text.startswith("assistant\n\n"): final_gen_text = final_gen_text[len("assistant\n\n"):]
+        elif final_gen_text.startswith(" assistant\n"): final_gen_text = final_gen_text[len(" assistant\n"):]
         return final_gen_text, run_metadata
+
+def main():
+    parser = argparse.ArgumentParser(description="EchoCachePipeline with KV Cache Sharing")
+    parser.add_argument("--base_model_name", type=str, default="meta-llama/Llama-3.1-8B-Instruct")
+    parser.add_argument("--speculator_model_name", type=str, required=True, help="Speculator model is required for EchoCachePipeline.")
+    parser.add_argument("--dataset_name", type=str, default="hotpotqa")
+    parser.add_argument("--look_ahead_k", type=int, default=1)
+    parser.add_argument("--max_capacity_prompt", type=int, default=256, help="The maximum number of prompt tokens to keep for the shared KV cache.")
+    parser.add_argument("--max_generation_length", type=int, default=32)
+    args = parser.parse_args()
+    
+    if QTIP_AVAILABLE: print("QTIP modules found and enabled for QTIP models.")
+    else: print("Warning: QTIP modules not found. QTIP model support disabled.")
+    
+    pipeline = EchoCachePipeline(
+        base_model_name=args.base_model_name,
+        speculator_model_name=args.speculator_model_name,
+        max_capacity_prompt=args.max_capacity_prompt
+    )
+    
+    prompt_str: str
+    try:
+        dataset = load_dataset('THUDM/LongBench', args.dataset_name, split='test', trust_remote_code=True)
+        sample = dataset[0]
+        context, input_text = sample.get('context', ''), sample.get('input', '')
+        messages = [{"role": "user", "content": f"Context: {context}\nQuestion: {input_text}\nAnswer:"}]
+        prompt_str = pipeline.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    except Exception as e:
+        print(f"Could not load dataset '{args.dataset_name}'. Using a default prompt. Error: {e}")
+        messages = [{"role": "user", "content": "Explain the theory of relativity in simple terms."}]
+        prompt_str = pipeline.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    
+    print(f"--- Running EchoCachePipeline ---")
+    print(f"Base Model: {args.base_model_name}")
+    print(f"Speculator Model: {args.speculator_model_name}")
+    print(f"Max Shared Cache Capacity: {args.max_capacity_prompt}")
+    print("-" * 35)
+
+    generated_text, run_metadata = pipeline.run(
+        prompt_text=prompt_str,
+        look_ahead_k=args.look_ahead_k,
+        max_generation_length=args.max_generation_length
+    )
+    
+    print(f"\n--- Generated Text ---")
+    print(generated_text)
+    print("-" * 22)
+
+    print("\n--- Performance Metrics ---")
+    print(f"Prompt Length (Tokens): {run_metadata.get('prompt_input_length', 'N/A')}")
+    print(f"Spec Cache Before Slicing: {run_metadata.get('spec_cache_len_before_slice', 'N/A')}")
+    print(f"Spec Cache After Slicing (Shared): {run_metadata.get('spec_cache_len_after_slice', 'N/A')}")
+    print(f"Token Keep Rate: {run_metadata.get('token_keep_rate', 0):.2f}%")
+    print(f"Time to First Token (TTFT): {run_metadata.get('base_ttft', 0):.4f} seconds")
+    print(f"  - Speculator Prefill: {run_metadata.get('speculation_prefill', 0):.4f} s")
+    print(f"  - Speculator Decode/Scoring: {run_metadata.get('speculation_decode', 0):.4f} s")
+    print(f"  - Base Model Knockout Pass: {run_metadata.get('base_prefill', 0):.4f} s")
+    print(f"Total Pipeline Time: {run_metadata.get('total_time', 0):.4f} seconds")
+    print("-" * 27)
+
+if __name__ == "__main__":
+    main()
