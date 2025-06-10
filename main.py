@@ -104,7 +104,7 @@ def _hf_patched_attention_forward_method(
     )
     attention_output = self_attn.o_proj(attention_output)
     
-    return attention_output, None
+    return attention_output, None, past_key_value
 
 
 def _qtip_patched_attention_forward_method(

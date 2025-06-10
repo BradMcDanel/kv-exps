@@ -1,4 +1,3 @@
-
 import torch
 import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
@@ -18,8 +17,6 @@ from functools import partial
 import sys
 import os
 
-# --- QTIP Imports and Setup ---
-# This section remains unchanged as it handles module availability, not generation fallbacks.
 sys.path.append(os.path.join(os.path.dirname(__file__), 'qtip'))
 
 try:
@@ -32,9 +29,6 @@ except ImportError:
     QuantizedLinear = None
     qtip_model_from_hf_path = None
     QTIP_LlamaAttention = None
-# --- End QTIP Imports ---
-
-os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 
 def _hf_patched_attention_forward_method(
@@ -49,7 +43,7 @@ def _hf_patched_attention_forward_method(
     cache_position: Optional[torch.LongTensor] = None,
     position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     **kwargs
-) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Cache]]:
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     batch_size, query_length, _ = hidden_states.size()
     
     query_projection = self_attn.q_proj(hidden_states)
@@ -195,33 +189,44 @@ class EchoCachePipeline:
     def __init__(
         self,
         base_model_name: str,
-        speculator_model_name: str,
-        max_capacity_prompt: int = 256
+        speculator_model_name: Optional[str],
+        max_capacity_prompt: int = 512
     ):
         self.base_model_name = base_model_name
         self.speculator_model_name = speculator_model_name
         self.max_capacity_prompt = max_capacity_prompt
         
-        if self.speculator_model_name is None:
-             raise ValueError("EchoCachePipeline requires a speculator model for KV cache generation.")
-        
         self.tokenizer = self._load_tokenizer()
-        self.speculator_model = self._load_model(self.speculator_model_name)
-        self.device = self.speculator_model.device
-        self.dtype = self.speculator_model.dtype
+        self.speculator_model: Optional[AutoModelForCausalLM] = None
+        self.device: Optional[torch.device] = None
+        self.dtype: Optional[torch.dtype] = None
+        
+        if self.speculator_model_name is not None and self.speculator_model_name.lower() != "none":
+            self.speculator_model = self._load_model(self.speculator_model_name)
+            self.device = self.speculator_model.device
+            self.dtype = self.speculator_model.dtype
         
         self.base_model = self._load_model(self.base_model_name)
         self.base_config: AutoConfig = self.base_model.config
         
         self.eos_token_ids = self._extract_eos_token_ids(self.base_config.eos_token_id)
         
-        self._check_model_compatibility()
+        if self.device is None:
+            self.device = self.base_model.device
+        if self.dtype is None:
+            self.dtype = self.base_model.dtype
+        
+        # Check model compatibility for KV cache sharing
+        if self.speculator_model is not None:
+            self._check_model_compatibility()
         
         self.captured_qs: List[List[torch.Tensor]] = []
         self.orig_spec_fwds: Dict[int, Any] = {}
         self.is_generating_lookaheads = False
         
+        self.global_qk_scores: Optional[torch.Tensor] = None
         self.first_step_prompt_qk_scores: Optional[torch.Tensor] = None 
+        self.layer_qk_scores: List[torch.Tensor] = []
     
     def _extract_eos_token_ids(self, eos_token_id: Union[int, List[int], None]) -> List[int]:
         if isinstance(eos_token_id, int):
@@ -244,34 +249,46 @@ class EchoCachePipeline:
             load_kwargs = {
                 "torch_dtype": torch.float16,
                 "trust_remote_code": True,
-                "device_map": "auto",
-                "attn_implementation": "sdpa",
+                "device_map": "auto"
             }
             model = AutoModelForCausalLM.from_pretrained(model_name, **load_kwargs)
             return model.eval()
     
     def _check_model_compatibility(self):
+        if self.speculator_model is None:
+            return
+        
         spec_config = self.speculator_model.config
         base_config = self.base_model.config
-        spec_num_heads = getattr(spec_config, 'num_attention_heads', getattr(spec_config, 'num_heads', None))
-        base_num_heads = getattr(base_config, 'num_attention_heads', getattr(base_config, 'num_heads', None))
+        
+        spec_num_heads = getattr(spec_config, 'num_attention_heads', 
+                                getattr(spec_config, 'num_heads', None))
+        base_num_heads = getattr(base_config, 'num_attention_heads', 
+                                getattr(base_config, 'num_heads', None))
+        
         spec_num_kv_heads = getattr(spec_config, 'num_key_value_heads', spec_num_heads)
         base_num_kv_heads = getattr(base_config, 'num_key_value_heads', base_num_heads)
+        
         compatible = (
             getattr(spec_config, 'num_hidden_layers', None) == getattr(base_config, 'num_hidden_layers', None) and
             getattr(spec_config, 'hidden_size', None) == getattr(base_config, 'hidden_size', None) and
             spec_num_heads == base_num_heads and
             spec_num_kv_heads == base_num_kv_heads
         )
+        
         if not compatible:
             raise ValueError("Speculator and base models are not compatible for KV cache sharing.")
     
     def _get_tokenizer_for_model(self, model_name: str) -> str:
-        # This fallback is for convenience in loading, not generation, so it remains.
         if "qtip" in model_name.lower():
-            if "llama-3.1" in model_name.lower(): return "meta-llama/Llama-3.1-8B-Instruct"
-            elif "llama-3" in model_name.lower(): return "meta-llama/Meta-Llama-3-8B-Instruct"
-            else: return "meta-llama/Llama-2-7b-hf"
+            if "llama-3.1" in model_name.lower():
+                return "meta-llama/Llama-3.1-8B-Instruct"
+            elif "llama-3" in model_name.lower():
+                return "meta-llama/Meta-Llama-3-8B-Instruct"
+            elif "llama-2" in model_name.lower():
+                return "meta-llama/Llama-2-7b-hf"
+            else:
+                return "meta-llama/Llama-2-7b-hf"
         return model_name
     
     def _get_chat_template(self, model_name: str) -> str:
@@ -283,202 +300,524 @@ class EchoCachePipeline:
             return "{% if not add_generation_prompt is defined %}{% set add_generation_prompt = false %}{% endif %}{% for message in messages %}{{'<|im_start|>' + message['role'] + '\n' + message['content'] + '<|im_end|>' + '\n'}}{% endfor %}{% if add_generation_prompt %}{{ '<|im_start|>assistant\n' }}{% endif %}"
     
     def _load_tokenizer(self):
-        # This fallback is for convenience in loading, not generation, so it remains.
         try:
             tokenizer = AutoTokenizer.from_pretrained(self.base_model_name, trust_remote_code=True)
         except OSError:
             fallback_name = self._get_tokenizer_for_model(self.base_model_name)
             tokenizer = AutoTokenizer.from_pretrained(fallback_name, trust_remote_code=True)
+        
         if tokenizer.pad_token is None and tokenizer.eos_token is not None:
             tokenizer.pad_token = tokenizer.eos_token
+        
         if tokenizer.chat_template is None:
             tokenizer.chat_template = self._get_chat_template(self.base_model_name)
+        
         return tokenizer
     
     def _patch_speculator(self):
-        if not hasattr(self.speculator_model, 'model') or not hasattr(self.speculator_model.model, 'layers'): return 0
+        if self.speculator_model is None:
+            return 0
+        
+        if not hasattr(self.speculator_model, 'model') or not hasattr(self.speculator_model.model, 'layers'):
+            return 0
+        
         num_layers = self.speculator_model.config.num_hidden_layers
         self.captured_qs = [[] for _ in range(num_layers)]
-        self.first_step_prompt_qk_scores = None
+        self.global_qk_scores = None
+        self.first_step_prompt_qk_scores = None 
+        self.layer_qk_scores = []
+        
         num_patched_layers = 0
+        
         for i, layer in enumerate(self.speculator_model.model.layers):
             if hasattr(layer, 'self_attn'):
                 attn = layer.self_attn
+                
                 if isinstance(attn, LlamaAttention):
-                    if i not in self.orig_spec_fwds: self.orig_spec_fwds[i] = attn.forward
+                    if i not in self.orig_spec_fwds:
+                        self.orig_spec_fwds[i] = attn.forward
                     attn.forward = types.MethodType(partial(_hf_patched_attention_forward_method, pipeline_instance=self), attn)
                     num_patched_layers += 1
+                
                 elif QTIP_AVAILABLE and QTIP_LlamaAttention is not None and isinstance(attn, QTIP_LlamaAttention):
-                    if i not in self.orig_spec_fwds: self.orig_spec_fwds[i] = attn.forward
+                    if i not in self.orig_spec_fwds:
+                        self.orig_spec_fwds[i] = attn.forward
                     attn.forward = types.MethodType(partial(_qtip_patched_attention_forward_method, pipeline_instance=self), attn)
                     num_patched_layers += 1
+        
         return num_patched_layers
     
-    def _compute_qk_scores(self, speculator_prefill_cache_as_tuple: Tuple[Tuple[torch.Tensor, torch.Tensor], ...], prompt_length: int, batch_size: int):
-        if not self.captured_qs or not any(self.captured_qs):
-            raise RuntimeError("Cannot compute QK scores because no Q-vectors were captured from the speculator.")
+    def _compute_qk_scores(
+        self,
+        speculator_prefill_cache_as_tuple: Tuple[Tuple[torch.Tensor, torch.Tensor], ...],
+        prompt_length: int,
+        batch_size: int
+    ):
+        if self.speculator_model is None or not self.captured_qs or not any(self.captured_qs):
+            return
         
         spec_config = self.speculator_model.config
         num_spec_layers = spec_config.num_hidden_layers
-        spec_num_q_heads = getattr(spec_config, 'num_attention_heads', getattr(spec_config, 'num_heads', None))
+        
+        spec_num_q_heads = getattr(spec_config, 'num_attention_heads', 
+                                  getattr(spec_config, 'num_heads', None))
         spec_num_kv_heads = getattr(spec_config, 'num_key_value_heads', spec_num_q_heads)
         
-        if spec_num_q_heads is None or spec_num_kv_heads is None: 
-            raise RuntimeError("Could not determine head counts for speculator. Cannot compute QK scores.")
-            
+        if spec_num_q_heads is None or spec_num_kv_heads is None:
+            print("Warning: Could not determine head counts for speculator. Skipping QK score calculation.")
+            return
+        
         spec_num_kv_groups = spec_num_q_heads // spec_num_kv_heads
-        first_step_layer_scores_list = [torch.zeros(batch_size, prompt_length, device=self.device, dtype=self.dtype) for _ in range(num_spec_layers)]
+        
+        self.layer_qk_scores = [
+            torch.zeros(batch_size, prompt_length, device=self.device, dtype=self.dtype)
+            for _ in range(num_spec_layers)
+        ]
+        first_step_layer_scores_list = [
+            torch.zeros(batch_size, prompt_length, device=self.device, dtype=self.dtype)
+            for _ in range(num_spec_layers)
+        ]
         
         for layer_idx in range(num_spec_layers):
-            if not self.captured_qs[layer_idx] or speculator_prefill_cache_as_tuple[layer_idx][0].numel() == 0: continue
-            key_prompt_layer_spec = speculator_prefill_cache_as_tuple[layer_idx][0].detach()
-            head_dim_from_q = self.captured_qs[layer_idx][0].shape[-1]
-            key_prompt_layer_rep_spec = hf_repeat_kv(key_prompt_layer_spec, spec_num_kv_groups)
-            query_first_lookahead_layer = self.captured_qs[layer_idx][0]
-            attn_logits_first_step = torch.matmul(query_first_lookahead_layer, key_prompt_layer_rep_spec.transpose(-1, -2)) / math.sqrt(head_dim_from_q)
-            first_step_layer_scores_list[layer_idx] = attn_logits_first_step.squeeze(2).sum(dim=1)
+            if not self.captured_qs[layer_idx] or speculator_prefill_cache_as_tuple[layer_idx][0].numel() == 0:
+                continue
             
-        valid_scores = [s for s in first_step_layer_scores_list if s.numel() > 0 and s.shape == (batch_size, prompt_length)]
-        if not valid_scores:
-            raise RuntimeError("Failed to compute QK scores. No valid layer scores were generated.")
-        self.first_step_prompt_qk_scores = torch.sum(torch.stack(valid_scores), dim=0)
+            key_prompt_layer_spec = speculator_prefill_cache_as_tuple[layer_idx][0].detach()
+            key_prompt_layer_rep_spec = hf_repeat_kv(key_prompt_layer_spec, spec_num_kv_groups)
+            
+            if not self.captured_qs[layer_idx]:
+                continue
+            
+            head_dim_from_q = self.captured_qs[layer_idx][0].shape[-1]
+            
+            if len(self.captured_qs[layer_idx]) > 0:
+                query_first_lookahead_layer = self.captured_qs[layer_idx][0] 
+                attn_logits_first_step = torch.matmul(
+                    query_first_lookahead_layer, 
+                    key_prompt_layer_rep_spec.transpose(-1, -2)
+                ) / math.sqrt(head_dim_from_q)
+                attn_scores_first_step = attn_logits_first_step.squeeze(2) 
+                first_step_layer_scores_list[layer_idx] = attn_scores_first_step.sum(dim=1) 
 
-    def _get_sorted_top_k_indices(self, scores: torch.Tensor, num_to_keep: int, current_seq_len: int, device: torch.device) -> torch.Tensor:
+            for spec_idx in range(len(self.captured_qs[layer_idx])):
+                query_lookahead_layer_step = self.captured_qs[layer_idx][spec_idx]
+                attn_logits_layer_step = torch.matmul(
+                    query_lookahead_layer_step, 
+                    key_prompt_layer_rep_spec.transpose(-1, -2)
+                ) / math.sqrt(head_dim_from_q)
+                attn_scores_layer_step = attn_logits_layer_step.squeeze(2)
+                layer_total_scores_step = attn_scores_layer_step.sum(dim=1)
+                self.layer_qk_scores[layer_idx] += layer_total_scores_step
+        
+        if self.layer_qk_scores:
+            valid_layer_scores = [
+                ls for ls in self.layer_qk_scores 
+                if ls.numel() > 0 and ls.shape[0] == batch_size and ls.shape[-1] == prompt_length
+            ]
+            if valid_layer_scores:
+                self.global_qk_scores = torch.sum(torch.stack(valid_layer_scores), dim=0)
+            else:
+                self.global_qk_scores = torch.zeros(batch_size, prompt_length, device=self.device, dtype=self.dtype)
+        else:
+            self.global_qk_scores = torch.zeros(batch_size, prompt_length, device=self.device, dtype=self.dtype)
+
+        valid_first_step_layer_scores = [
+            fsls for fsls in first_step_layer_scores_list
+            if fsls.numel() > 0 and fsls.shape[0] == batch_size and fsls.shape[-1] == prompt_length
+        ]
+        if valid_first_step_layer_scores:
+            self.first_step_prompt_qk_scores = torch.sum(torch.stack(valid_first_step_layer_scores), dim=0)
+        else:
+            self.first_step_prompt_qk_scores = torch.zeros(batch_size, prompt_length, device=self.device, dtype=self.dtype)
+
+    def _get_sorted_top_k_indices(
+        self, 
+        scores: torch.Tensor, 
+        num_to_keep: int, 
+        current_seq_len: int, 
+        device: torch.device
+    ) -> torch.Tensor:
+        if current_seq_len == 0:
+            return torch.empty(0, dtype=torch.long, device=device)
+        
         num_to_keep = min(num_to_keep, current_seq_len)
-        if num_to_keep <= 0: return torch.empty(0, dtype=torch.long, device=device)
-        if num_to_keep >= current_seq_len: return torch.arange(current_seq_len, device=device, dtype=torch.long)
-        if scores.ndim > 1: scores = scores.squeeze()
-        if scores.shape[0] != current_seq_len: raise ValueError(f"Score length {scores.shape[0]} doesn't match seq_len {current_seq_len}")
+        
+        if num_to_keep == 0:
+            return torch.empty(0, dtype=torch.long, device=device)
+        
+        if scores.ndim > 1:
+            scores = scores.squeeze() 
+        
+        if scores.shape[0] != current_seq_len:
+            if current_seq_len == 0 and scores.numel() == 0:
+                return torch.empty(0, dtype=torch.long, device=device)
+            raise ValueError(f"Score length {scores.shape[0]} does not match current_seq_len {current_seq_len}")
+        
+        if num_to_keep >= current_seq_len:
+            return torch.arange(current_seq_len, device=device, dtype=torch.long)
+        
         _, top_k_indices = torch.topk(scores, k=num_to_keep)
         return torch.sort(top_k_indices)[0]
 
-    def _slice_kv_cache(self, spec_cache_tuple: Tuple[Tuple[torch.Tensor, ...], ...], target_dtype: torch.dtype, device: torch.device) -> Tuple[Optional[Tuple[Tuple[torch.Tensor, torch.Tensor], ...]], int]:
-        if not spec_cache_tuple or spec_cache_tuple[0][0].numel() == 0: return None, 0
+    def _calculate_num_tokens_to_keep(
+        self,
+        original_seq_len: int,
+        batch_size: int, 
+        device: torch.device
+    ) -> torch.Tensor:
+        # Simple fixed capacity approach
+        num_tokens_to_keep = min(self.max_capacity_prompt, original_seq_len)
         
-        batch_size, original_seq_len = spec_cache_tuple[0][0].shape[0], spec_cache_tuple[0][0].shape[2]
+        if num_tokens_to_keep <= 0:
+            return torch.empty(0, dtype=torch.long, device=device)
         
-        if self.first_step_prompt_qk_scores is None or self.first_step_prompt_qk_scores.shape != (batch_size, original_seq_len):
-            raise RuntimeError("Cannot slice KV cache without valid, correctly-sized QK scores.")
+        if num_tokens_to_keep >= original_seq_len:
+            return torch.arange(original_seq_len, device=device, dtype=torch.long)
         
-        scores = self.first_step_prompt_qk_scores[0].clone()
-        num_to_keep = min(self.max_capacity_prompt, original_seq_len)
-        final_indices = self._get_sorted_top_k_indices(scores, num_to_keep, original_seq_len, device)
+        # Use first_step_prompt_qk_scores or global_qk_scores for selection
+        scores_for_selection = None
+        if (self.first_step_prompt_qk_scores is not None and 
+            self.first_step_prompt_qk_scores.shape[0] == batch_size and 
+            self.first_step_prompt_qk_scores.shape[-1] == original_seq_len):
+            scores_for_selection = self.first_step_prompt_qk_scores[0].clone()
+        elif (self.global_qk_scores is not None and 
+              self.global_qk_scores.shape[0] == batch_size and 
+              self.global_qk_scores.shape[-1] == original_seq_len):
+            scores_for_selection = self.global_qk_scores[0].clone()
+        
+        if scores_for_selection is None:
+            # Fallback to keeping the last tokens if no scores available
+            return torch.arange(original_seq_len - num_tokens_to_keep, original_seq_len, device=device, dtype=torch.long)
+        
+        return self._get_sorted_top_k_indices(
+            scores_for_selection, num_tokens_to_keep, original_seq_len, device
+        )
 
-        if final_indices.numel() == 0 and original_seq_len > 0:
-            raise ValueError(
-                "KV cache slicing resulted in zero tokens being kept. "
-                "This can happen if `max_capacity_prompt` is too small or zero."
-            )
-        if final_indices.numel() == 0:
+    def _prune_kv_cache(
+        self,
+        spec_cache_tuple: Tuple[Tuple[torch.Tensor, torch.Tensor], ...],
+        target_dtype: torch.dtype,
+        device: torch.device
+    ) -> Tuple[Optional[Tuple[Tuple[torch.Tensor, torch.Tensor], ...]], int]:
+        if not spec_cache_tuple or spec_cache_tuple[0][0].numel() == 0:
             return None, 0
+        
+        batch_size = spec_cache_tuple[0][0].shape[0]
+        original_seq_len = spec_cache_tuple[0][0].shape[2]
+        
+        if original_seq_len == 0:
+            return spec_cache_tuple, 0
 
-        sliced_kv_list: List[Tuple[torch.Tensor, torch.Tensor]] = []
+        final_indices_to_keep = self._calculate_num_tokens_to_keep(original_seq_len, batch_size, device)
+        num_tokens_kept_for_metadata = final_indices_to_keep.numel()
+
+        pruned_kv_list: List[Tuple[torch.Tensor, torch.Tensor]] = []
         for k_l_spec, v_l_spec in spec_cache_tuple:
-            sliced_k = torch.index_select(k_l_spec, 2, final_indices).to(dtype=target_dtype)
-            sliced_v = torch.index_select(v_l_spec, 2, final_indices).to(dtype=target_dtype)
-            sliced_kv_list.append((sliced_k, sliced_v))
-        
-        return tuple(sliced_kv_list), final_indices.numel()
-    
-    def run(self, prompt_text: str, look_ahead_k: int, max_generation_length: int) -> Tuple[str, Dict[str, Any]]: 
-        run_metadata, overall_start_time = {}, time.perf_counter()
-        run_metadata["max_capacity_prompt"] = self.max_capacity_prompt
-        num_patched_layers = self._patch_speculator()
-        if num_patched_layers == 0 and look_ahead_k > 0:
-            raise RuntimeError("Speculator model could not be patched, but look_ahead_k > 0. Cannot capture Q-vectors.")
+            if k_l_spec.shape[2] == 0: 
+                pruned_kv_list.append((k_l_spec.to(dtype=target_dtype), v_l_spec.to(dtype=target_dtype)))
+                continue
             
-        limit_due_to_base, limit_due_to_speculator = self.base_config.max_position_embeddings - max_generation_length, self.speculator_model.config.max_position_embeddings - look_ahead_k
-        max_prompt_length = max(1, int(min(limit_due_to_base, limit_due_to_speculator) - self.POSITION_BUFFER))
-        inputs = self.tokenizer(prompt_text, return_tensors="pt", padding=False, truncation=True, max_length=max_prompt_length).to(self.device)
-        prompt_input_ids, prompt_length, batch_size = inputs.input_ids, inputs.input_ids.shape[1], inputs.input_ids.shape[0]
-        run_metadata["prompt_input_length"] = prompt_length
-        if prompt_length == 0: run_metadata["total_time"] = time.perf_counter() - overall_start_time; run_metadata["token_keep_rate"] = 100.0; return "", run_metadata
+            pruned_k = torch.index_select(k_l_spec, 2, final_indices_to_keep).to(dtype=target_dtype)
+            pruned_v = torch.index_select(v_l_spec, 2, final_indices_to_keep).to(dtype=target_dtype)
+            pruned_kv_list.append((pruned_k, pruned_v))
         
-        stage_start_time = time.perf_counter()
-        self.is_generating_lookaheads = False
-        spec_prompt_cache_pos = torch.arange(prompt_length, device=self.device)
-        with torch.no_grad():
-            spec_out = self.speculator_model(input_ids=prompt_input_ids, use_cache=True, cache_position=spec_prompt_cache_pos)
+        final_kept_tokens_count = 0
+        if pruned_kv_list and pruned_kv_list[0][0].numel() > 0:
+            final_kept_tokens_count = pruned_kv_list[0][0].shape[2]
         
-        speculator_prefill_cache = spec_out.past_key_values
-        speculator_prefill_cache_as_tuple: Optional[Tuple[Tuple[torch.Tensor, torch.Tensor], ...]] = None
-        if speculator_prefill_cache is not None:
-            if not isinstance(speculator_prefill_cache, tuple): speculator_prefill_cache_as_tuple = speculator_prefill_cache.to_legacy_cache()
-            else: speculator_prefill_cache_as_tuple, speculator_prefill_cache = speculator_prefill_cache, DynamicCache.from_legacy_cache(speculator_prefill_cache)
-        
-        if speculator_prefill_cache_as_tuple is None:
-            raise RuntimeError("Speculator prefill did not return a past_key_values cache.")
+        # Ensure consistency
+        assert final_kept_tokens_count == num_tokens_kept_for_metadata, \
+               f"Mismatch in kept token count: {final_kept_tokens_count} vs {num_tokens_kept_for_metadata}"
 
-        speculator_next_token_ids = torch.argmax(spec_out.logits[:, -1, :], dim=-1, keepdim=True)
-        [q_list.clear() for q_list in self.captured_qs]
-        run_metadata["speculation_prefill"] = time.perf_counter() - stage_start_time
+        return tuple(pruned_kv_list), final_kept_tokens_count
+    
+    def run(
+        self,
+        prompt_text: str,
+        look_ahead_k: int,
+        max_generation_length: int
+    ) -> Tuple[str, Dict[str, Any]]: 
+        run_metadata: Dict[str, Any] = {} 
+        overall_start_time = time.perf_counter()
+
+        run_metadata["max_capacity_prompt"] = self.max_capacity_prompt
         
-        stage_start_time = time.perf_counter()
-        if look_ahead_k > 0:
-            self.is_generating_lookaheads = True
-            with torch.no_grad():
-                self.speculator_model(input_ids=speculator_next_token_ids, position_ids=torch.tensor([[prompt_length]], device=self.device), past_key_values=speculator_prefill_cache, use_cache=True, cache_position=torch.tensor([prompt_length], device=self.device))
+        num_patched_layers = 0
+        if self.speculator_model is not None:
+            num_patched_layers = self._patch_speculator() 
+        
+        limit_due_to_base = self.base_config.max_position_embeddings - max_generation_length
+        if self.speculator_model is not None:
+            limit_due_to_speculator = self.speculator_model.config.max_position_embeddings - look_ahead_k
+            max_prompt_len_calc = float(min(limit_due_to_base, limit_due_to_speculator) - self.POSITION_BUFFER)
+        else:
+            max_prompt_len_calc = float(limit_due_to_base - self.POSITION_BUFFER)
+        
+        max_prompt_length = max(1, int(max_prompt_len_calc))
+        
+        inputs = self.tokenizer(
+            prompt_text,
+            return_tensors="pt",
+            padding=False,
+            truncation=True,
+            max_length=max_prompt_length
+        ).to(self.device)
+        
+        prompt_input_ids = inputs.input_ids
+        prompt_length = inputs.input_ids.shape[1]
+        batch_size = inputs.input_ids.shape[0]
+        num_kept_tokens_for_base_prefill = prompt_length # Default to full prefill
+
+        run_metadata["prompt_input_length"] = prompt_length 
+        
+        if prompt_length == 0:
+            run_metadata["total_time"] = time.perf_counter() - overall_start_time
+            run_metadata["token_keep_rate"] = 100.0
+            return "", run_metadata
+        
+        speculator_prefill_cache: Optional[Cache] = None
+        speculator_prefill_cache_as_tuple: Optional[Tuple[Tuple[torch.Tensor, torch.Tensor], ...]] = None
+        speculator_next_token_ids: Optional[torch.Tensor] = None
+        speculation_prefill_time = 0.0
+        
+        if self.speculator_model is not None:
+            stage_start_time = time.perf_counter()
             self.is_generating_lookaheads = False
-        run_metadata["speculation_decode"] = time.perf_counter() - stage_start_time
+            
+            spec_prompt_cache_pos = torch.arange(prompt_length, device=self.device)
+            with torch.no_grad():
+                spec_out = self.speculator_model(
+                    input_ids=prompt_input_ids,
+                    use_cache=True,
+                    cache_position=spec_prompt_cache_pos
+                )
+            
+            speculator_prefill_cache = spec_out.past_key_values
+            if speculator_prefill_cache is not None:
+                if not isinstance(speculator_prefill_cache, tuple): 
+                    speculator_prefill_cache_as_tuple = speculator_prefill_cache.to_legacy_cache()
+                else: 
+                    speculator_prefill_cache_as_tuple = speculator_prefill_cache
+                    speculator_prefill_cache = DynamicCache.from_legacy_cache(speculator_prefill_cache) 
+            
+            speculator_next_token_ids = torch.argmax(spec_out.logits[:, -1, :], dim=-1, keepdim=True)
+            
+            if num_patched_layers > 0: 
+                for q_list in self.captured_qs:
+                    q_list.clear()
+            
+            speculation_prefill_time = time.perf_counter() - stage_start_time
         
-        self._compute_qk_scores(speculator_prefill_cache_as_tuple, prompt_length, batch_size)
+        run_metadata["speculation_prefill"] = speculation_prefill_time
+        
+        generated_speculator_ids: List[int] = []
+        current_spec_cache_lookahead: Optional[Cache] = speculator_prefill_cache 
+        speculation_decode_time = 0.0
+        
+        if (self.speculator_model is not None and 
+            num_patched_layers > 0 and 
+            look_ahead_k > 0 and
+            speculator_next_token_ids is not None and 
+            current_spec_cache_lookahead is not None): 
+            
+            stage_start_time = time.perf_counter()
+            self.is_generating_lookaheads = True 
+            
+            current_spec_tokens = speculator_next_token_ids
+            current_spec_pos = prompt_length
+            
+            for _ in range(look_ahead_k):
+                cache_len = current_spec_cache_lookahead.get_seq_length(0) 
+                lookahead_cache_pos = torch.tensor([cache_len], device=self.device, dtype=torch.long)
+                lookahead_pos_ids = torch.tensor([[current_spec_pos]], device=self.device, dtype=torch.long)
+                
+                with torch.no_grad():
+                    lookahead_out = self.speculator_model(
+                        input_ids=current_spec_tokens,
+                        position_ids=lookahead_pos_ids,
+                        past_key_values=current_spec_cache_lookahead,
+                        use_cache=True,
+                        cache_position=lookahead_cache_pos
+                    )
+                
+                current_spec_cache_lookahead = lookahead_out.past_key_values
+                current_spec_tokens = torch.argmax(lookahead_out.logits[:, -1, :], dim=-1, keepdim=True)
+                
+                token_id = current_spec_tokens.item()
+                generated_speculator_ids.append(token_id)
+                current_spec_pos += 1
+                
+                if token_id in self.eos_token_ids:
+                    break
+            
+            self.is_generating_lookaheads = False
+            speculation_decode_time = time.perf_counter() - stage_start_time
+        
+        run_metadata["speculation_decode"] = speculation_decode_time
+        
+        num_lookahead_steps = len(generated_speculator_ids)
+        if (self.speculator_model is not None and 
+            num_lookahead_steps > 0 and 
+            num_patched_layers > 0 and
+            speculator_prefill_cache_as_tuple is not None):
+            self._compute_qk_scores(speculator_prefill_cache_as_tuple, prompt_length, batch_size)
         
         base_model_first_token_gen_start_time = time.perf_counter()
+        base_model_cache_after_prefill: Optional[Cache] = None
+        base_model_next_token_ids: Optional[torch.Tensor] = None
         
-        run_metadata["spec_cache_len_before_slice"] = speculator_prefill_cache_as_tuple[0][0].shape[2]
-        sliced_kv_tuple, num_tokens_in_shared_cache = self._slice_kv_cache(speculator_prefill_cache_as_tuple, self.base_model.dtype, self.device)
-        run_metadata["spec_cache_len_after_slice"] = num_tokens_in_shared_cache
+        current_pruning_applicable = (self.speculator_model is not None and 
+                                     num_lookahead_steps > 0 and 
+                                     num_patched_layers > 0 and
+                                     self.first_step_prompt_qk_scores is not None) # Scores must be computed
         
-        injected_cache_dynamic = DynamicCache()
-        if sliced_kv_tuple:
-            for layer_idx, (k, v) in enumerate(sliced_kv_tuple): injected_cache_dynamic.update(k, v, layer_idx)
+        if self.speculator_model is None: 
+            base_prefill_cache_pos = torch.arange(prompt_length, device=self.device)
+            with torch.no_grad():
+                base_out = self.base_model(
+                    input_ids=prompt_input_ids,
+                    use_cache=True,
+                    cache_position=base_prefill_cache_pos
+                )
+            base_model_next_token_ids = torch.argmax(base_out.logits[:, -1, :], dim=-1, keepdim=True)
+            base_model_cache_after_prefill = base_out.past_key_values
         
-        knockout_tokens, knockout_pos_ids = prompt_input_ids[:, -1:], torch.tensor([[prompt_length - 1]], device=self.device)
-        knockout_cache_pos = torch.tensor([injected_cache_dynamic.get_seq_length(0)], device=self.device)
-        with torch.no_grad():
-            knockout_out = self.base_model(knockout_tokens, position_ids=knockout_pos_ids, past_key_values=injected_cache_dynamic, use_cache=True, cache_position=knockout_cache_pos)
-        base_model_next_token_ids, base_model_cache_after_prefill = torch.argmax(knockout_out.logits[:, -1, :], dim=-1, keepdim=True), knockout_out.past_key_values
+        else: # KV cache sharing path
+            knockout_past_kv_dynamic: DynamicCache = DynamicCache()
+            n_tokens_in_knockout_cache = 0 
+            
+            if speculator_prefill_cache_as_tuple is not None:
+                spec_cache_original_len = speculator_prefill_cache_as_tuple[0][0].shape[2]
+                run_metadata["spec_cache_len_before_prune"] = spec_cache_original_len
+
+                pruned_kv_tuple_result: Optional[Tuple[Tuple[torch.Tensor, torch.Tensor], ...]] = None
+                if current_pruning_applicable: 
+                    pruned_kv_tuple_result, n_tokens_in_knockout_cache = self._prune_kv_cache(
+                        speculator_prefill_cache_as_tuple,
+                        self.base_model.dtype,
+                        self.device
+                    )
+                else: 
+                    pruned_kv_tuple_result = speculator_prefill_cache_as_tuple
+                    n_tokens_in_knockout_cache = spec_cache_original_len
+                
+                run_metadata["spec_cache_len_after_prune"] = n_tokens_in_knockout_cache 
+                num_kept_tokens_for_base_prefill = n_tokens_in_knockout_cache
+                
+                if pruned_kv_tuple_result is not None:
+                    for layer_idx, (k, v) in enumerate(pruned_kv_tuple_result):
+                        knockout_past_kv_dynamic.update(k.to(self.base_model.dtype), v.to(self.base_model.dtype), layer_idx)
+            else: 
+                run_metadata["spec_cache_len_before_prune"] = 0 
+                run_metadata["spec_cache_len_after_prune"] = 0
+            
+            knockout_tokens = prompt_input_ids[:, -1:]
+            knockout_pos_ids = torch.tensor([[prompt_length - 1]], device=self.device, dtype=torch.long)
+            # Use actual length of cache after pruning for knockout_cache_pos
+            actual_knockout_cache_len = knockout_past_kv_dynamic.get_seq_length(0) if knockout_past_kv_dynamic.key_cache else 0
+            knockout_cache_pos = torch.tensor([actual_knockout_cache_len], device=self.device, dtype=torch.long)
+            
+            with torch.no_grad():
+                knockout_out = self.base_model(
+                    knockout_tokens,
+                    position_ids=knockout_pos_ids,
+                    past_key_values=knockout_past_kv_dynamic,
+                    use_cache=True,
+                    cache_position=knockout_cache_pos
+                )
+            
+            base_model_next_token_ids = torch.argmax(knockout_out.logits[:, -1, :], dim=-1, keepdim=True)
+            base_model_cache_after_prefill = knockout_out.past_key_values
         
-        run_metadata["token_keep_rate"] = (num_tokens_in_shared_cache / prompt_length * 100.0) if prompt_length > 0 else 100.0
+        if prompt_length > 0:
+            run_metadata["token_keep_rate"] = (num_kept_tokens_for_base_prefill / prompt_length) * 100.0
+        else:
+            run_metadata["token_keep_rate"] = 100.0
+        
         base_model_first_token_time = time.perf_counter() - base_model_first_token_gen_start_time
         run_metadata["base_prefill"] = base_model_first_token_time
-        run_metadata["base_ttft"] = run_metadata["speculation_prefill"] + run_metadata["speculation_decode"] + base_model_first_token_time
         
-        gen_token_ids_list, final_gen_text = [], ""
+        if self.speculator_model is not None:
+            run_metadata["base_ttft"] = speculation_prefill_time + speculation_decode_time + base_model_first_token_time
+        else:
+            run_metadata["base_ttft"] = base_model_first_token_time
+        
+        gen_token_ids_list: List[int] = []
+        final_gen_text = ""
+        
         if base_model_next_token_ids is not None and base_model_cache_after_prefill is not None:
-            gen_token_ids_list.append(base_model_next_token_ids.item())
-            current_decode_tokens, current_decode_kv_cache, current_real_pos = base_model_next_token_ids, base_model_cache_after_prefill, prompt_length
-            if not isinstance(current_decode_kv_cache, DynamicCache):
-                if isinstance(current_decode_kv_cache, tuple): current_decode_kv_cache = DynamicCache.from_legacy_cache(current_decode_kv_cache)
-                elif not isinstance(current_decode_kv_cache, Cache): raise TypeError(f"Unexpected cache type: {type(current_decode_kv_cache)}")
-            current_cache_write_pos = current_decode_kv_cache.get_seq_length(0)
-            if gen_token_ids_list[-1] not in self.eos_token_ids:
+            first_gen_token_id = base_model_next_token_ids.item()
+            gen_token_ids_list.append(first_gen_token_id)
+            
+            current_decode_tokens = base_model_next_token_ids
+            current_decode_kv_cache: Cache = base_model_cache_after_prefill
+            current_real_pos = prompt_length
+            
+            if not isinstance(current_decode_kv_cache, DynamicCache): 
+                 if isinstance(current_decode_kv_cache, tuple): # Legacy
+                    current_decode_kv_cache = DynamicCache.from_legacy_cache(current_decode_kv_cache)
+                 elif not isinstance(current_decode_kv_cache, Cache): # Should not happen with HF models
+                    raise TypeError(f"Unexpected cache type: {type(current_decode_kv_cache)}")
+
+            current_cache_write_pos = current_decode_kv_cache.get_seq_length(0) if current_decode_kv_cache.key_cache else 0
+            
+            if first_gen_token_id not in self.eos_token_ids:
                 for _ in range(max_generation_length - 1):
+                    decode_pos_ids = torch.tensor([[current_real_pos]], device=self.device, dtype=torch.long)
+                    decode_cache_pos = torch.tensor([current_cache_write_pos], device=self.device, dtype=torch.long)
+                    
                     with torch.no_grad():
-                        decode_out = self.base_model(current_decode_tokens, position_ids=torch.tensor([[current_real_pos]], device=self.device), past_key_values=current_decode_kv_cache, use_cache=True, cache_position=torch.tensor([current_cache_write_pos], device=self.device))
+                        decode_out = self.base_model(
+                            current_decode_tokens,
+                            position_ids=decode_pos_ids,
+                            past_key_values=current_decode_kv_cache,
+                            use_cache=True,
+                            cache_position=decode_cache_pos
+                        )
+                    
                     next_tokens = torch.argmax(decode_out.logits[:, -1, :], dim=-1, keepdim=True)
-                    gen_token_ids_list.append(next_tokens.item())
-                    current_decode_tokens, current_decode_kv_cache, current_real_pos, current_cache_write_pos = next_tokens, decode_out.past_key_values, current_real_pos + 1, current_cache_write_pos + 1
-                    if gen_token_ids_list[-1] in self.eos_token_ids: break
+                    next_token_id = next_tokens.item()
+                    gen_token_ids_list.append(next_token_id)
+                    
+                    current_decode_tokens = next_tokens
+                    current_decode_kv_cache = decode_out.past_key_values
+                    current_real_pos += 1
+                    current_cache_write_pos += 1
+                    
+                    if next_token_id in self.eos_token_ids:
+                        break
+            
             final_gen_text = self.tokenizer.decode(gen_token_ids_list, skip_special_tokens=True)
         
         run_metadata["total_time"] = time.perf_counter() - overall_start_time
-        if final_gen_text.startswith("assistant\n\n"): final_gen_text = final_gen_text[len("assistant\n\n"):]
-        elif final_gen_text.startswith(" assistant\n"): final_gen_text = final_gen_text[len(" assistant\n"):]
+        
+        if final_gen_text.startswith("assistant\n\n"):
+            final_gen_text = final_gen_text[len("assistant\n\n"):]
+        elif final_gen_text.startswith(" assistant\n"):
+            final_gen_text = final_gen_text[len(" assistant\n"):]
+        
         return final_gen_text, run_metadata
 
+
 def main():
-    parser = argparse.ArgumentParser(description="EchoCachePipeline with KV Cache Sharing")
+    parser = argparse.ArgumentParser(description="Echo Cache Pipeline with KV Cache Sharing")
     parser.add_argument("--base_model_name", type=str, default="meta-llama/Llama-3.1-8B-Instruct")
-    parser.add_argument("--speculator_model_name", type=str, required=True, help="Speculator model is required for EchoCachePipeline.")
+    parser.add_argument("--speculator_model_name", type=str, default=None, 
+                        help="Set to 'None' or omit for no speculator.")
     parser.add_argument("--dataset_name", type=str, default="hotpotqa")
     parser.add_argument("--look_ahead_k", type=int, default=1)
-    parser.add_argument("--max_capacity_prompt", type=int, default=256, help="The maximum number of prompt tokens to keep for the shared KV cache.")
+    parser.add_argument("--max_capacity_prompt", type=int, default=512,
+                        help="Maximum number of tokens to keep for base model prefill. Default: 512")
     parser.add_argument("--max_generation_length", type=int, default=32)
     args = parser.parse_args()
     
-    if QTIP_AVAILABLE: print("QTIP modules found and enabled for QTIP models.")
-    else: print("Warning: QTIP modules not found. QTIP model support disabled.")
+    if args.speculator_model_name and args.speculator_model_name.lower() == "none":
+        args.speculator_model_name = None
+    
+    if QTIP_AVAILABLE:
+        print("QTIP modules found and enabled for QTIP models.")
+    else:
+        print("Warning: QTIP modules not found. QTIP model support disabled.")
     
     pipeline = EchoCachePipeline(
         base_model_name=args.base_model_name,
@@ -487,44 +826,44 @@ def main():
     )
     
     prompt_str: str
-    try:
+    if args.dataset_name == "hotpotqa":
         dataset = load_dataset('THUDM/LongBench', args.dataset_name, split='test', trust_remote_code=True)
         sample = dataset[0]
-        context, input_text = sample.get('context', ''), sample.get('input', '')
+        context = sample.get('context', '') if isinstance(sample, dict) else ''
+        input_text = sample.get('input', '') if isinstance(sample, dict) else ''
         messages = [{"role": "user", "content": f"Context: {context}\nQuestion: {input_text}\nAnswer:"}]
         prompt_str = pipeline.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    except Exception as e:
-        print(f"Could not load dataset '{args.dataset_name}'. Using a default prompt. Error: {e}")
+    else:
         messages = [{"role": "user", "content": "Explain the theory of relativity in simple terms."}]
         prompt_str = pipeline.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
     
-    print(f"--- Running EchoCachePipeline ---")
-    print(f"Base Model: {args.base_model_name}")
-    print(f"Speculator Model: {args.speculator_model_name}")
-    print(f"Max Shared Cache Capacity: {args.max_capacity_prompt}")
-    print("-" * 35)
-
     generated_text, run_metadata = pipeline.run(
         prompt_text=prompt_str,
         look_ahead_k=args.look_ahead_k,
         max_generation_length=args.max_generation_length
     )
     
-    print(f"\n--- Generated Text ---")
-    print(generated_text)
-    print("-" * 22)
+    print(f"\n--- Generated Output ({len(pipeline.tokenizer.encode(generated_text))} tokens) ---")
+    print(f"{generated_text}")
+    
+    print(f"\n--- Run Metadata & Timing Information ---") 
+    for key, value in run_metadata.items():
+        if isinstance(value, float):
+            print(f"  {key}: {value:.4f}")
+        else:
+            print(f"  {key}: {value}") 
+    
+    print(f"\n--- Model Information ---")
+    print(f"Base model: {args.base_model_name}")
+    
+    if args.speculator_model_name:
+        print(f"Speculator model: {args.speculator_model_name}")
+    else:
+        print("No speculator model used")
+    
+    print(f"Max Capacity Prompt: {args.max_capacity_prompt}")
+    print(f"Lookahead K: {args.look_ahead_k}")
 
-    print("\n--- Performance Metrics ---")
-    print(f"Prompt Length (Tokens): {run_metadata.get('prompt_input_length', 'N/A')}")
-    print(f"Spec Cache Before Slicing: {run_metadata.get('spec_cache_len_before_slice', 'N/A')}")
-    print(f"Spec Cache After Slicing (Shared): {run_metadata.get('spec_cache_len_after_slice', 'N/A')}")
-    print(f"Token Keep Rate: {run_metadata.get('token_keep_rate', 0):.2f}%")
-    print(f"Time to First Token (TTFT): {run_metadata.get('base_ttft', 0):.4f} seconds")
-    print(f"  - Speculator Prefill: {run_metadata.get('speculation_prefill', 0):.4f} s")
-    print(f"  - Speculator Decode/Scoring: {run_metadata.get('speculation_decode', 0):.4f} s")
-    print(f"  - Base Model Knockout Pass: {run_metadata.get('base_prefill', 0):.4f} s")
-    print(f"Total Pipeline Time: {run_metadata.get('total_time', 0):.4f} seconds")
-    print("-" * 27)
 
 if __name__ == "__main__":
     main()
