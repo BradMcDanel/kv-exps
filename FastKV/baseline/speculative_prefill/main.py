@@ -318,6 +318,87 @@ class SpeculativePrefillPipeline:
         
         return num_patched_layers
     
+
+    def _denoise_and_select_chunks(
+        self,
+        scores: torch.Tensor,
+        num_to_keep: int,
+        original_seq_len: int,
+        chunk_size: int = 64, # A reasonable default, can be tuned
+        pool_kernel_size: int = 7 # As mentioned in FastKV/Speculative Prefill
+    ) -> torch.Tensor:
+        """
+        Applies 1D average pooling to denoise scores, then selects the top-K chunks.
+        This function implements the logic from Section 3.2.3 of the paper.
+        """
+        device = scores.device
+        if original_seq_len <= num_to_keep:
+            return torch.arange(original_seq_len, device=device, dtype=torch.long)
+
+        # 1. Denoise with 1D Average Pooling
+        # Reshape for avg_pool1d: (N, C_in, L_in) -> (batch_size=1, channels=1, length)
+        scores_for_pooling = scores.view(1, 1, -1)
+        
+        # The paper mentions pooling before chunking.
+        # We use padding to keep the tensor size the same.
+        padding = (pool_kernel_size - 1) // 2
+        smoothed_scores = F.avg_pool1d(
+            scores_for_pooling,
+            kernel_size=pool_kernel_size,
+            stride=1,
+            padding=padding
+        ).squeeze()
+
+        # 2. Chunk Selection
+        # If the sequence is too short for chunking, fall back to simple top-k on smoothed scores
+        if original_seq_len < chunk_size:
+            return self._get_sorted_top_k_indices(smoothed_scores, num_to_keep, original_seq_len, device)
+
+        # Pad scores to be divisible by chunk_size
+        num_chunks = math.ceil(original_seq_len / chunk_size)
+        padding_len = num_chunks * chunk_size - original_seq_len
+        if padding_len > 0:
+            # Pad with a very low value so these don't get selected
+            padded_scores = F.pad(smoothed_scores, (0, padding_len), value=float('-inf'))
+        else:
+            padded_scores = smoothed_scores
+
+        # Reshape into chunks and calculate the average score per chunk
+        chunked_scores = padded_scores.view(num_chunks, chunk_size)
+        avg_chunk_scores = chunked_scores.mean(dim=1)
+
+        # Determine how many chunks to keep
+        # We want to keep at least `num_to_keep` tokens
+        num_chunks_to_keep = math.ceil(num_to_keep / chunk_size)
+        num_chunks_to_keep = min(num_chunks_to_keep, num_chunks) # Cannot keep more chunks than exist
+
+        # Select the top-K chunks
+        _, top_chunk_indices = torch.topk(avg_chunk_scores, k=num_chunks_to_keep)
+
+        # 3. Restore Final Token Indices
+        # Create a tensor of all indices from the selected chunks
+        selected_indices = []
+        for chunk_idx in top_chunk_indices:
+            start = chunk_idx * chunk_size
+            end = start + chunk_size
+            selected_indices.append(torch.arange(start, end, device=device))
+
+        final_indices = torch.cat(selected_indices)
+
+        # The selected indices might be longer than original_seq_len due to padding,
+        # and might be more than num_to_keep due to chunk granularity.
+        # We filter out padded indices and then, if needed, take top-k from the selected tokens.
+        final_indices = final_indices[final_indices < original_seq_len]
+        
+        # The paper isn't explicit on what to do if chunking gives you > num_to_keep tokens.
+        # A robust strategy is to re-score only the selected tokens and take the best.
+        if len(final_indices) > num_to_keep:
+            final_scores = smoothed_scores[final_indices]
+            _, top_k_in_chunks_indices = torch.topk(final_scores, k=num_to_keep)
+            final_indices = final_indices[top_k_in_chunks_indices]
+
+        return torch.sort(final_indices)[0]
+
     def _compute_qk_scores(
         self,
         speculator_prefill_cache_as_tuple: Tuple[Tuple[torch.Tensor, torch.Tensor], ...],
@@ -340,64 +421,69 @@ class SpeculativePrefillPipeline:
         
         spec_num_kv_groups = spec_num_q_heads // spec_num_kv_heads
         
-        self.layer_qk_scores = [
-            torch.zeros(batch_size, prompt_length, device=self.device, dtype=self.dtype)
-            for _ in range(num_spec_layers)
-        ]
+        # This will now store a list of score tensors, one for each look-ahead step.
+        lookahead_step_scores = []
+        
+        # Store scores for the very first step separately for potential pruning
         first_step_layer_scores_list = [
             torch.zeros(batch_size, prompt_length, device=self.device, dtype=self.dtype)
             for _ in range(num_spec_layers)
         ]
-        
-        for layer_idx in range(num_spec_layers):
-            if not self.captured_qs[layer_idx] or speculator_prefill_cache_as_tuple[layer_idx][0].numel() == 0:
-                continue
-            
-            key_prompt_layer_spec = speculator_prefill_cache_as_tuple[layer_idx][0].detach()
-            key_prompt_layer_rep_spec = hf_repeat_kv(key_prompt_layer_spec, spec_num_kv_groups)
-            
-            if not self.captured_qs[layer_idx]:
-                continue
-            
-            head_dim_from_q = self.captured_qs[layer_idx][0].shape[-1]
-            
-            if len(self.captured_qs[layer_idx]) > 0:
-                query_first_lookahead_layer = self.captured_qs[layer_idx][0] 
-                attn_logits_first_step = torch.matmul(
-                    query_first_lookahead_layer, 
-                    key_prompt_layer_rep_spec.transpose(-1, -2)
-                ) / math.sqrt(head_dim_from_q)
-                attn_scores_first_step = attn_logits_first_step.squeeze(2) 
-                first_step_layer_scores_list[layer_idx] = attn_scores_first_step.sum(dim=1) 
 
-            for spec_idx in range(len(self.captured_qs[layer_idx])):
+        for spec_idx in range(len(self.captured_qs[0])): # Iterate over look-ahead steps
+            
+            # This will store the scores for each layer for the *current* look-ahead step
+            current_step_layer_scores = []
+            
+            for layer_idx in range(num_spec_layers):
+                if not self.captured_qs[layer_idx] or len(self.captured_qs[layer_idx]) <= spec_idx:
+                    continue
+                if speculator_prefill_cache_as_tuple[layer_idx][0].numel() == 0:
+                    continue
+
+                key_prompt_layer_rep_spec = hf_repeat_kv(
+                    speculator_prefill_cache_as_tuple[layer_idx][0].detach(), 
+                    spec_num_kv_groups
+                )
+                
+                head_dim_from_q = self.captured_qs[layer_idx][spec_idx].shape[-1]
+                
                 query_lookahead_layer_step = self.captured_qs[layer_idx][spec_idx]
+                
                 attn_logits_layer_step = torch.matmul(
                     query_lookahead_layer_step, 
                     key_prompt_layer_rep_spec.transpose(-1, -2)
                 ) / math.sqrt(head_dim_from_q)
-                attn_scores_layer_step = attn_logits_layer_step.squeeze(2)
-                layer_total_scores_step = attn_scores_layer_step.sum(dim=1)
-                self.layer_qk_scores[layer_idx] += layer_total_scores_step
-        
-        if self.layer_qk_scores:
-            valid_layer_scores = [
-                ls for ls in self.layer_qk_scores 
-                if ls.numel() > 0 and ls.shape[0] == batch_size and ls.shape[-1] == prompt_length
-            ]
-            if valid_layer_scores:
-                self.global_qk_scores = torch.sum(torch.stack(valid_layer_scores), dim=0)
-            else:
-                self.global_qk_scores = torch.zeros(batch_size, prompt_length, device=self.device, dtype=self.dtype)
+                
+                # According to the paper, take max over heads (dim=1)
+                # The result is (batch_size, seq_len)
+                layer_max_head_scores = attn_logits_layer_step.max(dim=1).values.squeeze(1)
+                
+                current_step_layer_scores.append(layer_max_head_scores)
+
+                # Keep track of the first step scores separately
+                if spec_idx == 0:
+                    first_step_layer_scores_list[layer_idx] = layer_max_head_scores
+
+            if current_step_layer_scores:
+                # According to the paper, take max over layers (dim=0)
+                # Stack along a new dimension and take the max
+                step_final_scores = torch.stack(current_step_layer_scores).max(dim=0).values
+                lookahead_step_scores.append(step_final_scores)
+
+        if lookahead_step_scores:
+            # According to the paper, average over look-ahead steps (dim=0)
+            self.global_qk_scores = torch.stack(lookahead_step_scores).mean(dim=0)
         else:
             self.global_qk_scores = torch.zeros(batch_size, prompt_length, device=self.device, dtype=self.dtype)
 
+        # For the first-step scores, we still use max over layers
         valid_first_step_layer_scores = [
             fsls for fsls in first_step_layer_scores_list
             if fsls.numel() > 0 and fsls.shape[0] == batch_size and fsls.shape[-1] == prompt_length
         ]
         if valid_first_step_layer_scores:
-            self.first_step_prompt_qk_scores = torch.sum(torch.stack(valid_first_step_layer_scores), dim=0)
+            self.first_step_prompt_qk_scores = torch.stack(valid_first_step_layer_scores).max(dim=0).values
         else:
             self.first_step_prompt_qk_scores = torch.zeros(batch_size, prompt_length, device=self.device, dtype=self.dtype)
 
@@ -436,7 +522,6 @@ class SpeculativePrefillPipeline:
         batch_size: int, 
         device: torch.device
     ) -> torch.Tensor:
-        # Simple fixed capacity approach
         num_tokens_to_keep = min(self.max_capacity_prompt, original_seq_len)
         
         if num_tokens_to_keep <= 0:
@@ -445,25 +530,23 @@ class SpeculativePrefillPipeline:
         if num_tokens_to_keep >= original_seq_len:
             return torch.arange(original_seq_len, device=device, dtype=torch.long)
         
-        # Use first_step_prompt_qk_scores or global_qk_scores for selection
+        # Use global_qk_scores as it incorporates look-ahead information.
+        # The paper is a bit ambiguous, but this is a more robust choice.
         scores_for_selection = None
-        if (self.first_step_prompt_qk_scores is not None and 
-            self.first_step_prompt_qk_scores.shape[0] == batch_size and 
-            self.first_step_prompt_qk_scores.shape[-1] == original_seq_len):
-            scores_for_selection = self.first_step_prompt_qk_scores[0].clone()
-        elif (self.global_qk_scores is not None and 
-              self.global_qk_scores.shape[0] == batch_size and 
-              self.global_qk_scores.shape[-1] == original_seq_len):
+        if (self.global_qk_scores is not None and 
+            self.global_qk_scores.shape[0] == batch_size and 
+            self.global_qk_scores.shape[-1] == original_seq_len):
             scores_for_selection = self.global_qk_scores[0].clone()
         
         if scores_for_selection is None:
-            # Fallback to keeping the last tokens if no scores available
-            return torch.arange(original_seq_len - num_tokens_to_keep, original_seq_len, device=device, dtype=torch.long)
+            raise ValueError("scores_for_selection is None")
         
-        return self._get_sorted_top_k_indices(
-            scores_for_selection, num_tokens_to_keep, original_seq_len, device
-        )
-    
+        return self._denoise_and_select_chunks(
+            scores=scores_for_selection,
+            num_to_keep=num_tokens_to_keep,
+            original_seq_len=original_seq_len
+        )    
+
     def run(
         self,
         prompt_text: str,
