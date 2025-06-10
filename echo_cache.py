@@ -625,7 +625,7 @@ def main():
         print(f"Could not load dataset '{args.dataset_name}'. Using a default prompt. Error: {e}")
         prompt_str = "Explain the theory of relativity in simple terms."
     
-    selection_strategy = f"Chunk-based (size={pipeline.chunk_size})" if pipeline.use_chunk_selection else "Simple Top-K"
+    selection_strategy = f"Chunk-based (size={pipeline.chunk_size})" if pipeline.use_chunk_selection else "Top-K"
     print(f"--- Running EchoCachePipeline ---")
     print(f"Base Model: {args.base_model_name}")
     print(f"Speculator Model: {args.speculator_model_name}")

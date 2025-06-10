@@ -50,6 +50,7 @@ def setup_model_and_tokenizer(args):
             max_capacity_prompt=args.max_capacity_prompt,
             pool_kernel_size=args.kernel_size if args.pooling != 'none' else None,
             pool_type=args.pooling,
+            use_chunk_selection=args.use_chunk_selection, # Correctly passed
             chunk_size=args.chunk_size,
         )
     elif args.mode == "echo_cache":
@@ -58,7 +59,11 @@ def setup_model_and_tokenizer(args):
         pipeline = Pipeline(
             base_model_name=args.model,
             speculator_model_name=args.speculator_model_name,
-            max_capacity_prompt=args.max_capacity_prompt
+            max_capacity_prompt=args.max_capacity_prompt,
+            pool_kernel_size=args.kernel_size if args.pooling != 'none' else None,
+            pool_type=args.pooling,
+            use_chunk_selection=args.use_chunk_selection, # Correctly passed
+            chunk_size=args.chunk_size,
         )
     else:
         # Standard modes require explicit model loading and configuration.
@@ -228,6 +233,7 @@ if __name__ == "__main__":
     # Speculative Prefill / Echo Cache
     parser.add_argument("--speculator_model_name", type=str, default="meta-llama/Llama-3-8B-Instruct", help="Speculator model for prefill/echocache. Ensure compatibility.")
     parser.add_argument("--look_ahead_k", type=int, default=1, help="Number of lookahead steps for Speculative Prefill.")
+    parser.add_argument("--use_chunk_selection", action='store_true', help="Enable chunk-based token selection. Default is simple top-k.") # FIX: Changed to opt-in
     parser.add_argument("--chunk_size", type=int, default=64, help="Chunk size for Speculative Prefill.")
     
     # FastKV
