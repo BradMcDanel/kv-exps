@@ -11,7 +11,6 @@ from tqdm import tqdm
 from pathlib import Path
 
 import torch
-import torch.nn as nn
 
 from transformers import AutoModelForCausalLM, AutoTokenizer, set_seed
 from datasets import load_dataset
@@ -47,10 +46,11 @@ def setup_model_and_tokenizer(args):
         pipeline = Pipeline(
             base_model_name=args.model,
             speculator_model_name=args.speculator_model_name,
+            tokenizer=tokenizer,
             max_capacity_prompt=args.max_capacity_prompt,
             pool_kernel_size=args.kernel_size if args.pooling != 'none' else None,
             pool_type=args.pooling,
-            use_chunk_selection=args.use_chunk_selection, # Correctly passed
+            use_chunk_selection=args.use_chunk_selection, 
             chunk_size=args.chunk_size,
         )
     elif args.mode == "echo_cache":
@@ -59,10 +59,11 @@ def setup_model_and_tokenizer(args):
         pipeline = Pipeline(
             base_model_name=args.model,
             speculator_model_name=args.speculator_model_name,
+            tokenizer=tokenizer,
             max_capacity_prompt=args.max_capacity_prompt,
             pool_kernel_size=args.kernel_size if args.pooling != 'none' else None,
             pool_type=args.pooling,
-            use_chunk_selection=args.use_chunk_selection, # Correctly passed
+            use_chunk_selection=args.use_chunk_selection, 
             chunk_size=args.chunk_size,
         )
     else:
@@ -125,7 +126,6 @@ def build_chat(tokenizer, prompt, model_name):
 # 2. RUNTIME PHASE: Functions for repetitive processing
 # =====================================================================================
 
-@torch.inference_mode()
 def generate_longbench(data, max_length, max_gen, prompt_format, 
                        dataset, model, pipeline, tokenizer,
                        out_path, args):
@@ -134,37 +134,49 @@ def generate_longbench(data, max_length, max_gen, prompt_format,
     if model is not None:
         device = model.device
 
+    i = 0
     for json_obj in tqdm(data, desc=f"Generating Responses for {args.mode}..."):
+        if i == 3:
+            break
+        i+=1
         prompt = prompt_format.format(**json_obj)
-        tokenized_prompt = tokenizer(prompt, truncation=False, return_tensors="pt").input_ids[0]
-        if len(tokenized_prompt) > max_length:
+        # Tokenize once to check length, then decode for truncation
+        tokenized_prompt_ids = tokenizer.encode(prompt, add_special_tokens=False)
+        if len(tokenized_prompt_ids) > max_length:
             half = int(max_length / 2)
-            prompt = tokenizer.decode(tokenized_prompt[:half], skip_special_tokens=True) + tokenizer.decode(tokenized_prompt[-half:], skip_special_tokens=True)
+            prompt = tokenizer.decode(tokenized_prompt_ids[:half], skip_special_tokens=True) + tokenizer.decode(tokenized_prompt_ids[-half:], skip_special_tokens=True)
         
-        # For pipeline-based modes, pass the raw prompt and let the pipeline handle templating
-        # For standard modes, apply the template here.
-        if pipeline is None:
-            if dataset not in ["trec", "triviaqa", "samsum", "lsht", "lcc", "repobench-p"]: 
-                prompt = build_chat(tokenizer, prompt, args.model)
+        if dataset not in ["trec", "triviaqa", "samsum", "lsht", "lcc", "repobench-p"]: 
+            final_prompt = build_chat(tokenizer, prompt, args.model)
+        else:
+            final_prompt = prompt
+
+        inputs = tokenizer(final_prompt, truncation=False, return_tensors="pt").to(device)
         
         pred = ""
         if pipeline is not None:
-            pred, _ = pipeline.run(prompt, look_ahead_k=args.look_ahead_k, max_generation_length=max_gen)
+            pred, _ = pipeline.run(
+                input_ids=inputs.input_ids,
+                look_ahead_k=args.look_ahead_k, 
+                max_generation_length=max_gen,
+            )
         else:
-            input_ids = tokenizer(prompt, truncation=False, return_tensors="pt").to(device)
-            context_length = input_ids.input_ids.shape[-1]
-            if args.mode == 'gemfilter':
-                from baseline.gemfilter.gemfilter_utils import gemfilter_generate_selection
-                pred = gemfilter_generate_selection(
-                    input_ids['input_ids'], input_ids['attention_mask'], 
-                    model, tokenizer, max_gen_len=max_gen, select_layer_idx=args.filter_idx
-                )
-            else:
-                output = model.generate(
-                        **input_ids, max_new_tokens=max_gen, num_beams=1,
-                        do_sample=False, temperature=1.0, top_p=1.0,
-                        )[0]
-                pred = tokenizer.decode(output[context_length:], skip_special_tokens=True)
+            with torch.inference_mode():
+                context_length = inputs.input_ids.shape[-1]
+                if args.mode == 'gemfilter':
+                    from baseline.gemfilter.gemfilter_utils import gemfilter_generate_selection
+                    pred = gemfilter_generate_selection(
+                        inputs['input_ids'], inputs['attention_mask'], 
+                        model, tokenizer, max_gen_len=max_gen, select_layer_idx=args.filter_idx
+                    )
+                else:
+                    output = model.generate(
+                            **inputs, max_new_tokens=max_gen, num_beams=1,
+                            do_sample=False, temperature=1.0, top_p=1.0,
+                            )[0]
+                    pred = tokenizer.decode(output[context_length:], skip_special_tokens=True)
+
+        print(pred)
         
         with open(out_path, "a", encoding="utf-8") as f:
             json.dump({"pred": pred, "answers": json_obj["answers"], "all_classes": json_obj["all_classes"], "length": json_obj["length"]}, f, ensure_ascii=False)
@@ -233,7 +245,7 @@ if __name__ == "__main__":
     # Speculative Prefill / Echo Cache
     parser.add_argument("--speculator_model_name", type=str, default="meta-llama/Llama-3-8B-Instruct", help="Speculator model for prefill/echocache. Ensure compatibility.")
     parser.add_argument("--look_ahead_k", type=int, default=1, help="Number of lookahead steps for Speculative Prefill.")
-    parser.add_argument("--use_chunk_selection", action='store_true', help="Enable chunk-based token selection. Default is simple top-k.") # FIX: Changed to opt-in
+    parser.add_argument("--use_chunk_selection", action='store_true', help="Use chunk-based token selection (it's enabled by default).")
     parser.add_argument("--chunk_size", type=int, default=64, help="Chunk size for Speculative Prefill.")
     
     # FastKV

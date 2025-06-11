@@ -81,7 +81,6 @@ class QuantizedLinear(nn.Module):
                                      td_y)
 
     def forward(self, input):
-        print(input.shape)
         if self.grad_ckpt:
             return self.ckpt_forward(input)
         return self.no_ckpt_forward(input)
