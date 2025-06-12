@@ -25,7 +25,7 @@ DATASETS = [
     ("triviaqa", "TriviaQA"),
     ("samsum", "SAMSum"),
     ("lcc", "LCC"),
-    ("repobench-p", "RB-P")
+    ("repobench-p", "RB-P"),
     ("passage_count", "PCount"),
     ("passage_retrieval_en", "PRe"),
 ]
