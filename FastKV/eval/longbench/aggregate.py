@@ -12,7 +12,7 @@ import sys
 
 # Define the datasets in the specified order with their display names
 DATASETS = [
-    ("narrativeqa", "NarQA"),
+    ("narrativeqa", "NrtvQA"),
     ("qasper", "Qasper"), 
     ("multifieldqa_en", "MF-en"),
     ("hotpotqa", "HotpotQA"),
@@ -24,10 +24,10 @@ DATASETS = [
     ("trec", "TREC"),
     ("triviaqa", "TriviaQA"),
     ("samsum", "SAMSum"),
-    ("passage_count", "LCC"),
-    ("passage_retrieval_en", "RB-P"),
-    ("lcc", "PCount"),
-    ("repobench-p", "PRe")
+    ("lcc", "LCC"),
+    ("repobench-p", "RB-P")
+    ("passage_count", "PCount"),
+    ("passage_retrieval_en", "PRe"),
 ]
 
 # Extract just the keys for internal use
