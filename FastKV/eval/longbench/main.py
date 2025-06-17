@@ -136,11 +136,7 @@ def generate_longbench(data, max_length, max_gen, prompt_format,
     if model is not None:
         device = model.device
 
-    i = 0
     for json_obj in tqdm(data, desc=f"Generating Responses for {args.mode}..."):
-        if i == 3:
-            break
-        i+=1
         prompt = prompt_format.format(**json_obj)
         # Tokenize once to check length, then decode for truncation
         tokenized_prompt_ids = tokenizer.encode(prompt, add_special_tokens=False)
