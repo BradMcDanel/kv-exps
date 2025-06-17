@@ -61,6 +61,8 @@ def setup_model_and_tokenizer(args):
             speculator_model_name=args.speculator_model_name,
             tokenizer=tokenizer,
             max_capacity_prompt=args.max_capacity_prompt,
+            tsp_len=args.tsp_len,
+            cache_granularity=args.cache_granularity,
             pool_kernel_size=args.kernel_size if args.pooling != 'none' else None,
             pool_type=args.pooling,
             use_chunk_selection=args.use_chunk_selection, 
@@ -243,6 +245,9 @@ if __name__ == "__main__":
     parser.add_argument("--pooling", type=str, default="avgpool", choices=['avgpool', 'maxpool', 'none'])
     
     # Speculative Prefill / Echo Cache
+    parser.add_argument("--cache_granularity", type=str, default="head", choices=["global", "layer", "head"],
+                    help="Pruning granularity for EchoCache: 'global' (single stage), "
+                         "'layer' (global then per-layer), or 'head' (global then per-head).")
     parser.add_argument("--speculator_model_name", type=str, default="meta-llama/Llama-3-8B-Instruct", help="Speculator model for prefill/echocache. Ensure compatibility.")
     parser.add_argument("--look_ahead_k", type=int, default=1, help="Number of lookahead steps for Speculative Prefill.")
     parser.add_argument("--use_chunk_selection", action='store_true', help="Use chunk-based token selection (it's enabled by default).")
