@@ -76,6 +76,9 @@ def setup_model_and_tokenizer(args):
         elif args.mode == 'fastkv':
             from baseline.fastkv.monkeypatch import replace_llama, replace_mistral
             replace_llama(); replace_mistral()
+        elif args.mode == 'hfastkv':
+            from baseline.hfastkv.monkeypatch import replace_llama, replace_mistral
+            replace_llama(); replace_mistral()
         elif args.mode == 'snapkv':
             from baseline.snapkv.monkeypatch import replace_llama, replace_mistral, replace_phi3
             replace_llama(); replace_mistral(); replace_phi3()
@@ -100,6 +103,9 @@ def setup_model_and_tokenizer(args):
 
         if args.mode == 'fastkv':
             from baseline.fastkv.fastkv_utils import compress
+            compress(model, args)
+        elif args.mode == 'hfastkv':
+            from baseline.hfastkv.hfastkv_utils import compress
             compress(model, args)
         elif args.mode == 'snapkv':
             from baseline.snapkv.snapkv_utils import compress
@@ -232,7 +238,7 @@ if __name__ == "__main__":
     parser.add_argument("--save_path", default="", type=str, help="Path to save the output")
 
     # KV Compression & Prefill Modes
-    parser.add_argument("--mode", type=str, default="fastkv", choices=["fullkv", "fastkv", "snapkv", "gemfilter", "adakv", "headkv", "speculative_prefill", "echo_cache"])
+    parser.add_argument("--mode", type=str, default="fastkv", choices=["fullkv", "fastkv", "snapkv", "gemfilter", "adakv", "headkv", "speculative_prefill", "echo_cache", "hfastkv"])
     parser.add_argument("--window_size", type=int, default=8)
     parser.add_argument("--max_capacity_prompt", type=int, default=512)
 
@@ -266,6 +272,8 @@ if __name__ == "__main__":
     parser.add_argument("--head_choice", type=str, default='reason', choices=['copy', 'reason'])
     parser.add_argument('--beta', type=float, default=1.2)
     parser.add_argument('--temp', type=float, default=1.0)
+    # Hierarchical Fast KV
+    parser.add_argument("--tsp_schedule", type=str, default="", help="Hierarchical TSP schedule for HFastKV mode, e.g., '10:4096,15:2048'")
     
     # Evaluation
     parser.add_argument('--dataset', type=str, default='qasper', help="Dataset to evaluate on")

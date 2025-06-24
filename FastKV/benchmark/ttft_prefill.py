@@ -21,7 +21,10 @@ from utils import utils
 
 def average_excluding_min_max(numbers):
     if len(numbers) <= 2:
-        raise ValueError("The list must contain more than two elements.")
+        # For benchmarks with few runs, just take the mean.
+        if len(numbers) > 0:
+            return sum(numbers) / len(numbers)
+        return 0
     
     numbers_excluding_min_max = numbers.copy()
     numbers_excluding_min_max.remove(min(numbers))
@@ -42,6 +45,12 @@ def main(args):
         from baseline.fastkv.monkeypatch import replace_llama, replace_mistral
         replace_llama()
         replace_mistral()
+    # ==================== CHANGE 1: Add HFastKV monkeypatching ====================
+    elif args.mode == 'hfastkv':
+        from baseline.hfastkv.monkeypatch import replace_llama, replace_mistral
+        replace_llama()
+        replace_mistral()
+    # ============================================================================
     elif args.mode == 'snapkv':
         from baseline.snapkv.monkeypatch import replace_llama, replace_mistral, replace_phi3
         replace_llama()
@@ -71,11 +80,15 @@ def main(args):
     model = AutoModelForCausalLM.from_pretrained(args.model, device_map='auto', attn_implementation='flash_attention_2', torch_dtype=torch.float16)
     model.eval()
     
-
     # load compress args
     if args.mode == 'fastkv':
         from baseline.fastkv.fastkv_utils import compress
         compress(model, args)
+    # ==================== CHANGE 2: Add HFastKV compress call ====================
+    elif args.mode == 'hfastkv':
+        from baseline.hfastkv.hfastkv_utils import compress
+        compress(model, args)
+    # ===========================================================================
     elif args.mode == 'snapkv':
         from baseline.snapkv.snapkv_utils import compress
         compress(model, args)
@@ -91,20 +104,20 @@ def main(args):
     attn_mask = torch.ones((1,args.seqlen), dtype=torch.int64).to(model.device)
     context_length = input_id.shape[-1]
 
-
     # warmup
     if args.num_warmups > 0:
         for i in range(args.num_warmups):
-
             total_time = 0
             start = torch.cuda.Event(enable_timing=True)
             end = torch.cuda.Event(enable_timing=True)
 
             # Prefill
-            if args.mode in ['fullkv', 'fastkv', 'snapkv', 'adakv', 'headkv']:
+            # ================== CHANGE 3: Add hfastkv to the list of modes that use the standard prefill path ==================
+            if args.mode in ['fullkv', 'fastkv', 'snapkv', 'adakv', 'headkv', 'hfastkv']:
+            # =================================================================================================================
                 with torch.no_grad():
                     start.record()
-                    outputs = model(input_id, attn_mask)
+                    outputs = model(input_id, attention_mask=attn_mask)
                     end.record()
                 torch.cuda.synchronize()
                 total_time += start.elapsed_time(end)
@@ -127,16 +140,17 @@ def main(args):
 
     result_list = []
     for i in range(args.num_runs):        
-
         total_time = 0
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
 
         # Prefill
-        if args.mode in ['fullkv', 'fastkv', 'snapkv', 'adakv', 'headkv']:
+        # ================== CHANGE 4: Add hfastkv to the list of modes that use the standard prefill path ==================
+        if args.mode in ['fullkv', 'fastkv', 'snapkv', 'adakv', 'headkv', 'hfastkv']:
+        # =================================================================================================================
             with torch.no_grad():
                 start.record()
-                outputs = model(input_id, attn_mask)
+                outputs = model(input_id, attention_mask=attn_mask)
                 end.record()
             torch.cuda.synchronize()
             total_time += start.elapsed_time(end)
@@ -174,8 +188,9 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=42, help="Seed")
     parser.add_argument("--save_path", default="", type=str, help="Path to save the output")
 
+    # ==================== CHANGE 5: Add hfastkv as a choice and its specific argument ====================
     # KV Compression
-    parser.add_argument("--mode", type=str, default="fastkv", choices=["fullkv", "fastkv", "snapkv", "gemfilter", "adakv", "headkv"])
+    parser.add_argument("--mode", type=str, default="fastkv", choices=["fullkv", "fastkv", "snapkv", "gemfilter", "adakv", "headkv", "hfastkv"])
     parser.add_argument("--window_size", type=int, default=8)
     parser.add_argument("--max_capacity_prompt", type=int, default=512)
     parser.add_argument("--kernel_size", type=int, default=7)
@@ -184,6 +199,10 @@ if __name__ == "__main__":
     # FastKV
     parser.add_argument("--tsp_idx", type=int, default=15)
     parser.add_argument("--tsp_len", type=int, default=2048)
+
+    # Hierarchical FastKV
+    parser.add_argument("--tsp_schedule", type=str, default="", help="Hierarchical TSP schedule for HFastKV mode, e.g., '10:4096,15:2048'")
+    # ====================================================================================================
 
     # GemFilter
     parser.add_argument("--filter_idx", type=int, default=13)
@@ -209,6 +228,11 @@ if __name__ == "__main__":
 
 
     args = parser.parse_args()
+
+    # A simple fix for the average_excluding_min_max function when num_runs is small
+    if args.num_runs <= 2:
+        print("Warning: num_runs is <= 2. The average will be calculated without excluding min/max.")
+
 
     main(args)
     utils.cleanup_memory()

@@ -360,6 +360,7 @@ class EchoCachePipeline:
         else:
             _, local_top_indices = torch.topk(local_importance_scores, k=num_to_keep_locally, dim=-1)
             local_top_indices = torch.sort(local_top_indices)[0]
+            print(f"Layer {layer_idx}: {local_top_indices.cpu().tolist()}")
 
         k_final_layer = torch.index_select(k_globally_pruned, 2, local_top_indices)
         v_final_layer = torch.index_select(v_globally_pruned, 2, local_top_indices)
@@ -398,17 +399,32 @@ class EchoCachePipeline:
             if batch_size != 1:
                 raise NotImplementedError("Per-head local pruning for batch size > 1 not supported.")
 
-            scores_for_kv_head_squeezed = attn_logits_group.squeeze(0)
-            scores_summed_over_q_group = scores_for_kv_head_squeezed.sum(dim=0)
-            scores_softmaxed = F.softmax(scores_summed_over_q_group, dim=-1, dtype=torch.float32).to(scores_summed_over_q_group.dtype)
+            # ===== START OF MODIFICATION - ALIGNING WITH FASTKV PRINCIPLES =====
+            # Original shape: [num_q_in_group, num_lookahead, num_tokens]
+            scores_squeezed = attn_logits_group.squeeze(0)
+            
+            # Principle 1: Normalize first. Apply softmax to get attention probabilities.
+            # This ensures scores are comparable and prevents suppression of specialized heads.
+            scores_softmaxed_group = F.softmax(scores_squeezed, dim=-1, dtype=torch.float32).to(scores_squeezed.dtype)
 
+            # Principle 2: Aggregate across the "window" (our lookahead steps) and the GQA group.
+            # First, sum the probabilities across all Q-heads in the group. This is the democratic vote.
+            group_aggregated_probs = scores_softmaxed_group.sum(dim=0)  # Shape: [num_lookahead, num_tokens]
+            
+            # Then, sum the probabilities across the lookahead window. This captures sustained importance.
+            window_aggregated_scores = group_aggregated_probs.sum(dim=0) # Shape: [num_tokens]
+
+            # Now, apply pooling to the final, stable importance scores.
             if self.pool_kernel_size and self.pool_type != 'none':
                 padding = (self.pool_kernel_size - 1) // 2
                 pool_fn = F.avg_pool1d if self.pool_type == 'avgpool' else F.max_pool1d
-                pooled_scores = pool_fn(scores_softmaxed.unsqueeze(1), kernel_size=self.pool_kernel_size, stride=1, padding=padding).squeeze(1)
+                # Add and remove channel dimension for the 1D pooling operation
+                pooled_scores = pool_fn(window_aggregated_scores.unsqueeze(0).unsqueeze(0), kernel_size=self.pool_kernel_size, stride=1, padding=padding).squeeze(0).squeeze(0)
             else:
-                pooled_scores = scores_softmaxed
-            local_importance_scores_for_kv_head = pooled_scores.max(dim=0).values
+                pooled_scores = window_aggregated_scores
+            
+            local_importance_scores_for_kv_head = pooled_scores
+            # ===== END OF MODIFICATION =====
 
             if self.use_chunk_selection:
                 local_top_indices_for_kv_head = self._select_tokens_by_chunk(
@@ -419,6 +435,8 @@ class EchoCachePipeline:
                     local_importance_scores_for_kv_head, k=num_to_keep_locally_per_head, dim=-1
                 )
                 local_top_indices_for_kv_head = torch.sort(local_top_indices_for_kv_head)[0]
+
+                print(f"Layer {layer_idx}, KV Head {kv_head_idx}: {local_top_indices_for_kv_head.cpu().tolist()}")
 
             k_selected_for_head = torch.index_select(k_current_kv_head, 2, local_top_indices_for_kv_head)
             v_current_kv_head = v_globally_pruned_layer[:, kv_head_idx:kv_head_idx + 1, :, :]
