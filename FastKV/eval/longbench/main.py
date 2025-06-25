@@ -68,6 +68,15 @@ def setup_model_and_tokenizer(args):
             use_chunk_selection=args.use_chunk_selection, 
             chunk_size=args.chunk_size,
         )
+    elif args.mode == "draft_tsp":
+        from baseline.draft_tsp.main import DraftTSPPipeline as Pipeline
+        logging.info(f"Initializing DraftTSPPipeline...")
+        pipeline = Pipeline(
+            base_model_name=args.model,
+            speculator_model_name=args.speculator_model_name,
+            tokenizer=tokenizer,
+            args=args, # Pass all args for simplicity
+        )
     else:
         # Standard modes require explicit model loading and configuration.
         if args.mode == 'fullkv':
@@ -238,7 +247,7 @@ if __name__ == "__main__":
     parser.add_argument("--save_path", default="", type=str, help="Path to save the output")
 
     # KV Compression & Prefill Modes
-    parser.add_argument("--mode", type=str, default="fastkv", choices=["fullkv", "fastkv", "snapkv", "gemfilter", "adakv", "headkv", "speculative_prefill", "echo_cache", "hfastkv"])
+    parser.add_argument("--mode", type=str, default="fastkv", choices=["fullkv", "fastkv", "snapkv", "gemfilter", "adakv", "headkv", "speculative_prefill", "echo_cache", "hfastkv", "draft_tsp"])
     parser.add_argument("--window_size", type=int, default=8)
     parser.add_argument("--max_capacity_prompt", type=int, default=512)
 
@@ -272,8 +281,11 @@ if __name__ == "__main__":
     parser.add_argument("--head_choice", type=str, default='reason', choices=['copy', 'reason'])
     parser.add_argument('--beta', type=float, default=1.2)
     parser.add_argument('--temp', type=float, default=1.0)
-    # Hierarchical Fast KV
+    # Hierarchical Fast KV / Draft TSP
     parser.add_argument("--tsp_schedule", type=str, default="", help="Hierarchical TSP schedule for HFastKV mode, e.g., '10:4096,15:2048'")
+
+    parser.add_argument("--initial_capacity", type=int, default=8192, help="Initial capacity for Draft TSP.")
+
     
     # Evaluation
     parser.add_argument('--dataset', type=str, default='qasper', help="Dataset to evaluate on")
