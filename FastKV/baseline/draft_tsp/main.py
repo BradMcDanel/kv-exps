@@ -11,9 +11,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedModel
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.models.llama.modeling_llama import LlamaAttention, apply_rotary_pos_emb, repeat_kv
 
-# --- Use the robust HFastKV patching logic ---
-from baseline.hfastkv.monkeypatch import replace_llama as replace_llama_for_hfastkv
-from baseline.hfastkv.hfastkv_utils import compress as compress_for_hfastkv
+from baseline.draft_tsp.monkeypatch import replace_llama_for_draft_tsp, set_speculator_data
 
 
 class DraftTSPPipeline:
@@ -23,28 +21,24 @@ class DraftTSPPipeline:
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         print("Loading Speculator (Draft) Model...")
-        self.speculator_model: PreTrainedModel = self._load_model(speculator_model_name, patch=False)
+        self.speculator_model: PreTrainedModel = self._load_model(speculator_model_name)
 
-        print("Patching for HFastKV and Loading Base Model...")
-        # Apply HFastKV patches BEFORE loading the base model to ensure it uses the correct classes.
-        replace_llama_for_hfastkv()
-        self.base_model: PreTrainedModel = self._load_model(base_model_name, patch=True)
+        print("Loading Base Model...")
+        self.base_model: PreTrainedModel = self._load_model(base_model_name)
 
-        # Configure the HFastKV-patched base model with the TSP schedule.
-        print(f"Configuring base model with HFastKV schedule: '{args.tsp_schedule}'")
-        compress_for_hfastkv(self.base_model, args)
+        print("Patching for Draft TSP...")
+        replace_llama_for_draft_tsp(self.base_model, args)
         
         self.captured_qs: List[List[torch.Tensor]] = []
         self.orig_spec_fwds: Dict[int, types.MethodType] = {}
 
-    def _load_model(self, model_name: str, patch: bool) -> PreTrainedModel:
-        """Loads a model. If patching for HFastKV, attn_implementation must be 'flash_attention_2'."""
-        attn_impl = "flash_attention_2" if patch else "sdpa"
+    def _load_model(self, model_name: str) -> PreTrainedModel:
+        """Loads a model with flash_attention_2."""
         return AutoModelForCausalLM.from_pretrained(
             model_name,
             torch_dtype=torch.float16,
             device_map="auto",
-            attn_implementation=attn_impl
+            attn_implementation="flash_attention_2"
         ).eval()
 
     def _patch_speculator(self):
@@ -105,60 +99,56 @@ class DraftTSPPipeline:
             all_layer_logits.append(logits)
         
         if not all_layer_logits: raise RuntimeError("Failed to capture any Q-vectors from the speculator.")
-        attention_scores = torch.stack(all_layer_logits).permute(1, 0, 2, 3, 4)
-        bs, num_layers, num_heads, num_steps, key_len = attention_scores.shape
+        attention_scores = torch.stack(all_layer_logits).permute(1, 3, 0, 2, 4)
+        bs, num_steps, num_layers, num_heads, key_len = attention_scores.shape
         if bs != 1: raise NotImplementedError("Batch size > 1 is not supported.")
 
         attention_probs = F.softmax(attention_scores, dim=-1, dtype=torch.float32).to(attention_scores.dtype)
-        reshaped_probs = attention_probs.reshape(bs, -1, key_len)
+        
         if hasattr(self.args, 'kernel_size') and self.args.pooling in ['avgpool', 'maxpool'] and self.args.kernel_size > 1:
+            reshaped_for_pooling = attention_probs.squeeze(0).flatten(0, 2)
+            
             padding = (self.args.kernel_size - 1) // 2
             pool_fn = F.avg_pool1d if self.args.pooling == 'avgpool' else F.max_pool1d
-            pooled_tensor = pool_fn(reshaped_probs, kernel_size=self.args.kernel_size, stride=1, padding=padding)
+            
+            pooled_tensor = pool_fn(reshaped_for_pooling, kernel_size=self.args.kernel_size, stride=1, padding=padding)
+            processed_scores = pooled_tensor.reshape(num_steps, num_layers, num_heads, key_len)
         else:
-            pooled_tensor = reshaped_probs
+            processed_scores = attention_probs.squeeze(0)
         
-        processed_scores = pooled_tensor.reshape(bs, num_layers, num_heads, num_steps, key_len)
-        max_over_heads = processed_scores.max(dim=2).values
-        mean_over_lookaheads = max_over_heads.mean(dim=2)
-        final_token_importance = mean_over_lookaheads.sum(dim=1)
+        flattened_scores = processed_scores.flatten(1, 2)
+        max_scores = flattened_scores.max(1).values
+        final_token_importance = max_scores.mean(0)
         
-        return final_token_importance.squeeze(0)
+        # Return the indices sorted by importance
+        return torch.argsort(final_token_importance, descending=True)
 
     def run(self, input_ids: torch.Tensor, max_generation_length: int, look_ahead_k: int) -> Tuple[str, Dict]:
         prompt_len = input_ids.shape[1]
         
-        token_scores = self._get_token_importance_scores(input_ids, look_ahead_k)
+        # Get the globally sorted indices
+        sorted_indices = self._get_token_importance_scores(input_ids, look_ahead_k)
+        # Pass the sorted indices to the monkey-patched model environment
+        set_speculator_data(sorted_indices, prompt_len)
 
-        if hasattr(self.args, 'initial_capacity_percentage') and self.args.initial_capacity_percentage is not None:
-            num_to_select = int(prompt_len * self.args.initial_capacity_percentage)
-        else:
-            num_to_select = self.args.initial_capacity
-
-        num_to_select = min(num_to_select, prompt_len)
-        _, initial_indices = torch.topk(token_scores, k=num_to_select)
-        initial_indices, _ = torch.sort(initial_indices)
-
-        selected_input_ids = input_ids[:, initial_indices]
-        selected_position_ids = initial_indices.unsqueeze(0)
-        
         generated_ids = []
         with torch.no_grad():
-            prefill_outputs = self.base_model(input_ids=selected_input_ids, position_ids=selected_position_ids, use_cache=True)
+            prefill_outputs = self.base_model(input_ids=input_ids, use_cache=True)
             past_key_values = prefill_outputs.past_key_values
             
-            # This is the 1st new token
             next_token_logits = prefill_outputs.logits[:, -1, :]
             next_token = torch.argmax(next_token_logits, dim=-1).unsqueeze(-1)
             generated_ids.append(next_token.item())
 
             # Manual Generation Loop
             for _ in range(max_generation_length - 1):
-                current_token_pos = torch.tensor([[prompt_len + len(generated_ids) - 1]], device=self.device, dtype=torch.long)
+                cache_len = past_key_values.get_seq_length(0)
+                current_token_pos = torch.tensor([[cache_len]], device=self.device, dtype=torch.long)
                 
                 outputs = self.base_model(
                     input_ids=next_token,
                     position_ids=current_token_pos,
+                    cache_position=current_token_pos,
                     past_key_values=past_key_values,
                     use_cache=True
                 )
@@ -177,8 +167,6 @@ class DraftTSPPipeline:
 
 def _patched_attention_forward_for_capture(self_attn: LlamaAttention, pipeline_instance: 'DraftTSPPipeline', **kwargs) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Cache]]:
     """A standard LlamaAttention forward pass that also captures Q-vectors."""
-    # We can just call the original forward method and capture the Q-vector.
-    # To get the Q-vector, we need to re-compute it just before the original call.
     hidden_states = kwargs['hidden_states']
     position_ids = kwargs['position_ids']
     bsz, q_len, _ = hidden_states.size()
@@ -191,5 +179,4 @@ def _patched_attention_forward_for_capture(self_attn: LlamaAttention, pipeline_i
     
     pipeline_instance.captured_qs[self_attn.layer_idx].append(query_states.detach().clone())
 
-    # Call the original, unpatched forward method to get the correct output
     return pipeline_instance.orig_spec_fwds[self_attn.layer_idx](**kwargs)

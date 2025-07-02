@@ -186,18 +186,43 @@ class SpeculativePrefillPipeline:
 
     def _token_importance_from_attn_scores(self, attention_scores: torch.Tensor):
         if attention_scores.numel() == 0: raise RuntimeError("Cannot calculate importance from empty attention scores.")
-        bs, num_layers, num_heads, num_steps, key_len = attention_scores.shape
-        if bs != 1: raise NotImplementedError("Batch size > 1 is not supported.")
-        all_layers_tensor = F.softmax(attention_scores.squeeze(0), dim=-1, dtype=torch.float32).to(attention_scores.dtype)
-        flattened_tensor = all_layers_tensor.reshape(num_layers * num_heads, num_steps, key_len)
+        
+        # Permute to [N, L, H, S] to match vLLM's logic flow
+        # N = num_steps (lookahead), L = num_layers, H = num_heads, S = key_len (context)
+        attention_scores = attention_scores.permute(3, 1, 2, 0, 4).squeeze(0) # Remove batch dim
+        num_steps, num_layers, num_heads, key_len = attention_scores.shape
+
+        attention_probs = F.softmax(attention_scores, dim=-1, dtype=torch.float32).to(attention_scores.dtype)
+
+        # Optional: Apply 1D pooling to smooth scores
         if self.pool_kernel_size and self.pool_type != 'none':
+            # Reshape for pooling: combine N, L, H into a single batch dimension
+            reshaped_for_pooling = attention_probs.flatten(0, 2)
+            
             padding = (self.pool_kernel_size - 1) // 2
             pool_fn = F.avg_pool1d if self.pool_type == 'avgpool' else F.max_pool1d
-            pooled_tensor = pool_fn(flattened_tensor.reshape(-1, 1, key_len), kernel_size=self.pool_kernel_size, stride=1, padding=padding)
-            pooled_tensor = pooled_tensor.reshape(num_layers * num_heads, num_steps, key_len)
+            
+            pooled_tensor = pool_fn(reshaped_for_pooling, kernel_size=self.pool_kernel_size, stride=1, padding=padding)
+            processed_scores = pooled_tensor.reshape(num_steps, num_layers, num_heads, key_len)
         else:
-            pooled_tensor = flattened_tensor
-        self.token_importance_scores = pooled_tensor.max(dim=0).values.mean(dim=0).unsqueeze(0)
+            processed_scores = attention_probs
+
+        # --- Aggregation Strategy from vLLM Implementation ---
+        # "flatten L and H, max over the combined dimension, then mean over N"
+        
+        # 1. Flatten Layers (L) and Heads (H)
+        # Shape: [N, L*H, S]
+        flattened_scores = processed_scores.flatten(1, 2)
+
+        # 2. Max over the combined L*H dimension
+        # Shape: [N, S]
+        max_scores = flattened_scores.max(1).values
+        
+        # 3. Average over Lookaheads (N)
+        # Shape: [S]
+        final_token_importance = max_scores.mean(0)
+        
+        self.token_importance_scores = final_token_importance.unsqueeze(0)
 
     def _compute_raw_qk_scores(self, speculator_prefill_cache_as_tuple) -> torch.Tensor:
         if not self.captured_qs or not any(self.captured_qs): raise RuntimeError("Speculator Q-vectors were not captured.")

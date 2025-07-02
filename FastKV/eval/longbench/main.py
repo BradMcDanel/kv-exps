@@ -286,10 +286,6 @@ if __name__ == "__main__":
     # Hierarchical Fast KV / Draft TSP
     parser.add_argument("--tsp_schedule", type=str, default="", help="Hierarchical TSP schedule for HFastKV mode, e.g., '10:4096,15:2048'")
 
-    parser.add_argument("--initial_capacity", type=int, default=8192, help="Initial capacity for Draft TSP.")
-    parser.add_argument("--initial_capacity_percentage", type=float, default=None, help="Initial capacity percentage for Draft TSP.")
-
-    
     # Evaluation
     parser.add_argument('--dataset', type=str, default='qasper', help="Dataset to evaluate on")
     parser.add_argument('--longbench_type', type=str, default='longbench', choices=['longbench', 'longbench-e'])
