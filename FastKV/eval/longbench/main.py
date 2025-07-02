@@ -48,6 +48,7 @@ def setup_model_and_tokenizer(args):
             speculator_model_name=args.speculator_model_name,
             tokenizer=tokenizer,
             max_capacity_prompt=args.max_capacity_prompt,
+            max_capacity_prompt_percentage=args.max_capacity_prompt_percentage,
             pool_kernel_size=args.kernel_size if args.pooling != 'none' else None,
             pool_type=args.pooling,
             use_chunk_selection=args.use_chunk_selection, 
@@ -250,6 +251,7 @@ if __name__ == "__main__":
     parser.add_argument("--mode", type=str, default="fastkv", choices=["fullkv", "fastkv", "snapkv", "gemfilter", "adakv", "headkv", "speculative_prefill", "echo_cache", "hfastkv", "draft_tsp"])
     parser.add_argument("--window_size", type=int, default=8)
     parser.add_argument("--max_capacity_prompt", type=int, default=512)
+    parser.add_argument("--max_capacity_prompt_percentage", type=float, default=None, help="Use a percentage of the prompt length for max capacity.")
 
     # KV Compression & Prefill Modes (+ Speculative Prefill and Echo Cache)
     parser.add_argument("--kernel_size", type=int, default=7, help="Pooling kernel size. Must be odd.")
@@ -285,6 +287,7 @@ if __name__ == "__main__":
     parser.add_argument("--tsp_schedule", type=str, default="", help="Hierarchical TSP schedule for HFastKV mode, e.g., '10:4096,15:2048'")
 
     parser.add_argument("--initial_capacity", type=int, default=8192, help="Initial capacity for Draft TSP.")
+    parser.add_argument("--initial_capacity_percentage", type=float, default=None, help="Initial capacity percentage for Draft TSP.")
 
     
     # Evaluation

@@ -70,6 +70,8 @@ def main(args):
     elif args.mode == 'draft_tsp':
         # Setup for draft_tsp is handled by the pipeline itself. No patching here.
         pass
+    elif args.mode == 'speculative_prefill':
+        pass
     else:
         raise ValueError(f"We does not support {args.mode} mode")
 
@@ -89,6 +91,21 @@ def main(args):
             speculator_model_name=args.speculator_model_name,
             tokenizer=tokenizer,
             args=args,
+        )
+        model_device = pipeline.device
+    elif args.mode == 'speculative_prefill':
+        from baseline.speculative_prefill.main import SpeculativePrefillPipeline
+        print("Initializing SpeculativePrefillPipeline for benchmarking...")
+        pipeline = SpeculativePrefillPipeline(
+            base_model_name=args.model,
+            speculator_model_name=args.speculator_model_name,
+            tokenizer=tokenizer,
+            max_capacity_prompt=args.max_capacity_prompt,
+            max_capacity_prompt_percentage=args.max_capacity_prompt_percentage,
+            pool_kernel_size=args.kernel_size if args.pooling != 'none' else None,
+            pool_type=args.pooling,
+            use_chunk_selection=True, # Assuming default behavior
+            chunk_size=64 # Assuming default behavior
         )
         model_device = pipeline.device
     else:
@@ -123,14 +140,22 @@ def main(args):
         print(f"Running {args.num_warmups} warmup(s)...")
         for i in range(args.num_warmups):
             if pipeline:
-                token_scores = pipeline._get_token_importance_scores(input_id, args.look_ahead_k)
-                num_to_select = min(args.initial_capacity, context_length)
-                _, initial_indices = torch.topk(token_scores, k=num_to_select)
-                initial_indices, _ = torch.sort(initial_indices)
-                selected_input_ids = input_id[:, initial_indices]
-                selected_position_ids = initial_indices.unsqueeze(0)
-                with torch.no_grad():
-                    _ = pipeline.base_model(input_ids=selected_input_ids, position_ids=selected_position_ids, use_cache=True)
+                if args.mode == 'draft_tsp':
+                    token_scores = pipeline._get_token_importance_scores(input_id, args.look_ahead_k)
+                    if args.initial_capacity_percentage is not None:
+                        num_to_select = int(context_length * args.initial_capacity_percentage)
+                    else:
+                        num_to_select = args.initial_capacity
+                    num_to_select = min(num_to_select, context_length)
+                    _, initial_indices = torch.topk(token_scores, k=num_to_select)
+                    initial_indices, _ = torch.sort(initial_indices)
+                    selected_input_ids = input_id[:, initial_indices]
+                    selected_position_ids = initial_indices.unsqueeze(0)
+                    with torch.no_grad():
+                        _ = pipeline.base_model(input_ids=selected_input_ids, position_ids=selected_position_ids, use_cache=True)
+                elif args.mode == 'speculative_prefill':
+                    with torch.no_grad():
+                        _ = pipeline.run(input_ids=input_id, look_ahead_k=args.look_ahead_k, max_generation_length=1)
             elif args.mode == 'gemfilter':
                 from baseline.gemfilter.gemfilter_utils import gemfilter_generate_selection_prefill
                 set_topk(model, args.max_capacity_prompt, mode='gemfilter')
@@ -154,18 +179,25 @@ def main(args):
             start.record()
             # ==================== DRAFT_TSP BENCHMARKING LOGIC ====================
             if pipeline:
-                # 1. Score tokens with speculator
-                token_scores = pipeline._get_token_importance_scores(input_id, args.look_ahead_k)
-                
-                # 2. Select initial set of tokens
-                num_to_select = min(args.initial_capacity, context_length)
-                _, initial_indices = torch.topk(token_scores, k=num_to_select)
-                initial_indices, _ = torch.sort(initial_indices)
-                selected_input_ids = input_id[:, initial_indices]
-                selected_position_ids = initial_indices.unsqueeze(0)
+                if args.mode == 'draft_tsp':
+                    # 1. Score tokens with speculator
+                    token_scores = pipeline._get_token_importance_scores(input_id, args.look_ahead_k)
+                    
+                    # 2. Select initial set of tokens
+                    if args.initial_capacity_percentage is not None:
+                        num_to_select = int(context_length * args.initial_capacity_percentage)
+                    else:
+                        num_to_select = args.initial_capacity
+                    num_to_select = min(num_to_select, context_length)
+                    _, initial_indices = torch.topk(token_scores, k=num_to_select)
+                    initial_indices, _ = torch.sort(initial_indices)
+                    selected_input_ids = input_id[:, initial_indices]
+                    selected_position_ids = initial_indices.unsqueeze(0)
 
-                # 3. Prefill the base model with selected tokens
-                _ = pipeline.base_model(input_ids=selected_input_ids, position_ids=selected_position_ids, use_cache=True)
+                    # 3. Prefill the base model with selected tokens
+                    _ = pipeline.base_model(input_ids=selected_input_ids, position_ids=selected_position_ids, use_cache=True)
+                elif args.mode == 'speculative_prefill':
+                    _ = pipeline.run(input_ids=input_id, look_ahead_k=args.look_ahead_k, max_generation_length=1)
             # =====================================================================
             elif args.mode in ['gemfilter']:
                 from baseline.gemfilter.gemfilter_utils import gemfilter_generate_selection_prefill
@@ -186,7 +218,15 @@ def main(args):
     print(f"\nMode: {args.mode}")
     print(f"Context Length = {context_length}")
     if args.mode == "draft_tsp":
-        print(f"Initial Capacity = {args.initial_capacity}, TSP Schedule = '{args.tsp_schedule}'")
+        if args.initial_capacity_percentage is not None:
+            print(f"Initial Capacity = {args.initial_capacity_percentage:.1%}, TSP Schedule = '{args.tsp_schedule}'")
+        else:
+            print(f"Initial Capacity = {args.initial_capacity}, TSP Schedule = '{args.tsp_schedule}'")
+    elif args.mode == "speculative_prefill":
+        if args.max_capacity_prompt_percentage:
+            print(f"Max Prompt Capacity: {args.max_capacity_prompt_percentage:.1%}")
+        else:
+            print(f"Max Prompt Capacity: {args.max_capacity_prompt} tokens")
     elif args.mode != "fullkv":
         print(f"Context Capacity = {args.max_capacity_prompt}")
     print(f"TTFT: {(mean_ttft):.5f} msec")
@@ -201,15 +241,17 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=42, help="Seed")
 
     # ==================== ADD DRAFT_TSP TO CHOICES AND ITS ARGS ====================
-    parser.add_argument("--mode", type=str, default="fastkv", choices=["fullkv", "fastkv", "snapkv", "gemfilter", "adakv", "headkv", "hfastkv", "draft_tsp"])
+    parser.add_argument("--mode", type=str, default="fastkv", choices=["fullkv", "fastkv", "snapkv", "gemfilter", "adakv", "headkv", "hfastkv", "draft_tsp", "speculative_prefill"])
     parser.add_argument("--speculator_model_name", type=str, default="meta-llama/Llama-3.2-1B-Instruct", help="Speculator model for draft_tsp.")
     parser.add_argument("--initial_capacity", type=int, default=8192, help="Initial capacity for Draft TSP.")
+    parser.add_argument("--initial_capacity_percentage", type=float, default=None, help="Initial capacity percentage for Draft TSP.")
     parser.add_argument("--look_ahead_k", type=int, default=8, help="Number of lookahead steps for Draft TSP.")
     # =============================================================================
     
     # Common KV Compression Arguments
     parser.add_argument("--window_size", type=int, default=8)
     parser.add_argument("--max_capacity_prompt", type=int, default=512)
+    parser.add_argument("--max_capacity_prompt_percentage", type=float, default=None, help="Use a percentage of the prompt length for max capacity.")
     parser.add_argument("--kernel_size", type=int, default=7)
     parser.add_argument("--pooling", type=str, default="avgpool")
     

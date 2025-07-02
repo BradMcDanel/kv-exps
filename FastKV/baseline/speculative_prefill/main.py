@@ -104,6 +104,7 @@ class SpeculativePrefillPipeline:
         speculator_model_name: str,
         tokenizer: AutoTokenizer,
         max_capacity_prompt: int = 512,
+        max_capacity_prompt_percentage: Optional[float] = None,
         pool_kernel_size: Optional[int] = 13,
         pool_type: str = 'avgpool',
         use_chunk_selection: bool = True,
@@ -112,6 +113,7 @@ class SpeculativePrefillPipeline:
         self.base_model_name = base_model_name
         self.speculator_model_name = speculator_model_name
         self.max_capacity_prompt = max_capacity_prompt
+        self.max_capacity_prompt_percentage = max_capacity_prompt_percentage
         self.pool_kernel_size = pool_kernel_size
         self.pool_type = pool_type.lower()
         self.use_chunk_selection = use_chunk_selection
@@ -128,6 +130,12 @@ class SpeculativePrefillPipeline:
         self.orig_spec_fwds: Dict[int, Any] = {}
         self.is_prefilling = False
         self.token_importance_scores: Optional[torch.Tensor] = None
+
+    def _validate_config(self):
+        if self.max_capacity_prompt is not None and self.max_capacity_prompt_percentage is not None:
+            raise ValueError("Only one of `max_capacity_prompt` and `max_capacity_prompt_percentage` can be specified.")
+        if self.max_capacity_prompt_percentage is not None and not (0.0 < self.max_capacity_prompt_percentage <= 1.0):
+            raise ValueError("`max_capacity_prompt_percentage` must be between 0.0 and 1.0.")
 
     def _validate_config(self):
         if self.pool_type not in ['avgpool', 'maxpool', 'none']:
@@ -221,7 +229,11 @@ class SpeculativePrefillPipeline:
         return torch.sort(final_indices)[0]
 
     def _calculate_indices_to_keep(self, original_seq_len: int) -> torch.Tensor:
-        num_to_keep = min(self.max_capacity_prompt, original_seq_len)
+        if self.max_capacity_prompt_percentage is not None:
+            num_to_keep = int(original_seq_len * self.max_capacity_prompt_percentage)
+        else:
+            num_to_keep = min(self.max_capacity_prompt, original_seq_len)
+
         if num_to_keep >= original_seq_len: return torch.arange(original_seq_len, device=self.device, dtype=torch.long)
         if self.token_importance_scores is None: raise RuntimeError("Token importance scores not computed.")
         scores_for_selection = self.token_importance_scores[0].clone()
@@ -373,6 +385,7 @@ def main():
     parser.add_argument("--dataset_name", type=str, default="qasper")
     parser.add_argument("--look_ahead_k", type=int, default=8)
     parser.add_argument("--max_capacity_prompt", type=int, default=512)
+    parser.add_argument("--max_capacity_prompt_percentage", type=float, default=None)
     parser.add_argument("--max_generation_length", type=int, default=128)
     parser.add_argument("--kernel_size", type=int, default=13)
     parser.add_argument("--pooling", type=str, default="avgpool", choices=['avgpool', 'maxpool', 'none'])
@@ -391,6 +404,7 @@ def main():
         speculator_model_name=args.speculator_model_name,
         tokenizer=tokenizer,
         max_capacity_prompt=args.max_capacity_prompt,
+        max_capacity_prompt_percentage=args.max_capacity_prompt_percentage,
         pool_kernel_size=args.kernel_size if args.pooling != 'none' else None,
         pool_type=args.pooling,
         use_chunk_selection=args.use_chunk_selection,
@@ -427,7 +441,10 @@ def main():
     print(f"\n--- Running Speculative Prefill Pipeline ---")
     print(f"Base Model: {args.base_model_name}")
     print(f"Speculator Model: {args.speculator_model_name}")
-    print(f"Max Prompt Capacity: {args.max_capacity_prompt}")
+    if args.max_capacity_prompt_percentage:
+        print(f"Max Prompt Capacity: {args.max_capacity_prompt_percentage:.1%}")
+    else:
+        print(f"Max Prompt Capacity: {args.max_capacity_prompt} tokens")
     print(f"Lookahead K: {args.look_ahead_k}")
     print(f"Pooling: type='{pipeline.pool_type}', kernel_size={pipeline.pool_kernel_size}")
     print(f"Token Selection: {selection_strategy}")

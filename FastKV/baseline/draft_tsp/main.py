@@ -130,8 +130,12 @@ class DraftTSPPipeline:
         
         token_scores = self._get_token_importance_scores(input_ids, look_ahead_k)
 
-        initial_capacity = self.args.initial_capacity
-        num_to_select = min(initial_capacity, prompt_len)
+        if hasattr(self.args, 'initial_capacity_percentage') and self.args.initial_capacity_percentage is not None:
+            num_to_select = int(prompt_len * self.args.initial_capacity_percentage)
+        else:
+            num_to_select = self.args.initial_capacity
+
+        num_to_select = min(num_to_select, prompt_len)
         _, initial_indices = torch.topk(token_scores, k=num_to_select)
         initial_indices, _ = torch.sort(initial_indices)
 
@@ -140,31 +144,32 @@ class DraftTSPPipeline:
         
         generated_ids = []
         with torch.no_grad():
-            # Prefill the HFastKV-patched base model. The internal forward pass handles the TSP schedule.
             prefill_outputs = self.base_model(input_ids=selected_input_ids, position_ids=selected_position_ids, use_cache=True)
             past_key_values = prefill_outputs.past_key_values
             
-            # --- FIX: Access .logits directly from the CausalLMOutputWithPast object ---
-            # The HFastKV patch ensures the returned tensor has shape [batch, num_propagated_tokens, hidden_dim]
-            # We take the last token from this propagated set for generation.
+            # This is the 1st new token
             next_token_logits = prefill_outputs.logits[:, -1, :]
             next_token = torch.argmax(next_token_logits, dim=-1).unsqueeze(-1)
             generated_ids.append(next_token.item())
 
             # Manual Generation Loop
-            for i in range(max_generation_length - 1):
-                # The position_id for the next token is its "real" absolute position.
-                # Since we've generated one token, we start from prompt_len.
-                real_pos = torch.tensor([[prompt_len + i]], device=self.device, dtype=torch.long)
+            for _ in range(max_generation_length - 1):
+                current_token_pos = torch.tensor([[prompt_len + len(generated_ids) - 1]], device=self.device, dtype=torch.long)
                 
-                outputs = self.base_model(input_ids=next_token, position_ids=real_pos, past_key_values=past_key_values, use_cache=True)
+                outputs = self.base_model(
+                    input_ids=next_token,
+                    position_ids=current_token_pos,
+                    past_key_values=past_key_values,
+                    use_cache=True
+                )
                 past_key_values = outputs.past_key_values
 
-                # --- FIX: Access .logits directly ---
                 next_token_logits = outputs.logits[:, -1, :]
                 next_token = torch.argmax(next_token_logits, dim=-1).unsqueeze(-1)
                 
-                if next_token.item() == self.tokenizer.eos_token_id: break
+                if next_token.item() == self.tokenizer.eos_token_id:
+                    break
+                
                 generated_ids.append(next_token.item())
         
         response = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
