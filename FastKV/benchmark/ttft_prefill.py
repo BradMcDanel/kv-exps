@@ -91,6 +91,7 @@ def main(args):
             speculator_model_name=args.speculator_model_name,
             tokenizer=tokenizer,
             args=args,
+            detailed_timing=args.detailed_timing,
         )
         model_device = pipeline.device
     elif args.mode == 'speculative_prefill':
@@ -105,7 +106,8 @@ def main(args):
             pool_kernel_size=args.kernel_size if args.pooling != 'none' else None,
             pool_type=args.pooling,
             use_chunk_selection=True, # Assuming default behavior
-            chunk_size=64 # Assuming default behavior
+            chunk_size=64, # Assuming default behavior
+            detailed_timing=args.detailed_timing,
         )
         model_device = pipeline.device
     else:
@@ -158,27 +160,27 @@ def main(args):
 
     # Benchmark runs
     result_list = []
+    metadata_list = []
     print(f"Running {args.num_runs} benchmark run(s)...")
     for i in range(args.num_runs):        
         total_time = 0
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
+        run_metadata = {}
 
         # Prefill timing logic
         with torch.no_grad():
             start.record()
-            # ==================== DRAFT_TSP BENCHMARKING LOGIC ====================
             if pipeline:
                 if args.mode == 'draft_tsp':
-                    _ = pipeline.run(input_ids=input_id, look_ahead_k=args.look_ahead_k, max_generation_length=1)
+                    _, run_metadata = pipeline.run(input_ids=input_id, look_ahead_k=args.look_ahead_k, max_generation_length=1)
                 elif args.mode == 'speculative_prefill':
-                    _ = pipeline.run(input_ids=input_id, look_ahead_k=args.look_ahead_k, max_generation_length=1)
-            # =====================================================================
-            elif args.mode in ['gemfilter']:
+                    _, run_metadata = pipeline.run(input_ids=input_id, look_ahead_k=args.look_ahead_k, max_generation_length=1)
+            elif args.mode == 'gemfilter':
                 from baseline.gemfilter.gemfilter_utils import gemfilter_generate_selection_prefill
                 set_topk(model, args.max_capacity_prompt, mode='gemfilter')
                 _ = gemfilter_generate_selection_prefill(input_id, attn_mask, model, tokenizer, select_layer_idx=args.filter_idx)
-            else: # Standard modes
+            else: # Standard single-model modes
                 _ = model(input_id, attention_mask=attn_mask)
             
             end.record()
@@ -186,6 +188,8 @@ def main(args):
             total_time += start.elapsed_time(end)
         
         result_list.append(total_time)
+        if run_metadata:
+            metadata_list.append(run_metadata)
         utils.cleanup_memory(verbos=False)
 
     mean_ttft = average_excluding_min_max(result_list)
@@ -201,7 +205,17 @@ def main(args):
             print(f"Max Prompt Capacity: {args.max_capacity_prompt} tokens")
     elif args.mode != "fullkv":
         print(f"Context Capacity = {args.max_capacity_prompt}")
+    
     print(f"TTFT: {(mean_ttft):.5f} msec")
+
+    if args.detailed_timing and metadata_list:
+        avg_spec_prefill = average_excluding_min_max([m.get('speculation_prefill', 0) * 1000 for m in metadata_list])
+        avg_spec_decode = average_excluding_min_max([m.get('speculation_decode', 0) * 1000 for m in metadata_list])
+        avg_base_prefill = average_excluding_min_max([m.get('base_prefill', 0) * 1000 for m in metadata_list])
+        print(f"  - Speculator Prefill: {avg_spec_prefill:.5f} msec")
+        print(f"  - Speculator Decode/Scoring: {avg_spec_decode:.5f} msec")
+        print(f"  - Base Model Prefill: {avg_base_prefill:.5f} msec")
+
     print(f"Max memory allocated: {torch.cuda.max_memory_allocated() / (1024**3):.2f} GB\n")
 
 
@@ -245,6 +259,8 @@ if __name__ == "__main__":
     parser.add_argument("--head_choice", type=str, default='reason', choices=['copy', 'reason'])
     parser.add_argument('--beta', type=float, default=1.2)
     parser.add_argument('--temp', type=float, default=1.0)
+
+    parser.add_argument("--detailed_timing", action="store_true", help="Enable detailed, per-part timing with CUDA synchronization.")
 
     # Benchmark Option
     parser.add_argument("--seqlen", type=int, default=131072, help="")

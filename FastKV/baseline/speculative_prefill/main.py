@@ -62,7 +62,6 @@ def _patched_attention_forward(
     value_states_for_cache = value_projection.view(batch_size, query_length, num_key_value_heads, head_dim).transpose(1, 2)
 
     cos, sin = position_embeddings
-    # *** FIX: Pass position_ids to the rotary embedding application ***
     query_states_rotated, key_states_rotated = hf_apply_rotary_pos_emb(query_states, key_states_before_rope, cos, sin, position_ids)
 
     if pipeline_instance.is_prefilling and query_length > 1:
@@ -109,6 +108,7 @@ class SpeculativePrefillPipeline:
         pool_type: str = 'avgpool',
         use_chunk_selection: bool = True,
         chunk_size: int = 32,
+        detailed_timing: bool = False,
     ):
         self.base_model_name = base_model_name
         self.speculator_model_name = speculator_model_name
@@ -118,6 +118,7 @@ class SpeculativePrefillPipeline:
         self.pool_type = pool_type.lower()
         self.use_chunk_selection = use_chunk_selection
         self.chunk_size = chunk_size
+        self.detailed_timing = detailed_timing
         self._validate_config()
         self.tokenizer = tokenizer
         self.speculator_model = self._load_model(self.speculator_model_name)
@@ -187,17 +188,15 @@ class SpeculativePrefillPipeline:
     def _token_importance_from_attn_scores(self, attention_scores: torch.Tensor):
         if attention_scores.numel() == 0: raise RuntimeError("Cannot calculate importance from empty attention scores.")
         
-        # Permute to [N, L, H, S] to match vLLM's logic flow
-        # N = num_steps (lookahead), L = num_layers, H = num_heads, S = key_len (context)
-        attention_scores = attention_scores.permute(3, 1, 2, 0, 4).squeeze(0) # Remove batch dim
-        num_steps, num_layers, num_heads, key_len = attention_scores.shape
+        attention_scores = attention_scores.permute(0, 3, 1, 2, 4)
+        bs, num_steps, num_layers, num_heads, key_len = attention_scores.shape
+        if bs != 1:
+            raise NotImplementedError("Batch size > 1 is not supported.")
 
         attention_probs = F.softmax(attention_scores, dim=-1, dtype=torch.float32).to(attention_scores.dtype)
 
-        # Optional: Apply 1D pooling to smooth scores
         if self.pool_kernel_size and self.pool_type != 'none':
-            # Reshape for pooling: combine N, L, H into a single batch dimension
-            reshaped_for_pooling = attention_probs.flatten(0, 2)
+            reshaped_for_pooling = attention_probs.squeeze(0).flatten(0, 2)
             
             padding = (self.pool_kernel_size - 1) // 2
             pool_fn = F.avg_pool1d if self.pool_type == 'avgpool' else F.max_pool1d
@@ -207,19 +206,8 @@ class SpeculativePrefillPipeline:
         else:
             processed_scores = attention_probs
 
-        # --- Aggregation Strategy from vLLM Implementation ---
-        # "flatten L and H, max over the combined dimension, then mean over N"
-        
-        # 1. Flatten Layers (L) and Heads (H)
-        # Shape: [N, L*H, S]
         flattened_scores = processed_scores.flatten(1, 2)
-
-        # 2. Max over the combined L*H dimension
-        # Shape: [N, S]
         max_scores = flattened_scores.max(1).values
-        
-        # 3. Average over Lookaheads (N)
-        # Shape: [S]
         final_token_importance = max_scores.mean(0)
         
         self.token_importance_scores = final_token_importance.unsqueeze(0)
@@ -270,7 +258,10 @@ class SpeculativePrefillPipeline:
 
     def run(self, input_ids: torch.Tensor, look_ahead_k: int, max_generation_length: int) -> Tuple[str, Dict[str, Any]]:
         run_metadata: Dict[str, Any] = {"max_capacity_prompt": self.max_capacity_prompt}
-        overall_start_time = time.perf_counter()
+        
+        if self.detailed_timing:
+            start_event = torch.cuda.Event(enable_timing=True)
+            end_event = torch.cuda.Event(enable_timing=True)
 
         num_patched_layers = self._patch_speculator()
         if num_patched_layers == 0 and look_ahead_k > 0:
@@ -279,32 +270,32 @@ class SpeculativePrefillPipeline:
         prompt_length = input_ids.shape[1]
         run_metadata["prompt_input_length"] = prompt_length
         if prompt_length == 0:
-            run_metadata["total_time"] = time.perf_counter() - overall_start_time
             run_metadata["token_keep_rate"] = 100.0
             return "", run_metadata
 
         # --- Stage 1: Speculator Prefill ---
-        stage_start_time = time.perf_counter()
+        if self.detailed_timing: start_event.record()
         self.is_prefilling = True
         with torch.no_grad():
             spec_out = self.speculator_model(input_ids=input_ids, use_cache=True, cache_position=torch.arange(prompt_length, device=self.device))
+        if self.detailed_timing:
+            end_event.record()
+            torch.cuda.synchronize()
+            run_metadata["speculation_prefill"] = start_event.elapsed_time(end_event) / 1000.0
         
         speculator_prefill_cache = spec_out.past_key_values
         if speculator_prefill_cache is None: raise RuntimeError("Speculator prefill did not return a KV cache.")
         
         speculator_prefill_cache_as_tuple = speculator_prefill_cache.to_legacy_cache() if isinstance(speculator_prefill_cache, DynamicCache) else speculator_prefill_cache
         current_spec_cache = DynamicCache.from_legacy_cache(speculator_prefill_cache_as_tuple)
-        
         speculator_next_token_ids = torch.argmax(spec_out.logits[:, -1, :], dim=-1, keepdim=True)
-        run_metadata["speculation_prefill"] = time.perf_counter() - stage_start_time
 
         # --- Stage 2: Speculator Lookahead & Scoring ---
-        stage_start_time = time.perf_counter()
+        if self.detailed_timing: start_event.record()
         self.is_prefilling = False
         with torch.no_grad():
             current_spec_tokens = speculator_next_token_ids
             for i in range(look_ahead_k):
-                # *** FIX: The line that caused the crash ***
                 cache_len = current_spec_cache.get_seq_length(0)
                 pos_ids = torch.tensor([[cache_len]], device=self.device)
                 lookahead_out = self.speculator_model(
@@ -314,22 +305,21 @@ class SpeculativePrefillPipeline:
                     use_cache=True,
                     cache_position=torch.tensor([cache_len], device=self.device)
                 )
-                
-                # *** FIX: Normalize the cache after the model call to prevent future crashes ***
                 current_spec_cache = lookahead_out.past_key_values
                 if isinstance(current_spec_cache, tuple):
                     current_spec_cache = DynamicCache.from_legacy_cache(current_spec_cache)
-
                 current_spec_tokens = torch.argmax(lookahead_out.logits[:, -1, :], dim=-1, keepdim=True)
                 if current_spec_tokens.item() in self.eos_token_ids: break
 
-        run_metadata["speculation_decode"] = time.perf_counter() - stage_start_time
-
         raw_qk_scores = self._compute_raw_qk_scores(speculator_prefill_cache_as_tuple)
         self._token_importance_from_attn_scores(raw_qk_scores)
+        if self.detailed_timing:
+            end_event.record()
+            torch.cuda.synchronize()
+            run_metadata["speculation_decode"] = start_event.elapsed_time(end_event) / 1000.0
 
         # --- Stage 3: Base Model Selective Prefill ---
-        base_model_first_token_gen_start_time = time.perf_counter()
+        if self.detailed_timing: start_event.record()
         indices_to_keep = self._calculate_indices_to_keep(prompt_length)
         selected_prompt_ids = input_ids[:, indices_to_keep]
         selective_cache_pos = torch.arange(selected_prompt_ids.shape[1], device=self.device)
@@ -345,30 +335,27 @@ class SpeculativePrefillPipeline:
                 cache_position=selective_cache_pos
             )
         base_model_next_token_ids, base_model_cache_after_prefill = torch.argmax(base_out.logits[:, -1, :], dim=-1, keepdim=True), base_out.past_key_values
+        if self.detailed_timing:
+            end_event.record()
+            torch.cuda.synchronize()
+            run_metadata["base_prefill"] = start_event.elapsed_time(end_event) / 1000.0
 
         run_metadata["token_keep_rate"] = (selected_prompt_ids.shape[1] / prompt_length * 100.0) if prompt_length > 0 else 100.0
-        base_model_first_token_time = time.perf_counter() - base_model_first_token_gen_start_time
-        run_metadata["base_prefill"] = base_model_first_token_time
-        run_metadata["base_ttft"] = run_metadata["speculation_prefill"] + run_metadata["speculation_decode"] + base_model_first_token_time
+        if self.detailed_timing:
+            run_metadata["base_ttft"] = run_metadata.get("speculation_prefill", 0) + run_metadata.get("speculation_decode", 0) + run_metadata.get("base_prefill", 0)
 
         # --- Stage 4: Base Model Generation ---
         gen_token_ids_list: List[int] = []
-        decode_total_time = 0.0
         if base_model_next_token_ids is not None and base_model_cache_after_prefill is not None:
             first_gen_token_id = base_model_next_token_ids.item()
             gen_token_ids_list.append(first_gen_token_id)
-            
             current_decode_tokens = base_model_next_token_ids
-            # *** FIX: Normalize cache before entering the generation loop ***
             current_decode_kv_cache = base_model_cache_after_prefill
             if isinstance(current_decode_kv_cache, tuple):
                 current_decode_kv_cache = DynamicCache.from_legacy_cache(current_decode_kv_cache)
 
             if first_gen_token_id not in self.eos_token_ids:
                 for i in range(max_generation_length - 1):
-                    decode_step_start_time = time.perf_counter()
-                    
-                    # *** FIX: The line that would cause the next crash ***
                     current_cache_len = current_decode_kv_cache.get_seq_length(0)
                     pos_ids = torch.tensor([[selected_prompt_ids.shape[1] + i]], device=self.device)
                     decode_cache_pos = torch.tensor([current_cache_len], device=self.device)
@@ -381,23 +368,15 @@ class SpeculativePrefillPipeline:
                             use_cache=True,
                             cache_position=decode_cache_pos
                         )
-                    decode_total_time += time.perf_counter() - decode_step_start_time
-
                     next_tokens = torch.argmax(decode_out.logits[:, -1, :], dim=-1, keepdim=True)
                     gen_token_ids_list.append(next_tokens.item())
-                    
-                    # *** FIX: Normalize the cache after the model call ***
                     current_decode_kv_cache = decode_out.past_key_values
                     if isinstance(current_decode_kv_cache, tuple):
                         current_decode_kv_cache = DynamicCache.from_legacy_cache(current_decode_kv_cache)
-
                     current_decode_tokens = next_tokens
                     if gen_token_ids_list[-1] in self.eos_token_ids: break
 
         final_gen_text = self.tokenizer.decode(gen_token_ids_list, skip_special_tokens=True)
-        run_metadata["decode_time"] = decode_total_time
-        run_metadata["generated_tokens"] = len(gen_token_ids_list)
-        run_metadata["total_time"] = time.perf_counter() - overall_start_time
         if final_gen_text.startswith("assistant\n\n"): final_gen_text = final_gen_text[len("assistant\n\n"):]
         elif final_gen_text.startswith(" assistant\n"): final_gen_text = final_gen_text[len(" assistant\n"):]
         return final_gen_text, run_metadata
