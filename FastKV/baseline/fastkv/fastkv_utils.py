@@ -78,7 +78,6 @@ class FastKVCluster():
                 raise ValueError('Pooling method not supported')
 
             attn_cache = attn_cache.view(bsz, -1, num_key_value_groups, q_len-self.window_size).sum(dim=-2)
-            self.last_scores = attn_cache
             indices = attn_cache.topk(self.max_capacity_prompt - self.window_size, dim=-1).indices
             indices = indices.unsqueeze(-1).expand(-1, -1, -1, head_dim)
             
