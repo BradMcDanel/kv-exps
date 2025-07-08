@@ -362,9 +362,15 @@ class SpeculativePrefillPipeline:
                 current_decode_kv_cache = DynamicCache.from_legacy_cache(current_decode_kv_cache)
 
             if first_gen_token_id not in self.eos_token_ids:
+                if selective_pos_ids.shape[1] > 0:
+                    start_pos_for_generation = selective_pos_ids[0, -1] + 1
+                else:
+                    start_pos_for_generation = 0
+
                 for i in range(max_generation_length - 1):
                     current_cache_len = current_decode_kv_cache.get_seq_length(0)
-                    pos_ids = torch.tensor([[selected_prompt_ids.shape[1] + i]], device=self.device)
+                    
+                    pos_ids = torch.tensor([[start_pos_for_generation + i]], device=self.device)
                     decode_cache_pos = torch.tensor([current_cache_len], device=self.device)
                     
                     with torch.no_grad():
@@ -375,13 +381,18 @@ class SpeculativePrefillPipeline:
                             use_cache=True,
                             cache_position=decode_cache_pos
                         )
+
                     next_tokens = torch.argmax(decode_out.logits[:, -1, :], dim=-1, keepdim=True)
                     gen_token_ids_list.append(next_tokens.item())
                     current_decode_kv_cache = decode_out.past_key_values
+
                     if isinstance(current_decode_kv_cache, tuple):
                         current_decode_kv_cache = DynamicCache.from_legacy_cache(current_decode_kv_cache)
+
                     current_decode_tokens = next_tokens
-                    if gen_token_ids_list[-1] in self.eos_token_ids: break
+
+                    if gen_token_ids_list[-1] in self.eos_token_ids:
+                        break
 
         final_gen_text = self.tokenizer.decode(gen_token_ids_list, skip_special_tokens=True)
         if final_gen_text.startswith("assistant\n\n"): final_gen_text = final_gen_text[len("assistant\n\n"):]
