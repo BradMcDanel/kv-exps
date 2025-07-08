@@ -1,3 +1,4 @@
+# main.py
 import sys
 sys.path.append(".")
 
@@ -43,12 +44,21 @@ def setup_model_and_tokenizer(args):
     if args.mode == "speculative_prefill":
         from baseline.speculative_prefill.main import SpeculativePrefillPipeline as Pipeline
         logging.info("Initializing SpeculativePrefillPipeline with custom parameters...")
+
+        # Handle potentially conflicting capacity arguments. Prioritize percentage.
+        max_cap_prompt = args.max_capacity_prompt
+        max_cap_pct = args.max_capacity_prompt_percentage
+        if max_cap_pct is not None:
+            if max_cap_prompt is not None:
+                logging.info(f"Using `max_capacity_prompt_percentage={max_cap_pct}`. Ignoring `max_capacity_prompt={max_cap_prompt}`.")
+            max_cap_prompt = None # Nullify absolute value if percentage is given
+
         pipeline = Pipeline(
             base_model_name=args.model,
             speculator_model_name=args.speculator_model_name,
             tokenizer=tokenizer,
-            max_capacity_prompt=args.max_capacity_prompt,
-            max_capacity_prompt_percentage=args.max_capacity_prompt_percentage,
+            max_capacity_prompt=max_cap_prompt,
+            max_capacity_prompt_percentage=max_cap_pct,
             pool_kernel_size=args.kernel_size if args.pooling != 'none' else None,
             pool_type=args.pooling,
             use_chunk_selection=args.use_chunk_selection, 

@@ -133,21 +133,28 @@ class SpeculativePrefillPipeline:
         self.token_importance_scores: Optional[torch.Tensor] = None
 
     def _validate_config(self):
+        # Prompt capacity validation
         if self.max_capacity_prompt is not None and self.max_capacity_prompt_percentage is not None:
             raise ValueError("Only one of `max_capacity_prompt` and `max_capacity_prompt_percentage` can be specified.")
         if self.max_capacity_prompt_percentage is not None and not (0.0 < self.max_capacity_prompt_percentage <= 1.0):
             raise ValueError("`max_capacity_prompt_percentage` must be between 0.0 and 1.0.")
 
-    def _validate_config(self):
+        # Pooling validation
         if self.pool_type not in ['avgpool', 'maxpool', 'none']:
             raise ValueError(f"pool_type must be 'avgpool', 'maxpool', or 'none', but got {self.pool_type}")
         if self.pool_kernel_size is not None:
-            if self.pool_kernel_size <= 1: self.pool_kernel_size = None
-            elif self.pool_kernel_size % 2 == 0: raise ValueError("pool_kernel_size must be an odd number.")
-            if self.pool_type == 'none': raise ValueError("pool_kernel_size is specified, but pool_type is 'none'.")
+            if self.pool_kernel_size <= 1:
+                self.pool_kernel_size = None
+            elif self.pool_kernel_size % 2 == 0:
+                raise ValueError("pool_kernel_size must be an odd number.")
+            if self.pool_type == 'none':
+                raise ValueError("pool_kernel_size is specified, but pool_type is 'none'.")
         if self.pool_type != 'none' and self.pool_kernel_size is None:
             raise ValueError(f"pool_type is '{self.pool_type}', but pool_kernel_size is not specified.")
-        if self.chunk_size <= 0: raise ValueError("chunk_size must be a positive integer.")
+        
+        # Chunk size validation
+        if self.chunk_size <= 0:
+            raise ValueError("chunk_size must be a positive integer.")
 
     def _extract_eos_token_ids(self) -> List[int]:
         config_eos = self.base_config.eos_token_id
