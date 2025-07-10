@@ -170,11 +170,11 @@ class SpeculativePrefillPipeline:
         if self._is_qtip_model(model_name):
             if not QTIP_AVAILABLE: raise ImportError(f"QTIP model {model_name} requested but modules not available.")
             print(f"Loading QTIP model: {model_name}")
-            model, _ = qtip_model_from_hf_path(model_name, max_mem_ratio=0.7, attn_implementation="sdpa")
+            model, _ = qtip_model_from_hf_path(model_name, max_mem_ratio=0.7, attn_implementation="flash_attention_2")
         else:
             print(f"Loading standard HF model: {model_name}")
             model = AutoModelForCausalLM.from_pretrained(
-                model_name, torch_dtype=torch.float16, trust_remote_code=True, device_map="auto", attn_implementation="sdpa"
+                model_name, torch_dtype=torch.float16, trust_remote_code=True, device_map="auto", attn_implementation="flash_attention_2"
             )
         return model.eval()
 
@@ -399,6 +399,243 @@ class SpeculativePrefillPipeline:
         elif final_gen_text.startswith(" assistant\n"): final_gen_text = final_gen_text[len(" assistant\n"):]
         return final_gen_text, run_metadata
 
+class AdaptiveContextPruningPipeline:
+    def __init__(
+        self,
+        base_model_name: str,
+        speculator_model_name: str,
+        tokenizer: AutoTokenizer,
+        # ACP-specific parameters
+        use_adaptive_pruning: bool = False,
+        objective_token_count_start: int = 32,
+        objective_token_count_end: int = 256,
+        sink_token_count: int = 32,
+        pruning_alpha: float = 0.85,
+        score_sharpening_temp: float = 1.0, # New: Controls score distribution
+        # Fallback parameters for fixed pruning
+        max_capacity_prompt: int = 512,
+        max_capacity_prompt_percentage: Optional[float] = None,
+        # General config
+        detailed_timing: bool = False,
+    ):
+        self.base_model_name = base_model_name
+        self.speculator_model_name = speculator_model_name
+        self.tokenizer = tokenizer
+        self.detailed_timing = detailed_timing
+
+        # ACP Config
+        self.use_adaptive_pruning = use_adaptive_pruning
+        self.objective_token_count_start = objective_token_count_start
+        self.objective_token_count_end = objective_token_count_end
+        self.sink_token_count = sink_token_count
+        self.pruning_alpha = pruning_alpha
+        self.score_sharpening_temp = score_sharpening_temp
+
+        # Fallback Config
+        self.max_capacity_prompt = max_capacity_prompt
+        self.max_capacity_prompt_percentage = max_capacity_prompt_percentage
+
+        self.speculator_model = self._load_model(self.speculator_model_name)
+        self.base_model = self._load_model(self.base_model_name)
+        self.base_config: AutoConfig = self.base_model.config
+        self.device = self.speculator_model.device
+        self.dtype = self.speculator_model.dtype
+        self.eos_token_ids = self._extract_eos_token_ids()
+        self.token_importance_scores: Optional[torch.Tensor] = None
+
+    def _extract_eos_token_ids(self) -> List[int]:
+        config_eos = self.base_config.eos_token_id
+        if isinstance(config_eos, int): return [config_eos]
+        if isinstance(config_eos, list): return list(config_eos)
+        if self.tokenizer.eos_token_id: return [self.tokenizer.eos_token_id]
+        raise ValueError("eos_token_id not defined in config or tokenizer.")
+
+    def _load_model(self, model_name: str) -> AutoModelForCausalLM:
+        print(f"Loading standard HF model: {model_name}")
+        model = AutoModelForCausalLM.from_pretrained(
+            model_name, torch_dtype=torch.float16, trust_remote_code=True, device_map="auto", attn_implementation="sdpa"
+        )
+        return model.eval()
+
+
+    def _get_adaptive_importance_scores(self, attention_maps: Tuple[torch.Tensor, ...]) -> torch.Tensor:
+        """
+        Computes token importance in a memory-efficient way by streaming through layers.
+        """
+        if not attention_maps:
+            return torch.tensor([], device=self.device)
+
+        # Get shape information from the first layer's attention map
+        bs, num_heads, seq_len, _ = attention_maps[0].shape
+        if bs != 1:
+            raise NotImplementedError("Batch size > 1 not supported for profiling.")
+
+        # Initialize a tensor to accumulate the aggregated scores
+        total_agg_attn = torch.zeros((seq_len, seq_len), device=self.device, dtype=torch.float32)
+        num_layers_processed = 0
+
+        # Process layer by layer to prevent creating a massive stacked tensor
+        for layer_attn in attention_maps:
+            # Squeeze batch dim, average over heads, and add to total
+            # layer_attn shape: [1, num_heads, seq_len, seq_len]
+            # agg_layer_attn shape: [seq_len, seq_len]
+            agg_layer_attn = layer_attn.squeeze(0).mean(dim=0, dtype=torch.float32)
+            total_agg_attn += agg_layer_attn
+            num_layers_processed += 1
+        
+        # Final average over all layers
+        if num_layers_processed > 0:
+            agg_attn_probs = total_agg_attn / num_layers_processed
+        else:
+            return torch.tensor([], device=self.device)
+
+        # --- The rest of the logic is the same ---
+
+        # Define the "objective" tokens (the rows we care about)
+        start_indices = torch.arange(min(self.objective_token_count_start, seq_len), device=self.device)
+        end_indices = torch.arange(max(0, seq_len - self.objective_token_count_end), seq_len, device=self.device)
+        objective_indices = torch.cat([start_indices, end_indices]).unique()
+
+        # Calculate ObjectiveScore by summing columns over the objective rows
+        objective_scores = agg_attn_probs[objective_indices, :].sum(dim=0) # Shape: [seq_len]
+
+        # Sharpening step
+        if self.score_sharpening_temp > 0:
+            objective_scores = F.softmax(objective_scores / self.score_sharpening_temp, dim=-1)
+            
+        return objective_scores.to(self.dtype) # Return in model's dtype
+
+    def _calculate_indices_to_keep(self, original_seq_len: int) -> torch.Tensor:
+        """
+        Selects token indices to keep. Switches between adaptive and fixed-K pruning.
+        (This function is correct and does not need changes)
+        """
+        if self.token_importance_scores is None:
+            raise RuntimeError("Token importance scores must be computed before selection.")
+        
+        scores = self.token_importance_scores
+
+        if self.use_adaptive_pruning:
+            # --- ACP Dynamic Pruning Logic ---
+            # 1. Define always-keep sink/local tokens
+            sink_indices = torch.arange(min(self.sink_token_count, original_seq_len), device=self.device)
+            local_indices = torch.arange(max(0, original_seq_len - self.sink_token_count), original_seq_len, device=self.device)
+            always_keep_indices = torch.cat([sink_indices, local_indices]).unique()
+
+            # 2. Calculate dynamic baseline from the scores of these always-keep tokens
+            baseline_importance = scores[always_keep_indices].mean().item() if len(always_keep_indices) > 0 else scores.mean().item()
+            dynamic_threshold = self.pruning_alpha * baseline_importance
+
+            # 3. Select middle tokens that meet the dynamic threshold
+            middle_indices_mask = torch.ones(original_seq_len, dtype=torch.bool, device=self.device)
+            if len(always_keep_indices) > 0:
+                middle_indices_mask[always_keep_indices] = False
+            
+            middle_candidates = torch.arange(original_seq_len, device=self.device)[middle_indices_mask]
+            
+            if len(middle_candidates) > 0:
+                selected_middle_mask = scores[middle_candidates] >= dynamic_threshold
+                selected_middle_indices = middle_candidates[selected_middle_mask]
+            else:
+                selected_middle_indices = torch.tensor([], dtype=torch.long, device=self.device)
+
+            # 4. Combine and return
+            final_indices = torch.cat([always_keep_indices, selected_middle_indices]).unique()
+            return torch.sort(final_indices)[0]
+
+        else:
+            # --- Fallback to Fixed-K/Percentage Logic ---
+            if self.max_capacity_prompt_percentage is not None:
+                num_to_keep = int(original_seq_len * self.max_capacity_prompt_percentage)
+            else:
+                num_to_keep = min(self.max_capacity_prompt, original_seq_len)
+            
+            if num_to_keep >= original_seq_len:
+                return torch.arange(original_seq_len, device=self.device, dtype=torch.long)
+
+            _, indices = torch.topk(scores, k=num_to_keep, dim=-1)
+            return torch.sort(indices)[0]
+
+
+    def run(self, input_ids: torch.Tensor, max_generation_length: int) -> Tuple[str, Dict[str, Any]]:
+        run_metadata: Dict[str, Any] = {}
+        
+        if self.detailed_timing:
+            start_event = torch.cuda.Event(enable_timing=True)
+            end_event = torch.cuda.Event(enable_timing=True)
+
+        prompt_length = input_ids.shape[1]
+        run_metadata["prompt_input_length"] = prompt_length
+        if prompt_length == 0:
+            return "", run_metadata
+
+        # --- Stage 1: Speculator Prefill to get Attention Maps ---
+        if self.detailed_timing: start_event.record()
+        with torch.no_grad():
+            spec_out = self.speculator_model(input_ids=input_ids, use_cache=True, output_attentions=True)
+        if self.detailed_timing:
+            end_event.record(); torch.cuda.synchronize()
+            run_metadata["speculation_pass"] = start_event.elapsed_time(end_event) / 1000.0
+
+        # --- Stage 2: Calculate Importance and Select Tokens ---
+        if self.detailed_timing: start_event.record()
+        self.token_importance_scores = self._get_adaptive_importance_scores(spec_out.attentions)
+        indices_to_keep = self._calculate_indices_to_keep(prompt_length)
+        if self.detailed_timing:
+            end_event.record(); torch.cuda.synchronize()
+            run_metadata["scoring_and_selection"] = start_event.elapsed_time(end_event) / 1000.0
+
+        # --- Stage 3: Base Model Selective Prefill ---
+        if self.detailed_timing: start_event.record()
+        selected_prompt_ids = input_ids[:, indices_to_keep]
+        selective_pos_ids = indices_to_keep.unsqueeze(0).to(torch.long)
+        run_metadata["selective_prefill_kept_token_count"] = selected_prompt_ids.shape[1]
+        run_metadata["token_keep_rate"] = (selected_prompt_ids.shape[1] / prompt_length * 100.0) if prompt_length > 0 else 100.0
+
+        with torch.no_grad():
+            base_out = self.base_model(
+                selected_prompt_ids,
+                position_ids=selective_pos_ids,
+                use_cache=True
+            )
+        base_model_next_token_ids, base_model_cache_after_prefill = torch.argmax(base_out.logits[:, -1, :], dim=-1, keepdim=True), base_out.past_key_values
+        if self.detailed_timing:
+            end_event.record(); torch.cuda.synchronize()
+            run_metadata["base_prefill"] = start_event.elapsed_time(end_event) / 1000.0
+            run_metadata["base_ttft"] = run_metadata.get("speculation_pass", 0) + run_metadata.get("scoring_and_selection", 0) + run_metadata.get("base_prefill", 0)
+        
+        # --- Stage 4: Base Model Generation ---
+        gen_token_ids_list: List[int] = []
+        if base_model_next_token_ids is not None and base_model_cache_after_prefill is not None:
+            first_gen_token_id = base_model_next_token_ids.item()
+            gen_token_ids_list.append(first_gen_token_id)
+            
+            if first_gen_token_id not in self.eos_token_ids:
+                current_decode_tokens = base_model_next_token_ids
+                current_decode_kv_cache = base_model_cache_after_prefill
+                if isinstance(current_decode_kv_cache, tuple): current_decode_kv_cache = DynamicCache.from_legacy_cache(current_decode_kv_cache)
+                
+                start_pos_for_generation = selective_pos_ids[0, -1] + 1 if selective_pos_ids.shape[1] > 0 else 0
+                
+                for i in range(max_generation_length - 1):
+                    current_cache_len = current_decode_kv_cache.get_seq_length(0)
+                    pos_ids = torch.tensor([[start_pos_for_generation + i]], device=self.device)
+                    decode_cache_pos = torch.tensor([current_cache_len], device=self.device)
+                    
+                    with torch.no_grad():
+                        decode_out = self.base_model(
+                            current_decode_tokens, position_ids=pos_ids, past_key_values=current_decode_kv_cache,
+                            use_cache=True, cache_position=decode_cache_pos
+                        )
+                    next_tokens = torch.argmax(decode_out.logits[:, -1, :], dim=-1, keepdim=True)
+                    gen_token_ids_list.append(next_tokens.item())
+                    current_decode_kv_cache = decode_out.past_key_values
+                    if isinstance(current_decode_kv_cache, tuple): current_decode_kv_cache = DynamicCache.from_legacy_cache(current_decode_kv_cache)
+                    current_decode_tokens = next_tokens
+                    if gen_token_ids_list[-1] in self.eos_token_ids: break
+
+        final_gen_text = self.tokenizer.decode(gen_token_ids_list, skip_special_tokens=True)
+        return final_gen_text, run_metadata
 
 def main():
     parser = argparse.ArgumentParser(description="Speculative Prefill Pipeline with QTIP Support")

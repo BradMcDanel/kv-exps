@@ -97,11 +97,18 @@ def main(args):
     elif args.mode == 'speculative_prefill':
         from baseline.speculative_prefill.main import SpeculativePrefillPipeline
         print("Initializing SpeculativePrefillPipeline for benchmarking...")
+        
+        # FIX: Handle potentially conflicting capacity arguments. Prioritize percentage.
+        max_cap_prompt = args.max_capacity_prompt
+        if args.max_capacity_prompt_percentage is not None:
+            # If percentage is specified, nullify the absolute value to avoid conflict.
+            max_cap_prompt = None
+
         pipeline = SpeculativePrefillPipeline(
             base_model_name=args.model,
             speculator_model_name=args.speculator_model_name,
             tokenizer=tokenizer,
-            max_capacity_prompt=args.max_capacity_prompt,
+            max_capacity_prompt=max_cap_prompt, # Use the corrected value
             max_capacity_prompt_percentage=args.max_capacity_prompt_percentage,
             pool_kernel_size=args.kernel_size if args.pooling != 'none' else None,
             pool_type=args.pooling,
