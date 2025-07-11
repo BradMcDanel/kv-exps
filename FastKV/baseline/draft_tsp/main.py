@@ -14,6 +14,74 @@ from transformers.models.llama.modeling_llama import LlamaAttention, apply_rotar
 
 from baseline.draft_tsp.monkeypatch import replace_llama_for_draft_tsp, set_speculator_data
 
+def _patched_attention_forward_for_capture(
+    self_attn: LlamaAttention, 
+    pipeline_instance: 'DraftTSPPipeline', 
+    hidden_states: torch.Tensor,
+    attention_mask: Optional[torch.Tensor] = None,
+    position_ids: Optional[torch.LongTensor] = None,
+    past_key_value: Optional[Cache] = None,
+    output_attentions: bool = False,
+    use_cache: bool = False,
+    cache_position: Optional[torch.LongTensor] = None,
+    **kwargs
+) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Cache]]:
+    """
+    A patched LlamaAttention forward pass that captures Q-vectors.
+    It performs the full attention calculation to ensure it returns a valid output
+    while capturing the necessary state for scoring.
+    """
+    # This is a re-implementation of the attention forward pass to ensure
+    # we can reliably capture Q-vectors while still returning a valid output.
+    bsz, q_len, _ = hidden_states.size()
+
+    query_states = self_attn.q_proj(hidden_states)
+    key_states = self_attn.k_proj(hidden_states)
+    value_states = self_attn.v_proj(hidden_states)
+
+    query_states = query_states.view(bsz, q_len, self_attn.num_heads, self_attn.head_dim).transpose(1, 2)
+    key_states = key_states.view(bsz, q_len, self_attn.num_key_value_heads, self_attn.head_dim).transpose(1, 2)
+    value_states = value_states.view(bsz, q_len, self_attn.num_key_value_heads, self_attn.head_dim).transpose(1, 2)
+
+    cos, sin = self_attn.rotary_emb(value_states, position_ids)
+    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+    
+    # Capture Q-vectors for scoring
+    if q_len == 1 and not pipeline_instance.is_prefilling:
+        pipeline_instance.captured_qs[self_attn.layer_idx].append(query_states.detach().clone())
+    elif q_len > 1 and pipeline_instance.is_prefilling:
+        # During prefill, all Qs are generated, but we only need the last one for lookahead scoring
+        pipeline_instance.captured_qs[self_attn.layer_idx].append(query_states[:,:,-1:,:].detach().clone())
+
+
+    if past_key_value is not None:
+        # Update the cache
+        cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+        key_states, value_states = past_key_value.update(key_states, value_states, self_attn.layer_idx, cache_kwargs)
+
+    key_states = repeat_kv(key_states, self_attn.num_key_value_groups)
+    value_states = repeat_kv(value_states, self_attn.num_key_value_groups)
+
+    attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self_attn.head_dim)
+
+    if attention_mask is not None:
+        if attention_mask.size() != attn_weights.size():
+             # Mismatch can happen with KV cache. Adjust mask to match KV cache length.
+             attention_mask = attention_mask[:, :, -q_len:, -key_states.shape[-2]:]
+        attn_weights = attn_weights + attention_mask
+
+    attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+    attn_weights = F.dropout(attn_weights, p=self_attn.attention_dropout, training=self_attn.training)
+    
+    attn_output = torch.matmul(attn_weights, value_states)
+    attn_output = attn_output.transpose(1, 2).contiguous()
+    attn_output = attn_output.reshape(bsz, q_len, self_attn.hidden_size)
+    attn_output = self_attn.o_proj(attn_output)
+
+    if not output_attentions:
+        attn_weights = None
+
+    return attn_output, attn_weights, past_key_value
 
 class DraftTSPPipeline:
     def __init__(self, base_model_name: str, speculator_model_name: str, tokenizer: AutoTokenizer, args, detailed_timing: bool = False):
@@ -34,6 +102,7 @@ class DraftTSPPipeline:
         self.captured_qs: List[List[torch.Tensor]] = []
         self.orig_spec_fwds: Dict[int, types.MethodType] = {}
         self.eos_token_ids = self._extract_eos_token_ids()
+        self.is_prefilling = False
 
     def _extract_eos_token_ids(self) -> List[int]:
         config_eos = self.base_model.config.eos_token_id
@@ -59,6 +128,9 @@ class DraftTSPPipeline:
             attn = layer.self_attn
             if i not in self.orig_spec_fwds:
                 self.orig_spec_fwds[i] = attn.forward
+            
+            # Attach layer_idx to the attention module for the patch to use
+            attn.layer_idx = i
             attn.forward = types.MethodType(
                 partial(_patched_attention_forward_for_capture, pipeline_instance=self), 
                 attn
@@ -78,45 +150,64 @@ class DraftTSPPipeline:
             start_event = torch.cuda.Event(enable_timing=True)
             end_event = torch.cuda.Event(enable_timing=True)
 
+        self._patch_speculator()
+
         # --- Stage 1a: Speculator Prefill ---
+        self.is_prefilling = True
         if self.detailed_timing: start_event.record()
         with torch.no_grad():
             spec_out = self.speculator_model(input_ids=prompt_input_ids, use_cache=True)
         if self.detailed_timing:
-            end_event.record()
-            torch.cuda.synchronize()
+            end_event.record(); torch.cuda.synchronize()
             run_metadata["speculation_prefill"] = start_event.elapsed_time(end_event) / 1000.0
         
+        # Handle both tuple and DynamicCache formats for past_key_values
         if isinstance(spec_out.past_key_values, tuple):
             spec_prefill_cache_tuple = spec_out.past_key_values
             spec_lookahead_cache = DynamicCache.from_legacy_cache(spec_prefill_cache_tuple)
-        else:
+        else: # It's already a DynamicCache
             spec_lookahead_cache = spec_out.past_key_values
             spec_prefill_cache_tuple = spec_lookahead_cache.to_legacy_cache()
 
         # --- Stage 1b: Speculator Lookahead & Scoring ---
+        self.is_prefilling = False
         if self.detailed_timing: start_event.record()
-        self._patch_speculator()
+        
         with torch.no_grad():
             current_tokens = spec_out.logits[:, -1:, :].argmax(-1)
             for i in range(look_ahead_k):
                 cache_len = spec_lookahead_cache.get_seq_length(0)
                 pos_ids = torch.tensor([[cache_len]], device=self.device, dtype=torch.long)
-                outputs = self.speculator_model(input_ids=current_tokens, past_key_values=spec_lookahead_cache, use_cache=True, position_ids=pos_ids)
                 
-                if isinstance(outputs.past_key_values, tuple): spec_lookahead_cache = DynamicCache.from_legacy_cache(outputs.past_key_values)
-                else: spec_lookahead_cache = outputs.past_key_values
+                outputs = self.speculator_model(
+                    input_ids=current_tokens, 
+                    past_key_values=spec_lookahead_cache, 
+                    use_cache=True, 
+                    position_ids=pos_ids,
+                    cache_position=torch.tensor([cache_len], device=self.device)
+                )
+                
+                spec_lookahead_cache = outputs.past_key_values
+                if isinstance(spec_lookahead_cache, tuple):
+                    spec_lookahead_cache = DynamicCache.from_legacy_cache(spec_lookahead_cache)
+                
                 current_tokens = outputs.logits[:, -1:, :].argmax(-1)
+        
         self._unpatch_speculator()
 
         all_layer_logits = []
         spec_config = self.speculator_model.config
         for layer_idx in range(spec_config.num_hidden_layers):
-            if not self.captured_qs[layer_idx] or not spec_prefill_cache_tuple[layer_idx][0].numel(): continue
+            if not self.captured_qs[layer_idx] or not spec_prefill_cache_tuple[layer_idx][0].numel():
+                continue
             
+            # Q vectors from all lookahead steps for this layer
             q_vecs = torch.cat(self.captured_qs[layer_idx], dim=2)
+            # K vectors from the initial prefill pass
             k_cache = spec_prefill_cache_tuple[layer_idx][0]
             k_cache_rep = repeat_kv(k_cache, spec_config.num_attention_heads // spec_config.num_key_value_heads)
+            
+            # Calculate attention scores (logits)
             logits = torch.matmul(q_vecs, k_cache_rep.transpose(2, 3)) / math.sqrt(q_vecs.shape[-1])
             all_layer_logits.append(logits)
         
@@ -127,12 +218,11 @@ class DraftTSPPipeline:
 
         attention_probs = F.softmax(attention_scores, dim=-1, dtype=torch.float32).to(attention_scores.dtype)
         
+        # This pooling logic is from Speculative Prefill, keeping it for consistency
         if hasattr(self.args, 'kernel_size') and self.args.pooling in ['avgpool', 'maxpool'] and self.args.kernel_size > 1:
             reshaped_for_pooling = attention_probs.squeeze(0).flatten(0, 2)
-            
             padding = (self.args.kernel_size - 1) // 2
             pool_fn = F.avg_pool1d if self.args.pooling == 'avgpool' else F.max_pool1d
-            
             pooled_tensor = pool_fn(reshaped_for_pooling, kernel_size=self.args.kernel_size, stride=1, padding=padding)
             processed_scores = pooled_tensor.reshape(num_steps, num_layers, num_heads, key_len)
         else:
@@ -143,9 +233,9 @@ class DraftTSPPipeline:
         final_token_importance = max_scores.mean(0)
         
         if self.detailed_timing:
-            end_event.record()
-            torch.cuda.synchronize()
+            end_event.record(); torch.cuda.synchronize()
             run_metadata["speculation_decode"] = start_event.elapsed_time(end_event) / 1000.0
+        
         return torch.argsort(final_token_importance, descending=True)
 
     def run(self, input_ids: torch.Tensor, max_generation_length: int, look_ahead_k: int) -> Tuple[str, Dict]:
@@ -161,14 +251,14 @@ class DraftTSPPipeline:
 
         set_speculator_data(sorted_indices, prompt_len)
         with torch.no_grad():
+            # The patched model will now handle the funneling internally
             prefill_outputs = self.base_model(input_ids=input_ids, use_cache=True)
             past_key_values = prefill_outputs.past_key_values
             next_token_logits = prefill_outputs.logits[:, -1, :]
             next_token = torch.argmax(next_token_logits, dim=-1).unsqueeze(-1)
 
         if self.detailed_timing:
-            end_event.record()
-            torch.cuda.synchronize()
+            end_event.record(); torch.cuda.synchronize()
             base_model_first_token_time = start_event.elapsed_time(end_event) / 1000.0
             run_metadata["base_prefill"] = base_model_first_token_time
             run_metadata["base_ttft"] = run_metadata.get("speculation_prefill", 0) + run_metadata.get("speculation_decode", 0) + base_model_first_token_time
@@ -178,6 +268,7 @@ class DraftTSPPipeline:
             if generated_ids[-1] in self.eos_token_ids:
                 break
 
+            # Standard decoding loop continues from the state after prefill
             cache_len = past_key_values.get_seq_length(0)
             current_token_pos = torch.tensor([[cache_len]], device=self.device, dtype=torch.long)
             
@@ -196,61 +287,3 @@ class DraftTSPPipeline:
         
         response = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
         return response, run_metadata
-
-
-def _patched_attention_forward_for_capture(
-    self_attn: LlamaAttention, 
-    pipeline_instance: 'DraftTSPPipeline', 
-    hidden_states: torch.Tensor,
-    attention_mask: Optional[torch.Tensor] = None,
-    position_ids: Optional[torch.LongTensor] = None,
-    past_key_value: Optional[Cache] = None,
-    output_attentions: bool = False,
-    use_cache: bool = False,
-    cache_position: Optional[torch.LongTensor] = None,
-    **kwargs
-) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Cache]]:
-    """
-    A patched LlamaAttention forward pass that captures Q-vectors without re-running the original forward pass.
-    This is achieved by re-implementing the attention logic here.
-    """
-    bsz, q_len, _ = hidden_states.size()
-
-    query_states = self_attn.q_proj(hidden_states)
-    key_states = self_attn.k_proj(hidden_states)
-    value_states = self_attn.v_proj(hidden_states)
-
-    query_states = query_states.view(bsz, q_len, self_attn.num_heads, self_attn.head_dim).transpose(1, 2)
-    key_states = key_states.view(bsz, q_len, self_attn.num_key_value_heads, self_attn.head_dim).transpose(1, 2)
-    value_states = value_states.view(bsz, q_len, self_attn.num_key_value_heads, self_attn.head_dim).transpose(1, 2)
-
-    cos, sin = self_attn.rotary_emb(value_states, position_ids)
-    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
-    
-    if q_len == 1: 
-        pipeline_instance.captured_qs[self_attn.layer_idx].append(query_states.detach().clone())
-
-    if past_key_value is not None:
-        cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-        key_states, value_states = past_key_value.update(key_states, value_states, self_attn.layer_idx, cache_kwargs)
-
-    key_states = repeat_kv(key_states, self_attn.num_key_value_groups)
-    value_states = repeat_kv(value_states, self_attn.num_key_value_groups)
-
-    attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self_attn.head_dim)
-
-    if attention_mask is not None:
-        attn_weights = attn_weights + attention_mask
-
-    attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-    attn_weights = F.dropout(attn_weights, p=self_attn.attention_dropout, training=self_attn.training)
-    
-    attn_output = torch.matmul(attn_weights, value_states)
-    attn_output = attn_output.transpose(1, 2).contiguous()
-    attn_output = attn_output.reshape(bsz, q_len, self_attn.hidden_size)
-    attn_output = self_attn.o_proj(attn_output)
-
-    if not output_attentions:
-        attn_weights = None
-
-    return attn_output, attn_weights, past_key_value

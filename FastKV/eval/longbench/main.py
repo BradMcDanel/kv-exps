@@ -163,48 +163,57 @@ def generate_longbench(data, max_length, max_gen, prompt_format,
         device = model.device
 
     for json_obj in tqdm(data, desc=f"Generating Responses for {args.mode}..."):
-        prompt = prompt_format.format(**json_obj)
-        # Tokenize once to check length, then decode for truncation
-        tokenized_prompt_ids = tokenizer.encode(prompt, add_special_tokens=False)
-        if len(tokenized_prompt_ids) > max_length:
-            half = int(max_length / 2)
-            prompt = tokenizer.decode(tokenized_prompt_ids[:half], skip_special_tokens=True) + tokenizer.decode(tokenized_prompt_ids[-half:], skip_special_tokens=True)
-        
-        if dataset not in ["trec", "triviaqa", "samsum", "lsht", "lcc", "repobench-p"]: 
-            final_prompt = build_chat(tokenizer, prompt, args.model)
-        else:
-            final_prompt = prompt
+        try:
+            prompt = prompt_format.format(**json_obj)
+            # Tokenize once to check length, then decode for truncation
+            tokenized_prompt_ids = tokenizer.encode(prompt, add_special_tokens=False)
+            if len(tokenized_prompt_ids) > max_length:
+                half = int(max_length / 2)
+                prompt = tokenizer.decode(tokenized_prompt_ids[:half], skip_special_tokens=True) + tokenizer.decode(tokenized_prompt_ids[-half:], skip_special_tokens=True)
+            
+            if dataset not in ["trec", "triviaqa", "samsum", "lsht", "lcc", "repobench-p"]: 
+                final_prompt = build_chat(tokenizer, prompt, args.model)
+            else:
+                final_prompt = prompt
 
-        inputs = tokenizer(final_prompt, truncation=False, return_tensors="pt").to(device)
-        
-        pred = ""
-        if pipeline is not None:
-            pred, _ = pipeline.run(
-                input_ids=inputs.input_ids,
-                look_ahead_k=args.look_ahead_k, 
-                max_generation_length=max_gen,
-            )
-        else:
-            with torch.inference_mode():
-                context_length = inputs.input_ids.shape[-1]
-                if args.mode == 'gemfilter':
-                    from baseline.gemfilter.gemfilter_utils import gemfilter_generate_selection
-                    pred = gemfilter_generate_selection(
-                        inputs['input_ids'], inputs['attention_mask'], 
-                        model, tokenizer, max_gen_len=max_gen, select_layer_idx=args.filter_idx
-                    )
-                else:
-                    output = model.generate(
-                            **inputs, max_new_tokens=max_gen, num_beams=1,
-                            do_sample=False, temperature=1.0, top_p=1.0,
-                            )[0]
-                    pred = tokenizer.decode(output[context_length:], skip_special_tokens=True)
+            inputs = tokenizer(final_prompt, truncation=False, return_tensors="pt").to(device)
+            
+            pred = ""
+            if pipeline is not None:
+                pred, _ = pipeline.run(
+                    input_ids=inputs.input_ids,
+                    look_ahead_k=args.look_ahead_k, 
+                    max_generation_length=max_gen,
+                )
+            else:
+                with torch.inference_mode():
+                    context_length = inputs.input_ids.shape[-1]
+                    if args.mode == 'gemfilter':
+                        from baseline.gemfilter.gemfilter_utils import gemfilter_generate_selection
+                        pred = gemfilter_generate_selection(
+                            inputs['input_ids'], inputs['attention_mask'], 
+                            model, tokenizer, max_gen_len=max_gen, select_layer_idx=args.filter_idx
+                        )
+                    else:
+                        output = model.generate(
+                                **inputs, max_new_tokens=max_gen, num_beams=1,
+                                do_sample=False, temperature=1.0, top_p=1.0,
+                                )[0]
+                        pred = tokenizer.decode(output[context_length:], skip_special_tokens=True)
 
-        print(pred)
-        
-        with open(out_path, "a", encoding="utf-8") as f:
-            json.dump({"pred": pred, "answers": json_obj["answers"], "all_classes": json_obj["all_classes"], "length": json_obj["length"]}, f, ensure_ascii=False)
-            f.write('\n')
+            print(pred)
+            
+            with open(out_path, "a", encoding="utf-8") as f:
+                json.dump({"pred": pred, "answers": json_obj["answers"], "all_classes": json_obj["all_classes"], "length": json_obj["length"]}, f, ensure_ascii=False)
+                f.write('\n')
+        except RuntimeError as e:
+            if "out of memory" in str(e):
+                logging.warning(f"[[CUDA OOM - Skipping]]")
+                torch.cuda.empty_cache()
+                continue
+            else:
+                raise e
+
 
 # =====================================================================================
 # 3. MAIN ORCHESTRATION
@@ -273,7 +282,7 @@ if __name__ == "__main__":
                          "'layer' (global then per-layer), or 'head' (global then per-head).")
     parser.add_argument("--speculator_model_name", type=str, default="meta-llama/Llama-3-8B-Instruct", help="Speculator model for prefill/echocache. Ensure compatibility.")
     parser.add_argument("--look_ahead_k", type=int, default=1, help="Number of lookahead steps for Speculative Prefill.")
-    parser.add_argument("--use_chunk_selection", action='store_true', help="Use chunk-based token selection (it's enabled by default).")
+    parser.add_argument('--use_chunk_selection', action='store_true', help="Use chunk-based token selection (it's enabled by default).")
     parser.add_argument("--chunk_size", type=int, default=64, help="Chunk size for Speculative Prefill.")
     
     # FastKV
