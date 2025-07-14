@@ -1,7 +1,6 @@
 # analysis/generate_oracles.py
 
 import os
-import sys
 import argparse
 import pickle
 import json
@@ -111,21 +110,22 @@ class OracleGenerator:
         if attention_scores.numel() == 0:
             self.token_importance_scores = None
             return
+            
         bs, num_layers, num_heads, num_gen_tokens, prompt_len = attention_scores.shape
         if bs != 1: raise NotImplementedError("Batch size > 1 is not supported.")
-        attention_scores = attention_scores.squeeze(0)
-        total_max_scores = torch.zeros(prompt_len, device=self.device, dtype=torch.float32)
-        for i in range(num_gen_tokens):
-            gen_token_scores = attention_scores[:, :, i, :]
-            attention_probs = F.softmax(gen_token_scores, dim=-1, dtype=torch.float32)
-            flattened_probs = attention_probs.flatten(0, 1)
-            max_scores_for_token = flattened_probs.max(0).values
-            total_max_scores += max_scores_for_token
+        
+        scores = attention_scores.squeeze(0)
+        probs = F.softmax(scores, dim=-1, dtype=torch.float32)
+        flat_probs = probs.flatten(start_dim=0, end_dim=1)
+        max_probs_per_gen_token = flat_probs.max(dim=0).values
+
         if num_gen_tokens > 0:
-            final_token_importance = total_max_scores / num_gen_tokens
+            final_token_importance = max_probs_per_gen_token.mean(dim=0)
         else:
-            final_token_importance = total_max_scores
+            final_token_importance = torch.zeros(prompt_len, device=self.device, dtype=torch.float32)
+
         self.token_importance_scores = final_token_importance.unsqueeze(0).to(self.dtype)
+
 
     def _compute_raw_qk_scores(self, prompt_only_cache_tuple: Tuple[Tuple[torch.Tensor, torch.Tensor], ...]) -> torch.Tensor:
         if not self.captured_qs or not any(self.captured_qs): return torch.empty(0)
@@ -143,6 +143,9 @@ class OracleGenerator:
             attn_logits = torch.matmul(all_q_for_layer, key_prompt_layer_repeated.transpose(-1, -2)) / math.sqrt(head_dim)
             all_layer_scores.append(attn_logits)
         if not all_layer_scores: return torch.empty(0)
+        
+        # Stack the scores from each layer. The resulting shape is
+        # [batch, num_layers, num_heads, num_gen_tokens, prompt_len], which is correct.
         return torch.stack(all_layer_scores, dim=1)
 
     @torch.no_grad()
@@ -159,8 +162,10 @@ class OracleGenerator:
         self.is_prefilling = False
         current_tokens = next_token
         current_cache = prefill_cache
+        # Generate the first token before the loop
         if next_token.item() not in self.eos_token_ids:
-            for i in range(max_gen):
+             # Loop to generate the rest of the tokens, up to max_gen-1 more times
+            for i in range(max_gen - 1):
                 cache_len = current_cache.get_seq_length(0)
                 pos_ids = torch.tensor([[cache_len]], device=self.device)
                 decode_cache_pos = torch.tensor([cache_len], device=self.device)
@@ -181,11 +186,12 @@ def build_chat(tokenizer: AutoTokenizer, prompt: str, model_name: str) -> str:
     return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
 
 def main():
-    parser = argparse.ArgumentParser(description="Generate Answer-Informed Oracle Rankings.")
+    parser = argparse.ArgumentParser(description="Generate Answer-Informed Oracle Rankings using Max-then-Mean.")
     parser.add_argument("--model", type=str, required=True)
     parser.add_argument("--datasets", nargs='+', required=True)
     parser.add_argument("--num_samples", type=int, default=15)
     parser.add_argument("--max_len", type=int, default=128000, help="Skip prompts longer than this.")
+    parser.add_argument("--max_gen", type=int, default=256, help="Max tokens to generate for the oracle answer.")
     parser.add_argument("--output_dir", type=str, default="analysis_results/oracles")
     args = parser.parse_args()
     
@@ -195,7 +201,6 @@ def main():
     script_dir = os.path.dirname(os.path.abspath(__file__))
     project_root = os.path.abspath(os.path.join(script_dir, '..'))
     dataset2prompt_path = os.path.join(project_root, 'eval/longbench/config/dataset2prompt.json')
-    dataset2maxlen_path = os.path.join(project_root, 'eval/longbench/config/dataset2maxlen.json')
 
     with open(dataset2prompt_path, "r") as f: dataset2prompt = json.load(f)
     
@@ -213,7 +218,6 @@ def main():
             continue
         
         data = load_dataset('THUDM/LongBench', dataset_name, split='test', trust_remote_code=True)
-        max_gen = 256
         dataset_oracles = []
         processed_count = 0
 
@@ -239,7 +243,7 @@ def main():
 
             print(f"Processing sample {i} ({processed_count + 1}/{args.num_samples}) for {dataset_name} ({prompt_len} tokens)...")
             
-            oracle_ranking_tensor = generator.generate(inputs, max_gen)
+            oracle_ranking_tensor = generator.generate(inputs, args.max_gen)
             
             if oracle_ranking_tensor is not None and oracle_ranking_tensor.numel() > 0:
                 assert oracle_ranking_tensor.shape[1] == prompt_len, \
@@ -262,7 +266,7 @@ def main():
     output_filename = f"oracles_model_{model_name_sanitized}.pkl"
     output_path = os.path.join(args.output_dir, output_filename)
 
-    print(f"\nSaving oracle results to {output_path}")
+    print(f"\nSaving SP-style oracle results to {output_path}")
     with open(output_path, "wb") as f:
         pickle.dump(all_oracles, f)
     
