@@ -18,10 +18,6 @@ _speculator_indices: Optional[torch.Tensor] = None
 _original_prompt_len: int = 0
 
 def set_speculator_data(indices: torch.Tensor, prompt_len: int):
-    """
-    Sets the speculator-generated master plan for pruning decisions.
-    Called once per run from the pipeline.
-    """
     global _speculator_indices, _original_prompt_len
     _speculator_indices = indices
     _original_prompt_len = prompt_len
@@ -36,18 +32,42 @@ def _draft_tsp_decoder_layer_forward(
     output_attentions: Optional[bool] = False,
     use_cache: Optional[bool] = False,
     cache_position: Optional[torch.LongTensor] = None,
-    # This argument will be passed explicitly by our patched model forward
     current_global_indices: Optional[torch.Tensor] = None,
     **kwargs,
 ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
     """
-    A decoder layer forward pass that prunes its own output `hidden_states`
-    based on an intersection of its current tokens and the master plan.
+    A decoder layer that prunes its inputs *before* performing expensive computations.
     """
+    # --- THE CORE FIX: Pruning happens FIRST ---
+    is_prefill = hidden_states.shape[1] > 1
+    if is_prefill and self.layer_idx in self.tsp_schedule and _speculator_indices is not None:
+        percentage_to_keep = self.tsp_schedule[self.layer_idx]
+        num_tokens_to_keep = int(_original_prompt_len * percentage_to_keep)
+        
+        master_indices_for_this_stage = _speculator_indices[:num_tokens_to_keep]
+        
+        is_kept_mask = torch.isin(current_global_indices, master_indices_for_this_stage)
+        local_indices_to_keep = torch.where(is_kept_mask)[0]
+        
+        # Prune all relevant inputs BEFORE passing them to the expensive modules
+        hidden_states = torch.gather(hidden_states, 1, local_indices_to_keep.unsqueeze(0).unsqueeze(-1).expand(-1, -1, hidden_states.size(2)))
+        position_ids = torch.gather(position_ids, 1, local_indices_to_keep.unsqueeze(0))
+        
+        # Update the global indices tracker for THIS layer's computation
+        current_global_indices = torch.gather(current_global_indices, 0, local_indices_to_keep)
+
+        # The attention mask must also be updated. We signal the main loop to do this.
+        self.new_position_ids = position_ids
+        self.new_global_indices = current_global_indices
+    else:
+        self.new_position_ids = None
+        self.new_global_indices = None
+    # --- END OF CORE FIX ---
+
     residual = hidden_states
     hidden_states = self.input_layernorm(hidden_states)
 
-    # Self Attention
+    # Now, Self Attention runs on the (potentially) smaller hidden_states
     attn_outputs = self.self_attn(
         hidden_states=hidden_states,
         attention_mask=attention_mask,
@@ -59,39 +79,11 @@ def _draft_tsp_decoder_layer_forward(
     )
     hidden_states = residual + attn_outputs[0]
 
-    # Fully Connected
+    # And the MLP runs on the (potentially) smaller hidden_states
     residual = hidden_states
     hidden_states = self.post_attention_layernorm(hidden_states)
     hidden_states = self.mlp(hidden_states)
     hidden_states = residual + hidden_states
-
-    self.new_position_ids = None 
-    self.new_global_indices = None
-    
-    is_prefill = hidden_states.shape[1] > 1
-
-    if is_prefill and self.layer_idx in self.tsp_schedule and _speculator_indices is not None:
-        percentage_to_keep = self.tsp_schedule[self.layer_idx]
-        num_tokens_to_keep = int(_original_prompt_len * percentage_to_keep)
-        
-        # Get the master list of GLOBAL indices that should be kept for this stage
-        master_indices_for_this_stage = _speculator_indices[:num_tokens_to_keep]
-        
-        # Find which of the tokens we *currently have* are also in the master plan for this stage.
-        is_kept_mask = torch.isin(current_global_indices, master_indices_for_this_stage)
-        
-        # Convert this boolean mask to the LOCAL indices we need to gather from the current hidden_states.
-        local_indices_to_keep = torch.where(is_kept_mask)[0]
-
-        # Gather the new, shorter position_ids using the correct LOCAL indices
-        self.new_position_ids = torch.gather(position_ids, dim=1, index=local_indices_to_keep.unsqueeze(0))
-
-        # Gather the new set of global indices to pass to the next stage
-        self.new_global_indices = torch.gather(current_global_indices, dim=0, index=local_indices_to_keep)
-        
-        # Slice the hidden_states that will be returned, using the correct LOCAL indices
-        indices_to_keep_expanded = local_indices_to_keep.unsqueeze(0).unsqueeze(-1).expand(-1, -1, hidden_states.size(2))
-        hidden_states = torch.gather(hidden_states, dim=1, index=indices_to_keep_expanded)
 
     outputs = (hidden_states,)
     if output_attentions:
@@ -116,10 +108,6 @@ def _draft_tsp_model_forward(
     return_dict: Optional[bool] = None,
     cache_position: Optional[torch.LongTensor] = None,
 ) -> Union[Tuple, BaseModelOutputWithPast]:
-    """
-    The main model forward pass, which now explicitly manages all state variables
-    in its loop, ensuring correct propagation.
-    """
     output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
     output_hidden_states = (
         output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -133,7 +121,6 @@ def _draft_tsp_model_forward(
     if inputs_embeds is None:
         inputs_embeds = self.embed_tokens(input_ids)
 
-    # --- Initialize all state variables for the loop ---
     hidden_states = inputs_embeds
     bsz, q_len, _ = hidden_states.shape
 
@@ -142,7 +129,6 @@ def _draft_tsp_model_forward(
     if position_ids is None:
         position_ids = cache_position.unsqueeze(0)
 
-    # This is now a loop-managed variable
     current_global_indices = torch.arange(q_len, device=inputs_embeds.device)
     
     causal_mask = self._update_causal_mask(attention_mask, inputs_embeds, cache_position, past_key_values, output_attentions)
@@ -163,20 +149,21 @@ def _draft_tsp_model_forward(
             output_attentions=output_attentions,
             use_cache=use_cache,
             cache_position=cache_position,
-            current_global_indices=current_global_indices, # Explicitly pass global indices
+            current_global_indices=current_global_indices,
         )
         
         hidden_states = layer_outputs[0]
         
-        # --- Update all state variables based on the layer's output ---
+        # This logic is now crucial because the pruning happens *inside* the layer
         new_position_ids = getattr(decoder_layer, 'new_position_ids', None)
         if new_position_ids is not None:
             position_ids = new_position_ids
-            # Crucially, update the global indices tracker for the next iteration
             current_global_indices = getattr(decoder_layer, 'new_global_indices')
             
             new_seq_len = position_ids.shape[-1]
             
+            # Since the sequence length changed *before* attention, the mask we passed was wrong.
+            # We must update it *before* the next layer runs.
             causal_mask = self._update_causal_mask(None, hidden_states, cache_position[:new_seq_len], past_key_values, output_attentions)
             cache_position = torch.arange(new_seq_len, device=hidden_states.device)
 
@@ -215,10 +202,6 @@ def _draft_tsp_model_forward(
 
 
 def replace_llama_for_draft_tsp(model: LlamaModel, args):
-    """
-    Replaces the Llama forward methods with our new, corrected, and
-    generalizable in-flight funneling architecture.
-    """
     tsp_schedule_str = getattr(args, 'tsp_schedule', "")
     schedule = {}
     if tsp_schedule_str:

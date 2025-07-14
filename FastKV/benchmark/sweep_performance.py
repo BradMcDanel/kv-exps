@@ -24,10 +24,10 @@ METHODS_TO_SWEEP = [
 ]
 SEQ_LEN = 4000
 NUM_DECODE_STEPS = 16
-LOOK_AHEAD_K = 1
+LOOK_AHEAD_K = 4
 NUM_RUNS = 5
 NUM_WARMUPS = 3
-PRUNING_LEVELS = [0.1, 0.2, 0.3, 0.4, 0.5, 0.75, 1.0]
+PRUNING_LEVELS = [0.1, 0.2, 0.3, 0.4]
 # --- End Configuration Section ---
 
 def create_run_args(config):
