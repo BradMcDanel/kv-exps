@@ -309,8 +309,13 @@ if __name__ == "__main__":
     parser.add_argument("--max_capacity_prompt", type=int, default=512)
     parser.add_argument("--max_capacity_prompt_percentage", type=float, default=None, help="Use a percentage of the prompt length for max capacity.")
 
+    # Oracle
     parser.add_argument("--oracle_rankings_path", type=str, default="analysis_results/oracles", help="Path to the root directory of oracle .npz files for oracle mode.")
     parser.add_argument("--keep_percentage", type=float, default=0.05, help="Percentage of prompt tokens to keep for oracle mode.")
+
+    # Uniform
+    parser.add_argument("--uniform_first_k", type=int, default=64, help="Number of initial tokens to always keep for uniform mode.")
+    parser.add_argument("--uniform_last_k", type=int, default=256, help="Number of final tokens to always keep for uniform mode.")
 
     # KV Compression & Prefill Modes (+ Speculative Prefill and Echo Cache)
     parser.add_argument("--kernel_size", type=int, default=7, help="Pooling kernel size. Must be odd.")
