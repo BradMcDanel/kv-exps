@@ -170,6 +170,7 @@ class SpeculativeRankingGenerator(BaseRankingGenerator):
 
     def __init__(self, model, tokenizer, args):
         super().__init__(model, tokenizer, args)
+        self.is_prefill = False  # Track prefill stage
         self.is_lookahead = False
         self.lookahead_qs: List[List[torch.Tensor]] = []
         self.eos_token_ids = self._extract_eos_token_ids()
@@ -190,7 +191,11 @@ class SpeculativeRankingGenerator(BaseRankingGenerator):
             
         raise ValueError("Could not determine eos_token_id from model config or tokenizer.")
 
-    def _patched_attention_forward(self, self_attn: LlamaAttention, hidden_states: torch.Tensor, attention_mask: Optional[torch.Tensor] = None, position_ids: Optional[torch.LongTensor] = None, past_key_value: Optional[Cache] = None, use_cache: bool = False, **kwargs):
+    def _patched_attention_forward(self, self_attn: LlamaAttention, hidden_states: torch.Tensor, 
+                                   attention_mask: Optional[torch.Tensor] = None, 
+                                   position_ids: Optional[torch.LongTensor] = None, 
+                                   past_key_value: Optional[Cache] = None, 
+                                   use_cache: bool = False, **kwargs):
         bsz, q_len, _ = hidden_states.size()
         cfg = self_attn.config
         num_heads, head_dim = cfg.num_attention_heads, cfg.hidden_size // cfg.num_attention_heads
@@ -202,13 +207,24 @@ class SpeculativeRankingGenerator(BaseRankingGenerator):
         cos, sin = self_attn.rotary_emb(value_states, position_ids)
         query_states_rot, key_states_rot = hf_apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
-        if self.is_lookahead and q_len == 1:
+        # FIXED: Capture logic now matches Oracle
+        if self.is_prefill and q_len > 1:
+            # During prefill, capture the LAST prompt token's query
+            last_q = query_states_rot[:, :, -1:, :].detach().clone()
+            self.lookahead_qs[self_attn.layer_idx].append(last_q)
+        elif self.is_lookahead and q_len == 1:
+            # During generation, capture each generated token's query
             self.lookahead_qs[self_attn.layer_idx].append(query_states_rot.detach().clone())
 
         if use_cache:
-            key_states_rot, value_states = past_key_value.update(key_states_rot, value_states, self_attn.layer_idx, kwargs.get("cache_position"))
+            key_states_rot, value_states = past_key_value.update(key_states_rot, value_states, 
+                                                                 self_attn.layer_idx, kwargs.get("cache_position"))
 
-        attn_output = F.scaled_dot_product_attention(query_states_rot, hf_repeat_kv(key_states_rot, num_kv_groups), hf_repeat_kv(value_states, num_kv_groups), attn_mask=attention_mask, dropout_p=0.0, is_causal=(use_cache is False and q_len > 1 and attention_mask is None))
+        attn_output = F.scaled_dot_product_attention(
+            query_states_rot, hf_repeat_kv(key_states_rot, num_kv_groups), 
+            hf_repeat_kv(value_states, num_kv_groups), attn_mask=attention_mask, 
+            dropout_p=0.0, is_causal=(use_cache is False and q_len > 1 and attention_mask is None)
+        )
         attn_output = attn_output.transpose(1, 2).contiguous().reshape(bsz, q_len, cfg.hidden_size)
         return self_attn.o_proj(attn_output), None, past_key_value
 
@@ -220,24 +236,36 @@ class SpeculativeRankingGenerator(BaseRankingGenerator):
                 self.orig_fwds[i] = layer.self_attn.forward
                 layer.self_attn.forward = types.MethodType(self._patched_attention_forward, layer.self_attn)
 
-    def _compute_importance(self, legacy_cache: tuple) -> torch.Tensor:
+    def _compute_importance(self, legacy_cache: tuple, num_queries_to_use: int) -> torch.Tensor:
+        """Fixed to handle the exact number of queries to use for each k value."""
         cfg = self.config
-        num_layers, num_q_heads, num_kv_heads, head_dim = cfg.num_hidden_layers, cfg.num_attention_heads, cfg.num_key_value_heads, cfg.hidden_size // cfg.num_attention_heads
+        num_layers, num_q_heads, num_kv_heads, head_dim = (
+            cfg.num_hidden_layers, cfg.num_attention_heads, 
+            cfg.num_key_value_heads, cfg.hidden_size // cfg.num_attention_heads
+        )
         num_kv_groups = num_q_heads // num_kv_heads
 
-        all_scores = [
-            torch.matmul(torch.cat(self.lookahead_qs[i], dim=2), hf_repeat_kv(legacy_cache[i][0], num_kv_groups).transpose(-1, -2)) / math.sqrt(head_dim)
-            for i in range(num_layers) if self.lookahead_qs[i]
-        ]
+        all_scores = []
+        for i in range(num_layers):
+            if not self.lookahead_qs[i] or len(self.lookahead_qs[i]) < num_queries_to_use:
+                continue
+            # Use only the first num_queries_to_use queries
+            queries_for_this_k = torch.cat(self.lookahead_qs[i][:num_queries_to_use], dim=2)
+            key_cache = hf_repeat_kv(legacy_cache[i][0], num_kv_groups)
+            scores = torch.matmul(queries_for_this_k, key_cache.transpose(-1, -2)) / math.sqrt(head_dim)
+            all_scores.append(scores)
+            
         if not all_scores:
             return torch.empty(0)
 
         stacked_scores = torch.stack(all_scores, dim=0).permute(1, 3, 0, 2, 4)
+        
         if self.args.pooling != 'none':
             bs, k, layers, heads, p_len = stacked_scores.shape
             probs = F.softmax(stacked_scores, dim=-1, dtype=torch.float32).flatten(0, 3)
             pool_fn = F.avg_pool1d if self.args.pooling == "avgpool" else F.max_pool1d
-            pooled_probs = pool_fn(probs.unsqueeze(1), kernel_size=self.args.kernel_size, padding=self.args.kernel_size // 2, stride=1).squeeze(1)
+            pooled_probs = pool_fn(probs.unsqueeze(1), kernel_size=self.args.kernel_size, 
+                                  padding=self.args.kernel_size // 2, stride=1).squeeze(1)
             stacked_scores = pooled_probs.reshape(bs, k, layers, heads, p_len)
         else:
             stacked_scores = F.softmax(stacked_scores, dim=-1, dtype=torch.float32)
@@ -246,41 +274,34 @@ class SpeculativeRankingGenerator(BaseRankingGenerator):
 
     @torch.no_grad()
     def generate_rankings(self, inputs: Dict[str, torch.Tensor]) -> Dict:
-        """
-        **MODIFICATION: Overhauled the generation loop to respect EOS tokens
-        and correctly use `cache_position` for SDPA compatibility.**
-        """
         input_ids = inputs['input_ids']
         prompt_len = input_ids.shape[1]
         rankings_by_k = {}
         self._patch_model()
 
         try:
-            # --- Prefill Stage (Corrected) ---
-            # Pass cache_position for SDPA prefill.
+            # --- Prefill Stage (FIXED to capture last prompt query) ---
+            self.is_prefill = True
+            self.is_lookahead = False
+            
             prefill_out = self.model(
                 input_ids=input_ids,
                 use_cache=True,
                 cache_position=torch.arange(prompt_len, device=self.device)
             )
             prompt_kv_cache_tuple = prefill_out.past_key_values
-            # It's good practice to wrap the cache early.
             current_kv_cache = DynamicCache.from_legacy_cache(prompt_kv_cache_tuple)
             current_tokens = torch.argmax(prefill_out.logits[:, -1, :], dim=-1, keepdim=True)
 
-            # --- Lookahead Stage (Now respects EOS and SDPA) ---
+            # --- Lookahead Stage ---
+            self.is_prefill = False
             self.is_lookahead = True
             max_k = max(self.args.lookahead_k_values)
             
-            for k in range(1, max_k + 1):
-                # Stop generation if the previously generated token was EOS.
-                # This check happens at the top of the loop.
+            for gen_idx in range(max_k):
                 if current_tokens.item() in self.eos_token_ids:
-                    # Since we stopped, the last valid ranking applies to all future k's.
-                    # The score computation must happen *outside* the loop after it breaks.
                     break
 
-                # --- Decode Step (Corrected) ---
                 cache_len = current_kv_cache.get_seq_length(0)
                 pos_ids = torch.tensor([[cache_len]], device=self.device)
                 decode_cache_pos = torch.tensor([cache_len], device=self.device)
@@ -293,28 +314,26 @@ class SpeculativeRankingGenerator(BaseRankingGenerator):
                     cache_position=decode_cache_pos,
                 )
                 
-                # Update state for the next iteration
                 current_tokens = torch.argmax(decode_out.logits[:, -1, :], dim=-1, keepdim=True)
-                current_kv_cache = decode_out.past_key_values # Already a DynamicCache
+                current_kv_cache = decode_out.past_key_values
+
+            # --- Compute rankings for each k ---
+            # Now we have captured: last_prompt_query + generated_queries
+            # Total queries = 1 + number_of_generated_tokens
+            for k in self.args.lookahead_k_values:
+                # For k tokens generated, we use k+1 queries (including last prompt)
+                num_queries = k + 1
                 
-                # If this k is one we need to record, compute scores based on queries so far.
-                if k in self.args.lookahead_k_values:
-                    scores = self._compute_importance(prompt_kv_cache_tuple)
+                # Check if we have enough queries
+                min_layer_queries = min(len(qs) for qs in self.lookahead_qs if qs)
+                if min_layer_queries >= num_queries:
+                    scores = self._compute_importance(prompt_kv_cache_tuple, num_queries)
                     if scores.numel() > 0:
                         rankings_by_k[k] = scores.clone()
-            
-            # --- Post-Loop Score Finalization for EOS ---
-            # If the loop broke early due to EOS, we need to compute the final ranking
-            # and apply it to all remaining k-values that were not yet computed.
-            final_scores = self._compute_importance(prompt_kv_cache_tuple)
-            if final_scores.numel() > 0:
-                for k_val in self.args.lookahead_k_values:
-                    if k_val not in rankings_by_k:
-                        rankings_by_k[k_val] = final_scores.clone()
 
         finally:
             self._unpatch_model()
-            self.lookahead_qs.clear() # Good practice to clear captured data
+            self.lookahead_qs.clear()
 
         return rankings_by_k
 
@@ -330,7 +349,7 @@ def main():
     parser.add_argument("--output_dir", type=str, default="analysis_results/approx_rankings")
     parser.add_argument("--window_size", type=int, default=8)
     parser.add_argument("--lookahead_k_values", type=int, nargs='+', default=[1, 2, 4, 8, 16, 32, 64, 128, 256])
-    parser.add_argument("--kernel_size", type=int, default=7)
+    parser.add_argument("--kernel_size", type=int, default=13)
     parser.add_argument("--pooling", type=str, default="avgpool", choices=["avgpool", "maxpool", "none"])
     args = parser.parse_args()
 
