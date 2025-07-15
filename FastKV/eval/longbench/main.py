@@ -75,6 +75,16 @@ def setup_model_and_tokenizer(args):
             oracle_rankings_path=args.oracle_rankings_path,
             keep_percentage=args.keep_percentage,
         )
+    elif args.mode == "uniform":
+        from baseline.uniform.main import UniformRandomPipeline as Pipeline
+        logging.info("Initializing UniformRandomPipeline...")
+        pipeline = Pipeline(
+            base_model_name=args.model,
+            tokenizer=tokenizer,
+            keep_percentage=args.keep_percentage,
+            first_k=args.uniform_first_k,
+            last_k=args.uniform_last_k,
+        )
     elif args.mode == "echo_cache":
         from baseline.echo_cache.main import EchoCachePipeline as Pipeline
         logging.info(f"Initializing pipeline for {args.mode}...")
@@ -200,8 +210,12 @@ def generate_longbench(data, max_length, max_gen, prompt_format,
                         sample_key=sample_key,
                         max_generation_length=max_gen
                     )
+                elif args.mode == "uniform":
+                     pred, _ = pipeline.run(
+                        input_ids=inputs.input_ids,
+                        max_generation_length=max_gen,
+                    )
                 else: # Default behavior for other pipelines
-                    # Note: This assumes other pipelines share a similar `run` signature.
                     pred, _ = pipeline.run(
                         input_ids=inputs.input_ids,
                         look_ahead_k=args.look_ahead_k, 
@@ -289,7 +303,7 @@ if __name__ == "__main__":
     parser.add_argument("--save_path", default="", type=str, help="Path to save the output")
 
     # KV Compression & Prefill Modes
-    parser.add_argument("--mode", type=str, default="fastkv", choices=["fullkv", "fastkv", "snapkv", "gemfilter", "adakv", "headkv", "speculative_prefill", "echo_cache", "hfastkv", "draft_tsp", "oracle"])
+    parser.add_argument("--mode", type=str, default="fastkv", choices=["fullkv", "fastkv", "snapkv", "gemfilter", "adakv", "headkv", "speculative_prefill", "echo_cache", "hfastkv", "draft_tsp", "oracle", "uniform"])
 
     parser.add_argument("--window_size", type=int, default=8)
     parser.add_argument("--max_capacity_prompt", type=int, default=512)
