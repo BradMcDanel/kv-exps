@@ -37,7 +37,9 @@ def setup_model_and_tokenizer(args):
     
     # Load tokenizer once, as it's needed by all modes for prompt prep.
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
-    
+    if tokenizer.pad_token is None and tokenizer.eos_token is not None:
+        tokenizer.pad_token = tokenizer.eos_token
+
     model = None
     pipeline = None
 
@@ -63,6 +65,15 @@ def setup_model_and_tokenizer(args):
             pool_type=args.pooling,
             use_chunk_selection=args.use_chunk_selection, 
             chunk_size=args.chunk_size,
+        )
+    elif args.mode == "oracle":
+        from baseline.oracle.main import OraclePrefillPipeline as Pipeline
+        logging.info("Initializing OraclePrefillPipeline...")
+        pipeline = Pipeline(
+            base_model_name=args.model,
+            tokenizer=tokenizer,
+            oracle_rankings_path=args.oracle_rankings_path,
+            keep_percentage=args.keep_percentage,
         )
     elif args.mode == "echo_cache":
         from baseline.echo_cache.main import EchoCachePipeline as Pipeline
@@ -162,7 +173,7 @@ def generate_longbench(data, max_length, max_gen, prompt_format,
     if model is not None:
         device = model.device
 
-    for json_obj in tqdm(data, desc=f"Generating Responses for {args.mode}..."):
+    for i, json_obj in tqdm(enumerate(data), desc=f"Generating Responses for {args.mode}...", total=len(data)):
         try:
             prompt = prompt_format.format(**json_obj)
             # Tokenize once to check length, then decode for truncation
@@ -180,11 +191,22 @@ def generate_longbench(data, max_length, max_gen, prompt_format,
             
             pred = ""
             if pipeline is not None:
-                pred, _ = pipeline.run(
-                    input_ids=inputs.input_ids,
-                    look_ahead_k=args.look_ahead_k, 
-                    max_generation_length=max_gen,
-                )
+                if args.mode == "oracle":
+                    sample_key = f"sample_{i}"
+                    pred, _ = pipeline.run(
+                        input_ids=inputs.input_ids,
+                        oracle_model_for_path=args.model,
+                        dataset_name=dataset,
+                        sample_key=sample_key,
+                        max_generation_length=max_gen
+                    )
+                else: # Default behavior for other pipelines
+                    # Note: This assumes other pipelines share a similar `run` signature.
+                    pred, _ = pipeline.run(
+                        input_ids=inputs.input_ids,
+                        look_ahead_k=args.look_ahead_k, 
+                        max_generation_length=max_gen,
+                    )
             else:
                 with torch.inference_mode():
                     context_length = inputs.input_ids.shape[-1]
@@ -267,10 +289,14 @@ if __name__ == "__main__":
     parser.add_argument("--save_path", default="", type=str, help="Path to save the output")
 
     # KV Compression & Prefill Modes
-    parser.add_argument("--mode", type=str, default="fastkv", choices=["fullkv", "fastkv", "snapkv", "gemfilter", "adakv", "headkv", "speculative_prefill", "echo_cache", "hfastkv", "draft_tsp"])
+    parser.add_argument("--mode", type=str, default="fastkv", choices=["fullkv", "fastkv", "snapkv", "gemfilter", "adakv", "headkv", "speculative_prefill", "echo_cache", "hfastkv", "draft_tsp", "oracle"])
+
     parser.add_argument("--window_size", type=int, default=8)
     parser.add_argument("--max_capacity_prompt", type=int, default=512)
     parser.add_argument("--max_capacity_prompt_percentage", type=float, default=None, help="Use a percentage of the prompt length for max capacity.")
+
+    parser.add_argument("--oracle_rankings_path", type=str, default="analysis_results/oracles", help="Path to the root directory of oracle .npz files for oracle mode.")
+    parser.add_argument("--keep_percentage", type=float, default=0.05, help="Percentage of prompt tokens to keep for oracle mode.")
 
     # KV Compression & Prefill Modes (+ Speculative Prefill and Echo Cache)
     parser.add_argument("--kernel_size", type=int, default=7, help="Pooling kernel size. Must be odd.")
