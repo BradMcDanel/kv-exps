@@ -7,7 +7,7 @@ import seaborn as sns
 import torch
 from transformers import AutoTokenizer
 from scipy.stats import gaussian_kde
-from typing import Dict
+from typing import Dict, Any, List
 
 # --- Plotting Style ---
 sns.set_theme(style="whitegrid")
@@ -21,13 +21,19 @@ plt.rcParams.update({
     'legend.fontsize': 14,
 })
 
-def load_data(path: str) -> Dict:
-    """Safely loads a pickle file."""
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"Data file not found at: {path}")
-    print(f"Loading data from: {path}")
-    with open(path, "rb") as f:
-        return pickle.load(f)
+def load_npz_data_for_dataset(base_path: str, model_name_sanitized: str, dataset_name: str) -> Dict[str, Any]:
+    """Loads all samples from a single .npz file for a given dataset."""
+    file_path = os.path.join(base_path, model_name_sanitized, f"{dataset_name}.npz")
+    if not os.path.exists(file_path):
+        print(f"Warning: Data file not found at: {file_path}")
+        return {}
+    
+    try:
+        npz_file = np.load(file_path, allow_pickle=True)
+        return {key: npz_file[key].item() for key in npz_file.files}
+    except Exception as e:
+        print(f"Warning: Could not load or parse {file_path}. Error: {e}")
+        return {}
 
 def get_top_k_indices(scores: torch.Tensor, k: int) -> torch.Tensor:
     """Returns the indices of the top-k scores."""
@@ -44,7 +50,7 @@ def plot_selection_density(
     sequence_length: int,
     k_percentage: float,
     dataset_name: str,
-    sample_idx: int,
+    sample_key: str,
     output_file: str
 ):
     """Creates a density plot showing the concentration of selected tokens."""
@@ -60,24 +66,22 @@ def plot_selection_density(
     for name, props in methods.items():
         if name in all_indices and len(all_indices[name]) > 1:
             indices = all_indices[name].cpu().numpy()
-            # bw_method controls the "smoothness" of the density curve
             kde = gaussian_kde(indices, bw_method=0.03)
             density = kde(x_grid)
             ax.plot(x_grid, density, color=props['color'], label=name, linewidth=2.5)
             ax.fill_between(x_grid, density, color=props['color'], alpha=0.2)
     
-    # --- Formatting the plot ---
     ax.set_xlabel('Token Position in Prompt')
     ax.set_ylabel('Density of Selected Tokens')
     ax.grid(axis='y', linestyle=':', linewidth=0.7)
     ax.spines[['right', 'top']].set_visible(False)
     ax.legend()
     ax.set_xlim(0, sequence_length)
-    ax.set_yticklabels([]) # Hide y-axis numerical labels as density values are relative
-    ax.tick_params(axis='y', length=0) # remove y-axis ticks
+    ax.set_yticklabels([]) 
+    ax.tick_params(axis='y', length=0)
 
     title = f'Deep Dive: Density of Top-{k_percentage:.0%} Selected Tokens\n'
-    title += f'Dataset: {dataset_name.replace("_", " ").title()} | Sample Index: {sample_idx} | Sequence Length: {sequence_length}'
+    title += f'Dataset: {dataset_name.replace("_", " ").title()} | Sample Key: {sample_key} | Sequence Length: {sequence_length}'
     ax.set_title(title, pad=20)
     
     plt.tight_layout()
@@ -85,34 +89,48 @@ def plot_selection_density(
     plt.close(fig)
     print(f"\nDeep dive visualization saved to: {output_file}")
 
-
 def print_token_text(
-    tokenizer: AutoTokenizer,
+    tokenizer : AutoTokenizer, 
     all_indices: Dict[str, torch.Tensor],
     all_tokens: torch.Tensor,
-    num_tokens_to_print: int = 20
+    num_tokens_to_print: int = 200
 ):
-    """Prints the text of the selected tokens for qualitative analysis."""
+    """Prints the text of the selected tokens compactly for qualitative analysis."""
     print("\n" + "="*80)
-    print("Qualitative Deep Dive: Text of Top-Selected Tokens")
+    print("Qualitative Deep Dive: Text of Top-Selected Tokens (Compact)")
     print("="*80 + "\n")
-    
+
     for name, indices in all_indices.items():
-        print(f"--- {name} (Top {min(len(indices), num_tokens_to_print)} selections, sorted by position) ---")
-        
+        header = f"--- {name} (Top {min(len(indices), num_tokens_to_print)} selections) ---"
+        print(header)
+
+        if not indices.numel():
+            print("  (No tokens selected)\n")
+            continue
+
         sorted_indices = torch.sort(indices).values
         tokens_to_show = sorted_indices[:num_tokens_to_print]
-        token_ids = all_tokens[tokens_to_show]
-        decoded_tokens = [tokenizer.decode([tid]) for tid in token_ids]
-        
-        formatted_output = []
-        for i, token_text in zip(tokens_to_show, decoded_tokens):
-            clean_text = repr(token_text)[1:-1]
-            formatted_output.append(f"  Pos {i:<4}: '{clean_text}'")
-        
-        print("\n".join(formatted_output))
-        print("\n" + "-"*40 + "\n")
 
+        groups_of_indices: List[List[int]] = []
+        if tokens_to_show.numel() > 0:
+            current_group = [tokens_to_show[0].item()]
+            for i in range(1, len(tokens_to_show)):
+                if tokens_to_show[i] == tokens_to_show[i-1] + 1:
+                    current_group.append(tokens_to_show[i].item())
+                else:
+                    groups_of_indices.append(current_group)
+                    current_group = [tokens_to_show[i].item()]
+            groups_of_indices.append(current_group)
+
+        decoded_parts = []
+        for group in groups_of_indices:
+            group_tensor = torch.tensor(group, dtype=torch.long, device=all_tokens.device)
+            token_ids = all_tokens[group_tensor]
+            decoded_text = tokenizer.decode(token_ids)
+            clean_text = repr(decoded_text).strip("'")
+            decoded_parts.append(f"{clean_text}")
+
+        print("  " + " | ".join(decoded_parts) + "\n")
 
 def main():
     parser = argparse.ArgumentParser(
@@ -120,13 +138,22 @@ def main():
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
     
-    default_oracle_path = 'analysis_results/oracles/oracles_model_meta-llama_Llama-3.1-8B-Instruct.pkl'
-    default_approx_8b_path = 'analysis_results/approx_rankings/approx_rankings_model_meta-llama_Llama-3.1-8B-Instruct.pkl'
-    default_approx_1b_path = 'analysis_results/approx_rankings/approx_rankings_model_meta-llama_Llama-3.2-1B-Instruct.pkl'
+    # Define models and their paths
+    MODELS = {
+        'oracle': {
+            'sanitized_name': 'meta-llama_Llama-3.1-8B-Instruct',
+            'base_path': 'analysis_results/oracles'
+        },
+        '8B': {
+            'sanitized_name': 'meta-llama_Llama-3.1-8B-Instruct',
+            'base_path': 'analysis_results/approx_rankings'
+        },
+        '1B': {
+            'sanitized_name': 'meta-llama_Llama-3.2-1B-Instruct',
+            'base_path': 'analysis_results/approx_rankings'
+        },
+    }
 
-    parser.add_argument("--oracle_file", type=str, default=default_oracle_path, help="Path to the 8B oracle rankings file.")
-    parser.add_argument("--approx_8b_file", type=str, default=default_approx_8b_path, help="Path to the 8B approximate rankings file.")
-    parser.add_argument("--approx_1b_file", type=str, default=default_approx_1b_path, help="Path to the 1B approximate rankings file.")
     parser.add_argument("--tokenizer_path", type=str, default='meta-llama/Llama-3.1-8B-Instruct', help="Path to the tokenizer for decoding.")
     parser.add_argument("--dataset", type=str, default='qasper', help="Dataset to analyze.")
     parser.add_argument("--sample_idx_in_file", type=int, default=0, help="The index of the sample to use from the list of common samples (0 for the first).")
@@ -135,64 +162,70 @@ def main():
     args = parser.parse_args()
     
     try:
-        oracle_data = load_data(args.oracle_file)
-        approx_8b_data = load_data(args.approx_8b_file)
-        approx_1b_data = load_data(args.approx_1b_file)
+        # Load data for the specified dataset from all models
+        oracle_data = load_npz_data_for_dataset(MODELS['oracle']['base_path'], MODELS['oracle']['sanitized_name'], args.dataset)
+        approx_8b_data = load_npz_data_for_dataset(MODELS['8B']['base_path'], MODELS['8B']['sanitized_name'], args.dataset)
+        approx_1b_data = load_npz_data_for_dataset(MODELS['1B']['base_path'], MODELS['1B']['sanitized_name'], args.dataset)
         tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_path)
-    except (FileNotFoundError, OSError) as e:
-        print(f"Error: {e}\nPlease ensure paths are correct and you are running from the project root.")
+    except OSError as e:
+        print(f"Error loading models or tokenizer: {e}")
         return
 
-    oracle_sample_ids = {s['sample_idx'] for s in oracle_data.get(args.dataset, [])}
-    approx_8b_sample_ids = {s['sample_idx'] for s in approx_8b_data.get(args.dataset, [])}
-    approx_1b_sample_ids = {s['sample_idx'] for s in approx_1b_data.get(args.dataset, [])}
+    # Find common sample keys (e.g., 'sample_0', 'sample_12')
+    common_keys = sorted(list(
+        set(oracle_data.keys()) & set(approx_8b_data.keys()) & set(approx_1b_data.keys())
+    ))
     
-    common_ids = sorted(list(oracle_sample_ids & approx_8b_sample_ids & approx_1b_sample_ids))
-    
-    if not common_ids or args.sample_idx_in_file >= len(common_ids):
+    if not common_keys or args.sample_idx_in_file >= len(common_keys):
         print(f"Error: Could not find a common sample at index {args.sample_idx_in_file} for dataset '{args.dataset}'.")
+        print(f"Found {len(common_keys)} common samples.")
         return
 
-    target_sample_id = common_ids[args.sample_idx_in_file]
-    print(f"\nAnalyzing common sample with original index: {target_sample_id}")
+    target_sample_key = common_keys[args.sample_idx_in_file]
+    print(f"\nAnalyzing common sample with key: {target_sample_key}")
 
-    oracle_sample = next(s for s in oracle_data[args.dataset] if s['sample_idx'] == target_sample_id)
-    approx_8b_sample = next(s for s in approx_8b_data[args.dataset] if s['sample_idx'] == target_sample_id)
-    approx_1b_sample = next(s for s in approx_1b_data[args.dataset] if s['sample_idx'] == target_sample_id)
+    # Retrieve the specific sample data using the key
+    oracle_sample = oracle_data[target_sample_key]
+    approx_8b_sample = approx_8b_data[target_sample_key]
+    approx_1b_sample = approx_1b_data[target_sample_key]
     
+    # Unpickle ranking dicts if necessary
+    if isinstance(approx_8b_sample['layerwise_rankings'], bytes):
+        approx_8b_sample['layerwise_rankings'] = pickle.loads(approx_8b_sample['layerwise_rankings'])
+    if isinstance(approx_1b_sample['cumulative_rankings'], bytes):
+        approx_1b_sample['cumulative_rankings'] = pickle.loads(approx_1b_sample['cumulative_rankings'])
+
     layer_to_use = 15
 
-    input_ids = torch.tensor(oracle_sample['input_ids'])
+    input_ids = torch.from_numpy(oracle_sample['input_ids'])
     k = int(len(input_ids) * args.k_percentage)
     all_indices = {}
 
     # 1. Oracle
-    all_indices['Oracle (8B Answer-Informed)'] = get_top_k_indices(torch.tensor(oracle_sample['ranking']), k)
+    all_indices['Oracle (8B Answer-Informed)'] = get_top_k_indices(torch.from_numpy(oracle_sample['ranking']), k)
 
     # 2. FastKV-style (8B Single Layer)
-    layerwise_rankings_8b = approx_8b_sample['layerwise_rankings']
+    layerwise_rankings_8b = approx_8b_sample.get('layerwise_rankings', {})
     if layer_to_use in layerwise_rankings_8b:
-        fastkv_ranking = torch.tensor(layerwise_rankings_8b[layer_to_use])
+        fastkv_ranking = torch.from_numpy(layerwise_rankings_8b[layer_to_use])
         all_indices['FastKV-style (8B Layer 15)'] = get_top_k_indices(fastkv_ranking, k)
     else:
-        print(f"Error: Layer {layer_to_use} not found in 8B layerwise rankings. Available: {list(layerwise_rankings_8b.keys())}")
-        return
+        print(f"Warning: Layer {layer_to_use} not found in 8B layerwise rankings. Available: {list(layerwise_rankings_8b.keys())}")
 
     # 3. Speculative Prefill-style (1B Cumulative)
-    cumulative_rankings_1b = approx_1b_sample['cumulative_rankings']
+    cumulative_rankings_1b = approx_1b_sample.get('cumulative_rankings', {})
     if layer_to_use in cumulative_rankings_1b:
-        spec_prefill_ranking = torch.tensor(cumulative_rankings_1b[layer_to_use])
+        spec_prefill_ranking = torch.from_numpy(cumulative_rankings_1b[layer_to_use])
         all_indices['Speculative Prefill-style (1B Layer 15 Cumulative)'] = get_top_k_indices(spec_prefill_ranking, k)
     else:
-        print(f"Error: Layer {layer_to_use} not found in 1B cumulative rankings. Available: {list(cumulative_rankings_1b.keys())}")
-        return
+        print(f"Warning: Layer {layer_to_use} not found in 1B cumulative rankings. Available: {list(cumulative_rankings_1b.keys())}")
 
     plot_selection_density(
         all_indices,
         len(input_ids),
         args.k_percentage,
         args.dataset,
-        target_sample_id,
+        target_sample_key,
         args.output_file
     )
     

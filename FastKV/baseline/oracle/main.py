@@ -261,22 +261,14 @@ def main():
         sample = data[original_data_index]
 
         raw_prompt = dataset2prompt[args.dataset_name].format(**sample)
-
-        # --- Corrected Prompt Formatting Logic ---
-        # This now matches the oracle generation script to ensure input_ids are identical.
-        datasets_without_chat_template = ["trec", "triviaqa", "samsum", "lsht", "lcc", "repobench-p"]
-        if args.dataset_name not in datasets_without_chat_template:
-            messages = [{"role": "user", "content": raw_prompt}]
-            final_prompt_text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-        else:
-            final_prompt_text = raw_prompt
-        # --- End of Corrected Logic ---
+        messages = [{"role": "user", "content": raw_prompt}]
+        templated_prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
 
     except (FileNotFoundError, IndexError, KeyError) as e:
         print(f"Error loading data or prompt: {e}")
         return
 
-    inputs = tokenizer(final_prompt_text, return_tensors="pt", truncation=True, max_length=args.max_prompt_len).to(pipeline.device)
+    inputs = tokenizer(templated_prompt, return_tensors="pt", truncation=True, max_length=args.max_prompt_len).to(pipeline.device)
 
     print(f"\n--- Running Oracle Prefill Pipeline ---")
     print(f"Base Model: {args.base_model_name}")

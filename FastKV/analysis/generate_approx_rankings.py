@@ -1,5 +1,3 @@
-# analysis/generate_approx_rankings.py
-
 import os
 import sys
 import argparse
@@ -20,6 +18,7 @@ from transformers.models.llama.modeling_llama import (
 import math
 import types
 from functools import partial
+import numpy as np
 
 def _patched_attention_forward_unified(
     self_attn: LlamaAttention,
@@ -35,7 +34,6 @@ def _patched_attention_forward_unified(
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Cache]]:
     bsz, q_len, _ = hidden_states.size()
     if q_len <= ranking_generator.window_size:
-        # Fallback to original forward for prompts shorter than the window
         return ranking_generator.orig_fwds[self_attn.layer_idx](
             hidden_states, attention_mask, position_ids, past_key_value, 
             output_attentions, use_cache, cache_position, **kwargs
@@ -58,31 +56,19 @@ def _patched_attention_forward_unified(
     query_states, key_states = hf_apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
     
     with torch.no_grad():
-        # Use the last `window_size` queries as the perspective for scoring
         scoring_queries = query_states[..., -ranking_generator.window_size :, :].detach()
         key_states_for_scoring = hf_repeat_kv(key_states, num_kv_groups).detach()
         
-        # Calculate raw logits for both ranking styles
         attn_logits = torch.matmul(scoring_queries, key_states_for_scoring.transpose(2, 3)) / math.sqrt(head_dim)
         
-        # --- Store logits for Cumulative (SP-style) ranking ---
-        # This style uses raw logits which are processed later in `_compute_cumulative_sp_rankings`
         ranking_generator.aggregate_ranking_logits[self_attn.layer_idx] = attn_logits.clone()
         
-        # --- Compute Layerwise (FastKV-style) ranking ---
-        # This style uses softmax probabilities and specific slicing, just like FastKV
-        
-        # 1. Convert to probabilities
         attn_probs = F.softmax(attn_logits, dim=-1, dtype=torch.float32)
 
-        # 2. Slice to score only tokens *outside* the recent window
-        # The perspective is the last `window_size` tokens, the tokens being scored are the first `q_len - window_size`
         attn_probs_for_scoring = attn_probs[..., :, :-ranking_generator.window_size]
 
-        # 3. Sum probabilities from the perspective of the recent window (over the query dim)
         token_scores_per_head = attn_probs_for_scoring.sum(dim=-2)
 
-        # 4. Apply pooling for denoising, if configured
         if ranking_generator.pooling != "none":
             if ranking_generator.pooling == "avgpool":
                 pooled_scores = F.avg_pool1d(token_scores_per_head, kernel_size=ranking_generator.kernel_size, padding=ranking_generator.kernel_size // 2, stride=1)
@@ -91,25 +77,18 @@ def _patched_attention_forward_unified(
         else:
             pooled_scores = token_scores_per_head
         
-        # 5. Aggregate scores across heads
         final_fastkv_scores = pooled_scores.sum(dim=1)
         
-        # 6. Pad scores and ensure recent tokens are kept.
-        # NOTE: This modification ensures the last `window_size` tokens are not evicted
-        # by giving them a score higher than any other token.
         padded_scores = torch.zeros(bsz, q_len, device=final_fastkv_scores.device, dtype=final_fastkv_scores.dtype)
         
-        # Assign calculated scores to the evictable part of the prompt
         scorable_len = final_fastkv_scores.shape[1]
         padded_scores[:, :scorable_len] = final_fastkv_scores
         
-        # Find max score among evictable tokens and assign max_score + eps to recent tokens
         max_score = final_fastkv_scores.max(dim=-1, keepdim=True)[0]
         padded_scores[:, -ranking_generator.window_size:] = max_score + 1e-5
 
         ranking_generator.layerwise_rankings[self_attn.layer_idx] = padded_scores.clone()
 
-    # --- Continue with the original attention mechanism for model's forward pass ---
     if past_key_value is not None:
          key_states, value_states = past_key_value.update(key_states, value_states, self_attn.layer_idx, {"cache_position": cache_position})
     
@@ -138,6 +117,7 @@ class ApproxRankingGenerator:
         self.orig_fwds.clear()
         for i, layer in enumerate(self.model.model.layers):
             if hasattr(layer, 'self_attn') and isinstance(layer.self_attn, LlamaAttention):
+                setattr(layer.self_attn, "layer_idx", i) # Ensure layer_idx is available
                 self.orig_fwds[i] = layer.self_attn.forward
                 layer.self_attn.forward = types.MethodType(partial(_patched_attention_forward_unified, ranking_generator=self), layer.self_attn)
 
@@ -153,29 +133,17 @@ class ApproxRankingGenerator:
         sorted_layers = sorted(self.aggregate_ranking_logits.keys())
         for up_to_layer_idx in sorted_layers:
             current_layer_indices = [l for l in sorted_layers if l <= up_to_layer_idx]
-            # Stack the raw logits from layers up to the current one
             logits_to_process = torch.stack([self.aggregate_ranking_logits[i] for i in current_layer_indices])
             
-            # This logic mirrors Speculative Prefill's `_token_importance_from_attn_scores`
             all_probs = F.softmax(logits_to_process, dim=-1, dtype=torch.float32)
-            # Permute to (batch, perspective_len, layers, heads, prompt_len)
             all_probs = all_probs.permute(1, 3, 0, 2, 4)
-            # Flatten layers and heads
             flat_probs = all_probs.flatten(start_dim=2, end_dim=3)
-            # Get max probability for each prompt token from any layer/head
             max_scores, _ = flat_probs.max(dim=2)
-            # Average these max scores across the perspective tokens
             final_scores = max_scores.mean(dim=1)
             
-            # Ensure recent tokens are kept by assigning them the highest possible score.
-            # NOTE: This modification ensures the last `window_size` tokens are not evicted
-            # by giving them a score higher than any other token.
-            
-            # Find max score among the tokens that are candidates for eviction
             scores_to_rank = final_scores[:, :-self.window_size]
             max_score = scores_to_rank.max(dim=-1, keepdim=True)[0]
             
-            # Assign max_score + eps to the recent tokens to guarantee they are kept
             final_scores[:, -self.window_size:] = max_score + 1e-5
             
             cumulative_rankings[up_to_layer_idx] = final_scores.clone()
@@ -185,9 +153,13 @@ class ApproxRankingGenerator:
     def generate_rankings(self, inputs: Dict[str, torch.Tensor]) -> Tuple[Dict, Dict]:
         self.layerwise_rankings.clear()
         self.aggregate_ranking_logits.clear()
-        self._patch_model()
-        self.model(input_ids=inputs['input_ids'], use_cache=False, cache_position=torch.arange(inputs['input_ids'].shape[1], device=self.device))
-        self._unpatch_model()
+        
+        try:
+            self._patch_model()
+            self.model(input_ids=inputs['input_ids'], use_cache=False, cache_position=torch.arange(inputs['input_ids'].shape[1], device=self.device))
+        finally:
+            self._unpatch_model()
+            
         cumulative_sp_rankings = self._compute_cumulative_sp_rankings()
         return self.layerwise_rankings, cumulative_sp_rankings
 
@@ -221,19 +193,35 @@ def main():
     model = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=torch.bfloat16, device_map="auto", attn_implementation="sdpa")
     ranking_generator = ApproxRankingGenerator(model, window_size=args.window_size, kernel_size=args.kernel_size, pooling=args.pooling)
     
-    all_rankings_data = {}
+    model_name_sanitized = args.model.replace('/', '_')
+
     for dataset_name in args.datasets:
         print(f"\n--- Processing Approx. Rankings for Dataset: {dataset_name.upper()} ---")
         if dataset_name not in dataset2prompt:
             print(f"Warning: No prompt format found for {dataset_name}. Skipping.")
             continue
         
+        dataset_output_dir = os.path.join(args.output_dir, model_name_sanitized)
+        os.makedirs(dataset_output_dir, exist_ok=True)
+        output_path = os.path.join(dataset_output_dir, f"{dataset_name}.npz")
+        
+        try:
+            existing_data = dict(np.load(output_path, allow_pickle=True))
+            print(f"Loaded {len(existing_data)} existing samples from {output_path}. Will append new samples.")
+        except FileNotFoundError:
+            existing_data = {}
+
         data = load_dataset('THUDM/LongBench', dataset_name, split='test', trust_remote_code=True)
-        dataset_results = []
         processed_count = 0
 
         for i, sample in enumerate(data):
             if processed_count >= args.num_samples: break
+            sample_key = f'sample_{i}'
+
+            if sample_key in existing_data:
+                print(f"Skipping already processed sample {i}.")
+                processed_count += 1
+                continue
             
             try:
                 raw_prompt = dataset2prompt[dataset_name].format(**sample)
@@ -249,10 +237,7 @@ def main():
             inputs = tokenizer(final_prompt_text, return_tensors="pt").to(model.device)
             prompt_len = inputs.input_ids.shape[1]
 
-            if prompt_len > args.max_len:
-                continue
-
-            if prompt_len <= args.window_size:
+            if prompt_len > args.max_len or prompt_len <= args.window_size:
                 continue
             
             print(f"Processing sample {i} ({processed_count + 1}/{args.num_samples}) for {dataset_name} ({prompt_len} tokens)...")
@@ -263,33 +248,24 @@ def main():
                 print(f"  -> Warning: Failed to generate rankings for sample {i}. Skipping.")
                 continue
 
-            assert all(s.shape[-1] == prompt_len for s in layerwise_rankings.values()), \
-                f"Layerwise ranking size mismatch for sample {i}"
-            assert all(s.shape[-1] == prompt_len for s in cumulative_rankings.values()), \
-                f"Cumulative ranking size mismatch for sample {i}"
-
-            layerwise_list = {l: s.squeeze(0).cpu().tolist() for l, s in layerwise_rankings.items()}
-            cumulative_list = {l: s.squeeze(0).cpu().tolist() for l, s in cumulative_rankings.items()}
+            # Convert rankings to serializable numpy arrays
+            layerwise_np = {l: s.squeeze(0).cpu().to(torch.float32).numpy() for l, s in layerwise_rankings.items()}
+            cumulative_np = {l: s.squeeze(0).cpu().to(torch.float32).numpy() for l, s in cumulative_rankings.items()}
             
-            dataset_results.append({
-                'sample_idx': i,
-                'input_ids': inputs.input_ids.squeeze(0).cpu().tolist(),
-                'layerwise_rankings': layerwise_list,
-                'cumulative_rankings': cumulative_list,
-            })
+            sample_data = {
+                'input_ids': inputs.input_ids.squeeze(0).cpu().numpy(),
+                'layerwise_rankings': pickle.dumps(layerwise_np),
+                'cumulative_rankings': pickle.dumps(cumulative_np),
+            }
+            existing_data[sample_key] = np.array(sample_data)
+
+            # Save after each sample
+            np.savez_compressed(output_path, **existing_data)
             processed_count += 1
 
             if torch.cuda.is_available(): torch.cuda.empty_cache()
             
-        all_rankings_data[dataset_name] = dataset_results
-
-    model_name_sanitized = args.model.replace('/', '_')
-    output_filename = f"approx_rankings_model_{model_name_sanitized}.pkl"
-    output_path = os.path.join(args.output_dir, output_filename)
-
-    print(f"\nSaving approximate ranking results to {output_path}")
-    with open(output_path, "wb") as f:
-        pickle.dump(all_rankings_data, f)
+        print(f"\nSaved/Updated approximate ranking results for {dataset_name} to {output_path}")
 
 if __name__ == "__main__":
     main()
