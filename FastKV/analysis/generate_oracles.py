@@ -1,310 +1,372 @@
 import os
 import argparse
+import pickle
 import json
-import time
 from typing import List, Dict, Tuple, Optional, Any
 
 import torch
-import numpy as np
+import torch.nn.functional as F
 from datasets import load_dataset
-from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
+from transformers import AutoModelForCausalLM, AutoTokenizer, set_seed, AutoConfig
 from transformers.cache_utils import Cache, DynamicCache
+from transformers.models.llama.modeling_llama import (
+    LlamaAttention,
+    apply_rotary_pos_emb as hf_apply_rotary_pos_emb,
+    repeat_kv as hf_repeat_kv,
+)
+import math
+import types
+from functools import partial
+import numpy as np
 
-class OraclePrefillPipeline:
-    """
-    Implements a pipeline that uses pre-computed oracle rankings to perform
-    a selective prefill on a base model. This simulates a "perfect" KV cache
-    compression scenario to measure its upper-bound performance.
-    """
-    def __init__(
-        self,
-        base_model_name: str,
-        tokenizer: AutoTokenizer,
-        oracle_rankings_path: str,
-        keep_percentage: float = 0.1,
-        detailed_timing: bool = True,
-    ):
-        self.base_model_name = base_model_name
+def _patched_attention_forward_oracle(
+    self_attn: LlamaAttention,
+    oracle_generator: 'OracleGenerator',
+    hidden_states: torch.Tensor,
+    attention_mask: Optional[torch.Tensor] = None,
+    position_ids: Optional[torch.LongTensor] = None,
+    past_key_value: Optional[Cache] = None,
+    output_attentions: bool = False,
+    use_cache: bool = False,
+    cache_position: Optional[torch.LongTensor] = None,
+    **kwargs,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Cache]]:
+    # This forward patch is used for both the initial prompt processing (prefill)
+    # and the subsequent token generation (decode).
+    batch_size, query_length, _ = hidden_states.size()
+    num_heads = self_attn.config.num_attention_heads
+    head_dim = self_attn.config.hidden_size // num_heads
+    num_key_value_heads = self_attn.config.num_key_value_heads
+    hidden_size = self_attn.config.hidden_size
+    num_key_value_groups = num_heads // num_key_value_heads
+    
+    query_projection = self_attn.q_proj(hidden_states)
+    key_projection = self_attn.k_proj(hidden_states)
+    value_projection = self_attn.v_proj(hidden_states)
+    
+    query_states = query_projection.view(batch_size, query_length, num_heads, head_dim).transpose(1, 2)
+    key_states_before_rope = key_projection.view(batch_size, query_length, num_key_value_heads, head_dim).transpose(1, 2)
+    value_states_for_cache = value_projection.view(batch_size, query_length, num_key_value_heads, head_dim).transpose(1, 2)
+    
+    cos, sin = self_attn.rotary_emb(value_states_for_cache, position_ids=position_ids)
+    query_states_rotated, key_states_rotated = hf_apply_rotary_pos_emb(query_states, key_states_before_rope, cos, sin, position_ids)
+
+    # --- CAPTURE LOGIC ---
+    # We capture the queries that will be used to generate the next tokens.
+    if not oracle_generator.is_generating_oracle_answer:
+        # This is the prompt prefill pass. Capture the query of the LAST prompt token,
+        # as it's used to generate the FIRST answer token.
+        if query_length > 1:
+            last_q_vector = query_states_rotated[:, :, -1:, :].detach().clone()
+            oracle_generator.captured_qs[self_attn.layer_idx].append(last_q_vector)
+    else:
+        # This is the oracle answer generation pass. We are generating one token at a time.
+        if query_length == 1:
+            oracle_generator.captured_qs[self_attn.layer_idx].append(query_states_rotated.detach().clone())
+    # --- END CAPTURE LOGIC ---
+
+    key_states_for_sdpa, value_states_for_sdpa = past_key_value.update(
+        key_states_rotated, value_states_for_cache, self_attn.layer_idx, {"cache_position": cache_position}
+    )
+    key_states_for_sdpa = hf_repeat_kv(key_states_for_sdpa, num_key_value_groups)
+    value_states_for_sdpa = hf_repeat_kv(value_states_for_sdpa, num_key_value_groups)
+    
+    attn_mask_input = attention_mask
+    is_sdpa_causal = (query_length > 1) and (attn_mask_input is None)
+    if attn_mask_input is not None:
+        is_sdpa_causal = False
+        actual_kv_sequence_length = key_states_for_sdpa.shape[-2]
+        if attn_mask_input.shape[-1] > actual_kv_sequence_length:
+            attn_mask_input = attn_mask_input[:, :, :, :actual_kv_sequence_length]
+            
+    attention_output = F.scaled_dot_product_attention(
+        query_states_rotated, key_states_for_sdpa, value_states_for_sdpa, attn_mask=attn_mask_input, dropout_p=0.0, is_causal=is_sdpa_causal
+    )
+    attention_output = attention_output.transpose(1, 2).contiguous().reshape(batch_size, query_length, hidden_size)
+    attention_output = self_attn.o_proj(attention_output)
+    
+    return attention_output, None, past_key_value
+
+class OracleGenerator:
+    def __init__(self, model: AutoModelForCausalLM, tokenizer: AutoTokenizer, pool_kernel_size: Optional[int], pool_type: str):
+        self.model = model
         self.tokenizer = tokenizer
-        self.base_model = self._load_model(self.base_model_name)
-        self.base_config: AutoConfig = self.base_model.config
-        self.device = self.base_model.device
-        self.dtype = self.base_model.dtype
-        
-        self.oracle_rankings_path = oracle_rankings_path
-        self.keep_percentage = keep_percentage
-        self.detailed_timing = detailed_timing
-        
-        self._validate_config()
+        self.config: AutoConfig = self.model.config
+        self.device = self.model.device
+        self.dtype = self.model.dtype
         self.eos_token_ids = self._extract_eos_token_ids()
+        
+        # New parameters for feature parity
+        self.pool_kernel_size = pool_kernel_size
+        self.pool_type = pool_type.lower()
+        self._validate_pooling_config()
 
-    def _validate_config(self):
-        if not (0.0 < self.keep_percentage <= 1.0):
-            raise ValueError("`keep_percentage` must be between 0.0 and 1.0.")
-        if not os.path.isdir(self.oracle_rankings_path):
-            raise FileNotFoundError(f"Oracle rankings path not found: {self.oracle_rankings_path}")
+        self.captured_qs: List[List[torch.Tensor]] = []
+        self.orig_fwds: Dict[int, Any] = {}
+        self.is_generating_oracle_answer = False
+        self.token_importance_scores: Optional[torch.Tensor] = None
 
-    def _load_model(self, model_name: str) -> AutoModelForCausalLM:
-        print(f"Loading base model: {model_name}")
-        model = AutoModelForCausalLM.from_pretrained(
-            model_name, torch_dtype=torch.bfloat16, trust_remote_code=True, device_map="auto", attn_implementation="sdpa"
-        )
-        return model.eval()
-
+    def _validate_pooling_config(self):
+        if self.pool_type not in ['avgpool', 'maxpool', 'none']:
+            raise ValueError(f"pool_type must be 'avgpool', 'maxpool', or 'none', but got {self.pool_type}")
+        if self.pool_kernel_size is not None:
+            if self.pool_kernel_size <= 1: self.pool_kernel_size = None
+            elif self.pool_kernel_size % 2 == 0: raise ValueError("pool_kernel_size must be an odd number.")
+            if self.pool_type == 'none': raise ValueError("pool_kernel_size is specified, but pool_type is 'none'.")
+        if self.pool_type != 'none' and self.pool_kernel_size is None:
+            raise ValueError(f"pool_type is '{self.pool_type}', but pool_kernel_size is not specified.")
+            
     def _extract_eos_token_ids(self) -> List[int]:
-        config_eos = self.base_config.eos_token_id
+        # (Implementation is unchanged)
+        config_eos = self.config.eos_token_id
         if isinstance(config_eos, int): return [config_eos]
         if isinstance(config_eos, list): return list(config_eos)
         if self.tokenizer.eos_token_id: return [self.tokenizer.eos_token_id]
         raise ValueError("eos_token_id not defined in config or tokenizer.")
 
-    def _load_oracle_ranking(self, model_name: str, dataset_name: str, sample_key: str) -> Optional[Dict[str, np.ndarray]]:
-        """Loads the oracle data for a specific sample."""
-        model_name_sanitized = model_name.replace('/', '_')
-        file_path = os.path.join(self.oracle_rankings_path, model_name_sanitized, f"{dataset_name}.npz")
+    def _patch_model(self) -> int:
+        if not hasattr(self.model, 'model') or not hasattr(self.model.model, 'layers'): return 0
+        num_layers = self.config.num_hidden_layers
+        self.captured_qs = [[] for _ in range(num_layers)]
+        num_patched_layers = 0
+        for i, layer in enumerate(self.model.model.layers):
+            if hasattr(layer, 'self_attn') and isinstance(layer.self_attn, LlamaAttention):
+                attn_module = layer.self_attn
+                if i not in self.orig_fwds: self.orig_fwds[i] = attn_module.forward
+                # Add layer_idx for the patch to use
+                setattr(attn_module, "layer_idx", i)
+                attn_module.forward = types.MethodType(partial(_patched_attention_forward_oracle, oracle_generator=self), attn_module)
+                num_patched_layers += 1
+        return num_patched_layers
+
+    def _unpatch_model(self):
+        for i, layer in enumerate(self.model.model.layers):
+            if hasattr(layer, 'self_attn') and i in self.orig_fwds:
+                layer.self_attn.forward = self.orig_fwds[i]
+        self.orig_fwds.clear()
+
+    def _token_importance_from_attn_scores(self, attention_scores: torch.Tensor):
+        if attention_scores.numel() == 0:
+            self.token_importance_scores = None
+            return
+            
+        # attention_scores shape: [batch, num_layers, num_heads, num_gen_tokens, prompt_len]
+        # We need to process this to match the pooling logic
+        attention_scores = attention_scores.permute(0, 3, 1, 2, 4) 
+        # New shape: [batch, num_gen_tokens, num_layers, num_heads, prompt_len]
         
-        if not os.path.exists(file_path):
-            print(f"Warning: Oracle ranking file not found at: {file_path}")
-            return None
+        bs, num_gen_tokens, num_layers, num_heads, prompt_len = attention_scores.shape
+        if bs != 1: raise NotImplementedError("Batch size > 1 is not supported.")
         
-        try:
-            with np.load(file_path, allow_pickle=True) as npz_file:
-                if sample_key in npz_file:
-                    # .item() extracts the object array (which is a dict)
-                    return npz_file[sample_key].item()
-                else:
-                    print(f"Warning: Sample key '{sample_key}' not found in {file_path}")
-                    return None
-        except Exception as e:
-            print(f"Error loading oracle data from {file_path}: {e}")
-            return None
+        probs = F.softmax(attention_scores, dim=-1, dtype=torch.float32)
+
+        if self.pool_kernel_size and self.pool_type != 'none':
+            # Reshape for pooling: combine batch, gen_tokens, layers, heads
+            # Shape becomes [(bs * num_gen_tokens * num_layers * num_heads), prompt_len]
+            reshaped_for_pooling = probs.flatten(0, 3) 
+            
+            padding = (self.pool_kernel_size - 1) // 2
+            pool_fn = F.avg_pool1d if self.pool_type == 'avgpool' else F.max_pool1d
+            
+            # Pool along the prompt_len dimension
+            pooled_tensor = pool_fn(reshaped_for_pooling.unsqueeze(1), kernel_size=self.pool_kernel_size, stride=1, padding=padding).squeeze(1)
+            
+            # Reshape back
+            processed_scores = pooled_tensor.reshape(bs, num_gen_tokens, num_layers, num_heads, prompt_len)
+        else:
+            processed_scores = probs
+
+        # Flatten layers and heads for max operation
+        # New shape: [bs, num_gen_tokens, (num_layers * num_heads), prompt_len]
+        flattened_scores = processed_scores.flatten(2, 3)
+        max_scores, _ = flattened_scores.max(2) # Max over layers and heads
+        
+        # Mean over generated tokens
+        final_token_importance = max_scores.mean(1) # Mean over num_gen_tokens
+        
+        self.token_importance_scores = final_token_importance.to(self.dtype)
+
+
+    def _compute_raw_qk_scores(self, prompt_only_cache_tuple: Tuple[Tuple[torch.Tensor, torch.Tensor], ...]) -> torch.Tensor:
+        if not self.captured_qs or not any(self.captured_qs): return torch.empty(0)
+        num_layers = self.config.num_hidden_layers
+        num_q_heads = self.config.num_attention_heads
+        num_kv_heads = self.config.num_key_value_heads
+        num_kv_groups = num_q_heads // num_kv_heads
+        head_dim = self.config.hidden_size // num_q_heads
+        all_layer_scores = []
+        for layer_idx in range(num_layers):
+            if not self.captured_qs[layer_idx] or prompt_only_cache_tuple[layer_idx][0].numel() == 0: continue
+            key_prompt_layer = prompt_only_cache_tuple[layer_idx][0].detach()
+            key_prompt_layer_repeated = hf_repeat_kv(key_prompt_layer, num_kv_groups)
+            all_q_for_layer = torch.cat(self.captured_qs[layer_idx], dim=2)
+            attn_logits = torch.matmul(all_q_for_layer, key_prompt_layer_repeated.transpose(-1, -2)) / math.sqrt(head_dim)
+            all_layer_scores.append(attn_logits)
+        if not all_layer_scores: return torch.empty(0)
+        
+        return torch.stack(all_layer_scores, dim=1)
 
     @torch.no_grad()
-    def run(
-        self,
-        input_ids: torch.Tensor,
-        oracle_model_for_path: str, # Model name used to generate the oracle (e.g., meta-llama/Llama-3.1-8B-Instruct)
-        dataset_name: str,
-        sample_key: str,
-        max_generation_length: int,
-    ) -> Tuple[str, Dict[str, Any]]:
-        """
-        Runs the oracle-guided prefill and generation.
-
-        Args:
-            input_ids: The full prompt token IDs.
-            oracle_model_for_path: The model name used to create the oracle file path.
-            dataset_name: The name of the dataset for the sample.
-            sample_key: The key identifying the sample within the oracle .npz file.
-            max_generation_length: The maximum number of tokens to generate.
-        
-        Returns:
-            A tuple of the generated text and a dictionary of metadata.
-        """
-        run_metadata: Dict[str, Any] = {}
-        
-        if self.detailed_timing:
-            start_time = time.time()
-            prefill_start_event = torch.cuda.Event(enable_timing=True)
-            prefill_end_event = torch.cuda.Event(enable_timing=True)
-            decode_start_event = torch.cuda.Event(enable_timing=True)
-            decode_end_event = torch.cuda.Event(enable_timing=True)
-
-        # --- Stage 1: Load Oracle and Select Tokens ---
-        prompt_length = input_ids.shape[1]
-        oracle_data = self._load_oracle_ranking(oracle_model_for_path, dataset_name, sample_key)
-
-        if oracle_data is None:
-            raise RuntimeError(f"Failed to load oracle data for {dataset_name}/{sample_key}")
-
-        # Sanity check
-        oracle_input_ids = torch.from_numpy(oracle_data['input_ids']).to(self.device).unsqueeze(0)
-        if not torch.equal(input_ids, oracle_input_ids):
-            raise ValueError("Input IDs from prompt do not match Input IDs from the oracle file!")
-
-        ranking_scores = torch.from_numpy(oracle_data['ranking']).to(self.device)
-        num_to_keep = int(prompt_length * self.keep_percentage)
-
-        if num_to_keep >= prompt_length:
-            indices_to_keep = torch.arange(prompt_length, device=self.device, dtype=torch.long)
-        else:
-            _, top_k_indices = torch.topk(ranking_scores, k=num_to_keep, dim=-1)
-            indices_to_keep = torch.sort(top_k_indices).values
-        
-        selected_prompt_ids = input_ids[:, indices_to_keep]
-        
-        # This is the crucial step: use the original positions for RoPE.
-        selective_pos_ids = indices_to_keep.unsqueeze(0).to(torch.long)
-        
-        run_metadata["prompt_input_length"] = prompt_length
-        run_metadata["selective_prefill_kept_token_count"] = selected_prompt_ids.shape[1]
-        run_metadata["token_keep_rate"] = (selected_prompt_ids.shape[1] / prompt_length * 100.0) if prompt_length > 0 else 100.0
-
-        # --- Stage 2: Base Model Selective Prefill ---
-        if self.detailed_timing: prefill_start_event.record()
-
-        selective_cache_pos = torch.arange(selected_prompt_ids.shape[1], device=self.device)
-        base_out = self.base_model(
-            selected_prompt_ids,
-            position_ids=selective_pos_ids,
-            use_cache=True,
-            cache_position=selective_cache_pos
-        )
-        base_model_next_token_ids = torch.argmax(base_out.logits[:, -1, :], dim=-1, keepdim=True)
-        base_model_cache_after_prefill = base_out.past_key_values
-
-        if self.detailed_timing:
-            prefill_end_event.record()
-            torch.cuda.synchronize()
-            run_metadata["base_prefill_time"] = prefill_start_event.elapsed_time(prefill_end_event) / 1000.0
-            run_metadata["ttft"] = run_metadata["base_prefill_time"]
-            decode_start_event.record()
-
-
-        # --- Stage 3: Base Model Generation (Decoding) ---
-        gen_token_ids_list: List[int] = []
-        if base_model_next_token_ids is not None and base_model_cache_after_prefill is not None:
-            first_gen_token_id = base_model_next_token_ids.item()
-            gen_token_ids_list.append(first_gen_token_id)
+    def generate(self, inputs: Dict[str, torch.Tensor], max_gen: int) -> Optional[torch.Tensor]:
+        self._patch_model()
+        try:
+            input_ids = inputs['input_ids']
+            prompt_length = input_ids.shape[1]
             
-            current_decode_tokens = base_model_next_token_ids
-            current_decode_kv_cache = DynamicCache.from_legacy_cache(base_model_cache_after_prefill)
+            # --- Stage 1: Prompt Prefill ---
+            # is_generating_oracle_answer is False, so patch captures Q of last prompt token
+            self.is_generating_oracle_answer = False
+            prefill_out = self.model(input_ids=input_ids, use_cache=True, cache_position=torch.arange(prompt_length, device=self.device))
+            prefill_cache = prefill_out.past_key_values
+            
+            if isinstance(prefill_cache, tuple): prefill_cache = DynamicCache.from_legacy_cache(prefill_cache)
+            prompt_only_cache_tuple = prefill_cache.to_legacy_cache()
+            
+            current_tokens = torch.argmax(prefill_out.logits[:, -1, :], dim=-1, keepdim=True)
+            current_cache = prefill_cache
 
-            if first_gen_token_id not in self.eos_token_ids:
-                # The generation must continue from the position of the LAST token in the original sequence
-                # that we kept, not from the length of the compressed cache.
-                start_pos_for_generation = (selective_pos_ids[0, -1] + 1).item() if selective_pos_ids.numel() > 0 else 0
+            # --- Stage 2: Oracle Answer Generation ---
+            # is_generating_oracle_answer is True, so patch captures Q of each generated token
+            self.is_generating_oracle_answer = True
+            for i in range(max_gen):
+                if current_tokens.item() in self.eos_token_ids: break
 
-                for i in range(max_generation_length - 1):
-                    current_cache_len = current_decode_kv_cache.get_seq_length(0)
-                    
-                    # Position IDs for generation continue from the original sequence
-                    pos_ids = torch.tensor([[start_pos_for_generation + i]], device=self.device, dtype=torch.long)
-                    decode_cache_pos = torch.tensor([current_cache_len], device=self.device)
-                    
-                    decode_out = self.base_model(
-                        current_decode_tokens,
-                        position_ids=pos_ids,
-                        past_key_values=current_decode_kv_cache,
-                        use_cache=True,
-                        cache_position=decode_cache_pos
-                    )
+                cache_len = current_cache.get_seq_length(0)
+                pos_ids = torch.tensor([[cache_len]], device=self.device)
+                decode_cache_pos = torch.tensor([cache_len], device=self.device)
+                
+                decode_out = self.model(input_ids=current_tokens, position_ids=pos_ids, past_key_values=current_cache, use_cache=True, cache_position=decode_cache_pos)
+                
+                current_cache = decode_out.past_key_values
+                if isinstance(current_cache, tuple): current_cache = DynamicCache.from_legacy_cache(current_cache)
+                current_tokens = torch.argmax(decode_out.logits[:, -1, :], dim=-1, keepdim=True)
 
-                    next_tokens = torch.argmax(decode_out.logits[:, -1, :], dim=-1, keepdim=True)
-                    gen_token_ids_list.append(next_tokens.item())
-                    current_decode_kv_cache = DynamicCache.from_legacy_cache(decode_out.past_key_values)
-                    current_decode_tokens = next_tokens
+            raw_qk_scores = self._compute_raw_qk_scores(prompt_only_cache_tuple)
+            self._token_importance_from_attn_scores(raw_qk_scores)
 
-                    if gen_token_ids_list[-1] in self.eos_token_ids:
-                        break
+        finally:
+            self._unpatch_model()
+            self.captured_qs.clear()
 
-        if self.detailed_timing:
-            decode_end_event.record()
-            torch.cuda.synchronize()
-            run_metadata["decode_time"] = decode_start_event.elapsed_time(decode_end_event) / 1000.0
-            run_metadata["total_time"] = time.time() - start_time
+        return self.token_importance_scores
 
-        final_gen_text = self.tokenizer.decode(gen_token_ids_list, skip_special_tokens=True)
-        return final_gen_text, run_metadata
-
+def build_chat(tokenizer: AutoTokenizer, prompt: str, model_name: str) -> str:
+    messages = [{"role": "user", "content": prompt}]
+    return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
 
 def main():
-    parser = argparse.ArgumentParser(description="Run KV Cache compression using pre-computed Oracle rankings.",
-                                     formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    parser.add_argument("--base_model_name", type=str, default="meta-llama/Llama-3.1-8B-Instruct")
-    parser.add_argument("--oracle_rankings_path", type=str, default="analysis_results/oracles", help="Path to the root directory of oracle .npz files.")
-    parser.add_argument("--dataset_name", type=str, default="qasper", help="Name of the LongBench dataset to test.")
-    parser.add_argument("--sample_idx_in_file", type=int, default=0, help="The index of the sample to use from the dataset's oracle file.")
-    parser.add_argument("--keep_percentage", type=float, default=0.05, help="Percentage of prompt tokens to keep for prefill (e.g., 0.05 for 5%).")
-    parser.add_argument("--max_generation_length", type=int, default=128, help="Maximum number of tokens to generate.")
-    parser.add_argument("--max_prompt_len", type=int, default=8192, help="Maximum prompt length to consider.")
+    parser = argparse.ArgumentParser(description="Generate Answer-Informed Oracle Rankings.")
+    parser.add_argument("--model", type=str, required=True)
+    parser.add_argument("--datasets", nargs='+', required=True)
+    parser.add_argument("--num_samples", type=int, default=15)
+    parser.add_argument("--max_len", type=int, default=128000)
+    parser.add_argument("--max_gen", type=int, default=256)
+    parser.add_argument("--output_dir", type=str, default="analysis_results/oracles")
     
+    # New arguments for pooling
+    parser.add_argument("--pool_kernel_size", type=int, default=13)
+    parser.add_argument("--pool_type", type=str, default="avgpool", choices=['avgpool', 'maxpool', 'none'])
+
     args = parser.parse_args()
     
-    tokenizer = AutoTokenizer.from_pretrained(args.base_model_name, trust_remote_code=True)
-    if tokenizer.pad_token is None and tokenizer.eos_token is not None:
-        tokenizer.pad_token = tokenizer.eos_token
-        
-    pipeline = OraclePrefillPipeline(
-        base_model_name=args.base_model_name,
-        tokenizer=tokenizer,
-        oracle_rankings_path=args.oracle_rankings_path,
-        keep_percentage=args.keep_percentage,
-    )
+    set_seed(42)
+    os.makedirs(args.output_dir, exist_ok=True)
+    
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    project_root = os.path.abspath(os.path.join(script_dir, '..'))
+    dataset2prompt_path = os.path.join(project_root, 'eval/longbench/config/dataset2prompt.json')
 
-    # --- Load Prompt and Find Sample Key ---
-    try:
-        # Construct path relative to this script's location
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        project_root = os.path.abspath(os.path.join(script_dir, '..', '..'))
-        prompt_config_path = os.path.join(project_root, 'eval', 'longbench', 'config', 'dataset2prompt.json')
-        
-        with open(prompt_config_path, "r") as f:
-            dataset2prompt = json.load(f)
-        
-        data = load_dataset('THUDM/LongBench', args.dataset_name, split='test', trust_remote_code=True)
-        
-        # Find the sample key corresponding to the desired index
-        oracle_file_path = os.path.join(args.oracle_rankings_path, args.base_model_name.replace('/', '_'), f"{args.dataset_name}.npz")
-        if not os.path.exists(oracle_file_path):
-            raise FileNotFoundError(f"Oracle file not found. Please generate it first: {oracle_file_path}")
-            
-        with np.load(oracle_file_path, allow_pickle=True) as f:
-            available_keys = sorted(f.files)
-        
-        if args.sample_idx_in_file >= len(available_keys):
-            raise IndexError(f"sample_idx_in_file {args.sample_idx_in_file} is out of bounds for {len(available_keys)} available samples.")
-        
-        target_sample_key = available_keys[args.sample_idx_in_file]
-        # The key is like 'sample_XX', so we extract the index XX
-        original_data_index = int(target_sample_key.split('_')[1])
-        sample = data[original_data_index]
-
-        raw_prompt = dataset2prompt[args.dataset_name].format(**sample)
-
-        # --- Corrected Prompt Formatting Logic ---
-        # This now matches the oracle generation script to ensure input_ids are identical.
-        datasets_without_chat_template = ["trec", "triviaqa", "samsum", "lsht", "lcc", "repobench-p"]
-        if args.dataset_name not in datasets_without_chat_template:
-            messages = [{"role": "user", "content": raw_prompt}]
-            final_prompt_text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-        else:
-            final_prompt_text = raw_prompt
-        # --- End of Corrected Logic ---
-
-    except (FileNotFoundError, IndexError, KeyError) as e:
-        print(f"Error loading data or prompt: {e}")
-        return
-
-    inputs = tokenizer(final_prompt_text, return_tensors="pt", truncation=True, max_length=args.max_prompt_len).to(pipeline.device)
-
-    print(f"\n--- Running Oracle Prefill Pipeline ---")
-    print(f"Base Model: {args.base_model_name}")
-    print(f"Dataset: {args.dataset_name} | Sample Key: {target_sample_key}")
-    print(f"Keep Percentage: {args.keep_percentage:.1%}")
-    print("-" * 43)
-
-    generated_text, run_metadata = pipeline.run(
-        input_ids=inputs.input_ids,
-        oracle_model_for_path=args.base_model_name,
-        dataset_name=args.dataset_name,
-        sample_key=target_sample_key,
-        max_generation_length=args.max_generation_length,
+    with open(dataset2prompt_path, "r") as f: dataset2prompt = json.load(f)
+    
+    tokenizer = AutoTokenizer.from_pretrained(args.model)
+    if tokenizer.pad_token is None: tokenizer.pad_token = tokenizer.eos_token
+    
+    model = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=torch.bfloat16, device_map="auto", attn_implementation="sdpa")
+    
+    generator = OracleGenerator(
+        model, tokenizer,
+        pool_kernel_size=args.pool_kernel_size if args.pool_type != 'none' else None,
+        pool_type=args.pool_type
     )
     
-    print(f"\n--- Generated Text ---")
-    print(generated_text)
-    print("-" * 22)
+    model_name_sanitized = args.model.replace('/', '_')
 
-    print("\n--- Performance Metrics ---")
-    print(f"Prompt Length (Original): {run_metadata.get('prompt_input_length', 'N/A')} tokens")
-    print(f"Kept for Prefill (Compressed): {run_metadata.get('selective_prefill_kept_token_count', 'N/A')} tokens")
-    print(f"Token Keep Rate: {run_metadata.get('token_keep_rate', 0):.2f}%")
-    print(f"Time to First Token (TTFT): {run_metadata.get('ttft', 0):.4f} seconds")
-    print(f"  - Base Model Prefill Time: {run_metadata.get('base_prefill_time', 0):.4f} s")
-    print(f"Decoding Time: {run_metadata.get('decode_time', 0):.4f} seconds")
-    print(f"Total Pipeline Time: {run_metadata.get('total_time', 0):.4f} seconds")
-    print("-" * 27)
+    for dataset_name in args.datasets:
+        print(f"\n--- Processing Oracle for Dataset: {dataset_name.upper()} ---")
+        if dataset_name not in dataset2prompt:
+            print(f"Warning: No prompt format found for {dataset_name}. Skipping.")
+            continue
+        
+        # --- File I/O setup ---
+        dataset_output_dir = os.path.join(args.output_dir, model_name_sanitized)
+        os.makedirs(dataset_output_dir, exist_ok=True)
+        # Using .npz for efficient, appendable-like storage
+        output_path = os.path.join(dataset_output_dir, f"{dataset_name}.npz")
+        
+        # Load existing data if file exists to append new samples
+        try:
+            existing_data = dict(np.load(output_path, allow_pickle=True))
+            print(f"Loaded {len(existing_data)} existing samples from {output_path}. Will append new samples.")
+        except FileNotFoundError:
+            existing_data = {}
+        # --- End File I/O setup ---
 
+        data = load_dataset('THUDM/LongBench', dataset_name, split='test', trust_remote_code=True)
+        processed_count = 0
+
+        for i, sample in enumerate(data):
+            if processed_count >= args.num_samples: break
+            sample_key = f'sample_{i}'
+
+            if sample_key in existing_data:
+                print(f"Skipping already processed sample {i}.")
+                processed_count += 1
+                continue
+
+            try:
+                raw_prompt = dataset2prompt[dataset_name].format(**sample)
+            except KeyError:
+                continue
+
+            datasets_without_chat_template = ["trec", "triviaqa", "samsum", "lsht", "lcc", "repobench-p"]
+            if dataset_name not in datasets_without_chat_template:
+                final_prompt_text = build_chat(tokenizer, raw_prompt, args.model)
+            else:
+                final_prompt_text = raw_prompt
+
+            inputs = tokenizer(final_prompt_text, return_tensors="pt").to(model.device)
+            prompt_len = inputs.input_ids.shape[1]
+
+            if prompt_len > args.max_len:
+                continue
+
+            print(f"Processing sample {i} ({processed_count + 1}/{args.num_samples}) for {dataset_name} ({prompt_len} tokens)...")
+            
+            oracle_ranking_tensor = generator.generate(inputs, args.max_gen)
+            
+            if oracle_ranking_tensor is not None and oracle_ranking_tensor.numel() > 0:
+                assert oracle_ranking_tensor.shape[1] == prompt_len, \
+                    f"Sample {i}: Mismatch! Oracle ranking len {oracle_ranking_tensor.shape[1]} vs Input len {prompt_len}"
+
+                # We store a dictionary per sample key in the .npz file
+                # The dictionary itself contains the numpy arrays.
+                # This is a bit of a workaround to store structured data in .npz
+                sample_data = {
+                    'ranking': oracle_ranking_tensor.squeeze(0).cpu().to(torch.float32).numpy(),
+                    'input_ids': inputs.input_ids.squeeze(0).cpu().numpy(),
+                }
+                existing_data[sample_key] = np.array(sample_data) # Store dict as a 0-d array of objects
+
+                # Save after each sample for robustness
+                np.savez_compressed(output_path, **existing_data)
+                
+                processed_count += 1
+            else:
+                print(f"  -> Warning: Failed to generate a valid oracle ranking for sample {i}.")
+
+            if torch.cuda.is_available(): torch.cuda.empty_cache()
+            
+        print(f"\nSaved/Updated oracle results for {dataset_name} to {output_path}")
+    
 if __name__ == "__main__":
     main()
