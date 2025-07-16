@@ -11,7 +11,6 @@ import torch
 from scipy.stats import gaussian_kde
 from transformers import AutoTokenizer
 
-# Use relative import for package structure
 from .viz_utils import set_publication_style, METHOD_COLORS
 
 def load_npz_data_for_dataset(base_path, model_name, dataset_name):
@@ -28,9 +27,8 @@ def get_top_k_indices(scores, k, max_index=None):
     _, top_k_indices = torch.topk(scores, k=k)
     return top_k_indices
 
-def print_token_text(tokenizer, all_indices, all_tokens, num_tokens_to_print=300):
+def print_token_text(tokenizer, all_indices, all_tokens, num_tokens_to_print=512):
     print("\n" + "="*80 + "\nQualitative Deep Dive: Text of Top-Selected Tokens\n" + "="*80 + "\n")
-    # ... (rest of the function is unchanged)
     canonical_order = ['Oracle', 'FastKV (Layer 15)', 'GemFilter (Layer 13)']
     actual_speculative_key = next((key for key in all_indices if key.startswith('Speculative Prefill')), None)
     if actual_speculative_key: canonical_order.append(actual_speculative_key)

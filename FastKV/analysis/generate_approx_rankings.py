@@ -69,7 +69,7 @@ class FastKVRankingGenerator(BaseRankingGenerator):
             scoring_queries = query_states[..., -self.args.window_size:, :].detach()
             key_states_for_scoring = hf_repeat_kv(key_states, num_kv_groups).detach()
             attn_logits = torch.matmul(scoring_queries, key_states_for_scoring.transpose(2, 3)) / math.sqrt(head_dim)
-            attn_probs = F.softmax(attn_logits, dim=-1, dtype=torch.float32)
+            attn_probs = F.softmax(attn_logits, dim=-1, dtype=torch.bfloat16)
             token_scores = attn_probs[..., :, :-self.args.window_size].sum(dim=-2)
 
             if self.args.pooling != "none":
@@ -287,7 +287,7 @@ class SpeculativeRankingGenerator(BaseRankingGenerator):
             raise NotImplementedError("Batch size > 1 is not supported for speculative ranking.")
         
         # Softmax over the prompt length dimension
-        probs = F.softmax(attn_scores, dim=-1, dtype=torch.float32)
+        probs = F.softmax(attn_scores, dim=-1, dtype=torch.bfloat16)
 
         # Permute to [B, N_gen, S_prompt, L, H] for easier aggregation
         probs = probs.permute(0, 3, 4, 1, 2)
