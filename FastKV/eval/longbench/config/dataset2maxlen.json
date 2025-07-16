@@ -11,7 +11,7 @@
     "qmsum": 512,
     "multi_news": 512,
     "vcsum": 512,
-    "trec": 64,
+    "trec": 4,
     "triviaqa": 32,
     "samsum": 128,
     "lsht": 64,

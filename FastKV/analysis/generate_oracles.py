@@ -1,6 +1,5 @@
 import os
 import argparse
-import pickle
 import json
 from typing import List, Dict, Tuple, Optional, Any
 
@@ -90,7 +89,6 @@ class OracleGenerator:
         self.dtype = self.model.dtype
         self.eos_token_ids = self._extract_eos_token_ids()
         
-        # New parameters for feature parity
         self.pool_kernel_size = pool_kernel_size
         self.pool_type = pool_type.lower()
         self._validate_pooling_config()
@@ -126,7 +124,6 @@ class OracleGenerator:
             if hasattr(layer, 'self_attn') and isinstance(layer.self_attn, LlamaAttention):
                 attn_module = layer.self_attn
                 if i not in self.orig_fwds: self.orig_fwds[i] = attn_module.forward
-                # Add layer_idx for the patch to use
                 setattr(attn_module, "layer_idx", i)
                 attn_module.forward = types.MethodType(partial(_patched_attention_forward_oracle, oracle_generator=self), attn_module)
                 num_patched_layers += 1
@@ -138,47 +135,48 @@ class OracleGenerator:
                 layer.self_attn.forward = self.orig_fwds[i]
         self.orig_fwds.clear()
 
-    def _token_importance_from_attn_scores(self, attention_scores: torch.Tensor):
-        if attention_scores.numel() == 0:
+    def _token_importance_from_attn_scores(self, attn_scores: torch.Tensor):
+        if attn_scores.numel() == 0:
             self.token_importance_scores = None
             return
-            
-        # attention_scores shape: [batch, num_layers, num_heads, num_gen_tokens, prompt_len]
-        # We need to process this to match the pooling logic
-        attention_scores = attention_scores.permute(0, 3, 1, 2, 4) 
-        # New shape: [batch, num_gen_tokens, num_layers, num_heads, prompt_len]
-        
-        bs, num_gen_tokens, num_layers, num_heads, prompt_len = attention_scores.shape
-        if bs != 1: raise NotImplementedError("Batch size > 1 is not supported.")
-        
-        probs = F.softmax(attention_scores, dim=-1, dtype=torch.float16)
 
-        if self.pool_kernel_size and self.pool_type != 'none':
-            # Reshape for pooling: combine batch, gen_tokens, layers, heads
-            # Shape becomes [(bs * num_gen_tokens * num_layers * num_heads), prompt_len]
-            reshaped_for_pooling = probs.flatten(0, 3) 
+        # Input shape: [batch_size, num_layers, num_heads, num_gen_tokens, prompt_len]
+        bs, num_layers, num_heads, num_gen_tokens, prompt_len = attn_scores.shape
+
+        if bs != 1:
+            raise NotImplementedError("Batch size > 1 is not supported for oracle generation.")
+        
+        # Softmax over the prompt length dimension
+        probs = F.softmax(attn_scores, dim=-1, dtype=torch.float32)
+
+        # Permute to [B, N_gen, S_prompt, L, H] for easier aggregation
+        probs = probs.permute(0, 3, 4, 1, 2)
+
+        # Step 1: Max-aggregation over Layers and Heads
+        peak_importance, _ = torch.max(torch.max(probs, dim=-1)[0], dim=-1)
+        # Shape: [B, N_gen, S_prompt]
+
+        # Step 2: Mean-aggregation over generated tokens
+        mean_importance = torch.mean(peak_importance, dim=1)
+        # Shape: [B, S_prompt]
+
+        # Step 3 (Optional): 1D pooling on the final aggregated scores
+        final_scores = mean_importance
+        kernel_size = self.pool_kernel_size
+        if kernel_size and prompt_len >= kernel_size:
+            scores_for_pooling = final_scores.unsqueeze(1) # Add channel dim
             
-            padding = (self.pool_kernel_size - 1) // 2
             pool_fn = F.avg_pool1d if self.pool_type == 'avgpool' else F.max_pool1d
             
-            # Pool along the prompt_len dimension
-            pooled_tensor = pool_fn(reshaped_for_pooling.unsqueeze(1), kernel_size=self.pool_kernel_size, stride=1, padding=padding).squeeze(1)
-            
-            # Reshape back
-            processed_scores = pooled_tensor.reshape(bs, num_gen_tokens, num_layers, num_heads, prompt_len)
-        else:
-            processed_scores = probs
-
-        # Flatten layers and heads for max operation
-        # New shape: [bs, num_gen_tokens, (num_layers * num_heads), prompt_len]
-        flattened_scores = processed_scores.flatten(2, 3)
-        max_scores, _ = flattened_scores.max(2) # Max over layers and heads
+            pooled_scores = pool_fn(
+                scores_for_pooling,
+                kernel_size=kernel_size,
+                stride=1,
+                padding=kernel_size // 2
+            )
+            final_scores = pooled_scores.squeeze(1)
         
-        # Mean over generated tokens
-        final_token_importance = max_scores.mean(1) # Mean over num_gen_tokens
-        
-        self.token_importance_scores = final_token_importance.to(self.dtype)
-
+        self.token_importance_scores = final_scores.to(self.dtype)
 
     def _compute_raw_qk_scores(self, prompt_only_cache_tuple: Tuple[Tuple[torch.Tensor, torch.Tensor], ...]) -> torch.Tensor:
         if not self.captured_qs or not any(self.captured_qs): return torch.empty(0)
@@ -197,6 +195,7 @@ class OracleGenerator:
             all_layer_scores.append(attn_logits)
         if not all_layer_scores: return torch.empty(0)
         
+        # Shape: [batch_size, num_layers, num_heads, num_gen_tokens, prompt_len]
         return torch.stack(all_layer_scores, dim=1)
 
     @torch.no_grad()
@@ -219,8 +218,9 @@ class OracleGenerator:
 
         # --- Stage 2: Oracle Answer Generation ---
         self.is_generating_oracle_answer = True
-        for i in range(max_gen):
-            if current_tokens.item() in self.eos_token_ids: break
+        generated_token_ids = [current_tokens.item()]
+        for i in range(max_gen - 1):
+            if generated_token_ids[-1] in self.eos_token_ids: break
 
             cache_len = current_cache.get_seq_length(0)
             pos_ids = torch.tensor([[cache_len]], device=self.device)
@@ -230,8 +230,17 @@ class OracleGenerator:
             
             current_cache = decode_out.past_key_values
             if isinstance(current_cache, tuple): current_cache = DynamicCache.from_legacy_cache(current_cache)
+            
             current_tokens = torch.argmax(decode_out.logits[:, -1, :], dim=-1, keepdim=True)
+            generated_token_ids.append(current_tokens.item())
 
+        # --- Sanity Check: Print the generated oracle answer ---
+        oracle_text = self.tokenizer.decode(generated_token_ids, skip_special_tokens=True)
+        print("\n" + "="*25 + " Oracle Answer " + "="*25)
+        print(f"Generated {len(generated_token_ids)} tokens (max_gen={max_gen}): \n\033[94m{oracle_text}\033[00m")
+        print("="*67 + "\n")
+        
+        # --- Score Calculation ---
         raw_qk_scores = self._compute_raw_qk_scores(prompt_only_cache_tuple)
         self._token_importance_from_attn_scores(raw_qk_scores)
 
@@ -250,10 +259,8 @@ def main():
     parser.add_argument("--datasets", nargs='+', required=True)
     parser.add_argument("--num_samples", type=int, default=15)
     parser.add_argument("--max_len", type=int, default=128000)
-    parser.add_argument("--max_gen", type=int, default=256)
     parser.add_argument("--output_dir", type=str, default="analysis_results/oracles")
     
-    # New arguments for pooling
     parser.add_argument("--pool_kernel_size", type=int, default=13)
     parser.add_argument("--pool_type", type=str, default="avgpool", choices=['avgpool', 'maxpool', 'none'])
 
@@ -262,11 +269,18 @@ def main():
     set_seed(42)
     os.makedirs(args.output_dir, exist_ok=True)
     
+    # Correctly locate config files relative to the script's location
+    # analysis/generate_oracles.py -> project_root/
     script_dir = os.path.dirname(os.path.abspath(__file__))
     project_root = os.path.abspath(os.path.join(script_dir, '..'))
+    
     dataset2prompt_path = os.path.join(project_root, 'eval/longbench/config/dataset2prompt.json')
+    dataset2maxlen_path = os.path.join(project_root, 'eval/longbench/config/dataset2maxlen.json')
 
-    with open(dataset2prompt_path, "r") as f: dataset2prompt = json.load(f)
+    with open(dataset2prompt_path, "r") as f:
+        dataset2prompt = json.load(f)
+    with open(dataset2maxlen_path, "r") as f:
+        dataset2maxlen = json.load(f)
     
     tokenizer = AutoTokenizer.from_pretrained(args.model)
     if tokenizer.pad_token is None: tokenizer.pad_token = tokenizer.eos_token
@@ -286,13 +300,21 @@ def main():
         if dataset_name not in dataset2prompt:
             print(f"Warning: No prompt format found for {dataset_name}. Skipping.")
             continue
+
+        # Look up max_gen for the dataset, with a fallback
+        max_gen = dataset2maxlen.get(dataset_name)
+        if max_gen is None:
+            print(f"Warning: No max_gen found for {dataset_name}. Using default of 256.")
+            max_gen = 256
         
         dataset_output_dir = os.path.join(args.output_dir, model_name_sanitized)
         os.makedirs(dataset_output_dir, exist_ok=True)
         output_path = os.path.join(dataset_output_dir, f"{dataset_name}.npz")
         
-        existing_data = dict(np.load(output_path, allow_pickle=True))
-        print(f"Loaded {len(existing_data)} existing samples from {output_path}. Will append new samples.")
+        if os.path.exists(output_path):
+            existing_data = dict(np.load(output_path, allow_pickle=True))
+        else:
+            existing_data = {}
 
         data = load_dataset('THUDM/LongBench', dataset_name, split='test', trust_remote_code=True)
         processed_count = 0
@@ -322,7 +344,7 @@ def main():
 
             print(f"Processing sample {i} ({processed_count + 1}/{args.num_samples}) for {dataset_name} ({prompt_len} tokens)...")
             
-            oracle_ranking_tensor = generator.generate(inputs, args.max_gen)
+            oracle_ranking_tensor = generator.generate(inputs, max_gen)
             
             if oracle_ranking_tensor is not None and oracle_ranking_tensor.numel() > 0:
                 assert oracle_ranking_tensor.shape[1] == prompt_len, \
