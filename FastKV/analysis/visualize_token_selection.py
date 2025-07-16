@@ -12,17 +12,8 @@ import torch
 from scipy.stats import gaussian_kde
 from transformers import AutoTokenizer
 
-# --- Plotting Style ---
-sns.set_theme(style="whitegrid")
-plt.rcParams.update({
-    'font.family': 'serif',
-    'font.size': 14,
-    'axes.labelsize': 16,
-    'axes.titlesize': 18,
-    'xtick.labelsize': 12,
-    'ytick.labelsize': 12,
-    'legend.fontsize': 14,
-})
+# Import from common visualization utility
+from .viz_utils import set_publication_style
 
 def load_npz_data_for_dataset(base_path: str, model_name_sanitized: str, dataset_name: str) -> Dict[str, Any]:
     """Loads all samples from a single .npz file for a given dataset. Exits on failure."""
@@ -44,7 +35,6 @@ def get_top_k_indices(scores: torch.Tensor, k: int, max_index: Optional[int] = N
     if max_index is not None:
         if len(scores) < max_index:
             raise ValueError(f"Score tensor length ({len(scores)}) is less than max_index ({max_index}). This should not happen for valid methods.")
-        # First, limit the scores to the valid range BEFORE finding the top-k.
         scores = scores[:max_index]
 
     if scores.numel() < k:
@@ -63,21 +53,19 @@ def plot_selection_density(
     output_png_file: str
 ):
     """Creates a density plot showing the concentration of selected tokens."""
-    fig, ax = plt.subplots(figsize=(20, 6))
+    fig, ax = plt.subplots(figsize=(20, 7))
 
     # Define base properties and a canonical order for plotting
     method_properties = {
         'Oracle': {'color': '#2ca02c'},
         'FastKV (Layer 15)': {'color': '#d62728'},
         'GemFilter (Layer 13)': {'color': '#ff7f0e'},
-        'Speculative Prefill': {'color': '#1f77b4'}, # Generic key for base type
+        'Speculative Prefill': {'color': '#1f77b4'},
     }
     canonical_order = ['Oracle', 'FastKV (Layer 15)', 'GemFilter (Layer 13)', 'Speculative Prefill']
 
-    # Build a simple list of items to plot, ensuring the desired order
     items_to_plot = []
     for base_name in canonical_order:
-        # Handle the dynamic key of Speculative Prefill
         if base_name == 'Speculative Prefill':
             for key in all_indices.keys():
                 if key.startswith('Speculative Prefill'):
@@ -89,8 +77,7 @@ def plot_selection_density(
                         })
                     else:
                         print(f"Warning: Not enough data for '{key}' to plot density. Skipping.")
-                    break  # Found the one speculative key, move on
-        # Handle static keys
+                    break
         else:
             if base_name in all_indices:
                 if len(all_indices[base_name]) > 1:
@@ -104,13 +91,12 @@ def plot_selection_density(
     
     x_grid = np.linspace(0, sequence_length, 1000)
 
-    # Plot the items from the constructed list
     for item in items_to_plot:
         name, indices_np, color = item['name'], item['indices'], item['color']
         try:
             kde = gaussian_kde(indices_np, bw_method=0.03)
             density = kde(x_grid)
-            ax.plot(x_grid, density, color=color, label=name, linewidth=2.5)
+            ax.plot(x_grid, density, color=color, label=name)
             ax.fill_between(x_grid, density, color=color, alpha=0.2)
         except (np.linalg.LinAlgError, ValueError) as e:
             print(f"Warning: KDE failed for '{name}' ({e}). Falling back to histogram.")
@@ -147,18 +133,14 @@ def print_token_text(
     print("Qualitative Deep Dive: Text of Top-Selected Tokens (Compact)")
     print("="*80 + "\n")
 
-    # Define the desired print order, with Oracle first
     canonical_order = ['Oracle', 'FastKV (Layer 15)', 'GemFilter (Layer 13)']
     
-    # Find the actual speculative key to append it to the order
     actual_speculative_key = next((key for key in all_indices if key.startswith('Speculative Prefill')), None)
     if actual_speculative_key:
         canonical_order.append(actual_speculative_key)
 
-    # Build the final list of methods to print, respecting the canonical order
     methods_to_print = [name for name in canonical_order if name in all_indices]
     
-    # Add any other methods not in the canonical list (for robustness), sorted for consistency
     remaining_methods = sorted([key for key in all_indices if key not in methods_to_print])
     methods_to_print.extend(remaining_methods)
 
@@ -191,12 +173,14 @@ def print_token_text(
         print("  " + " | ".join(decoded_parts) + "\n")
 
 def main():
+    # Set the publication style at the beginning
+    set_publication_style()
+
     parser = argparse.ArgumentParser(
         description="Generates a deep dive density plot comparing token selection positions for a single sample.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
     
-    # --- Model Configuration ---
     TARGET_MODEL = 'meta-llama/Llama-3.1-8B-Instruct'
     DRAFT_MODEL = 'meta-llama/Llama-3.2-1B-Instruct'
 
@@ -217,39 +201,31 @@ def main():
     if not (0 < args.k_percentage <= 1):
         raise ValueError("--k_percentage must be between 0 and 1.")
 
-    # --- Create output directory ---
     output_dir = "figures"
     os.makedirs(output_dir, exist_ok=True)
     output_pdf_file = os.path.join(output_dir, f"{args.output_name}.pdf")
     output_png_file = os.path.join(output_dir, f"{args.output_name}.png")
 
-    # --- Strict Data Loading ---
-    print("Loading data with strict, fail-fast settings...")
     oracle_data = load_npz_data_for_dataset(MODELS['oracle']['base_path'], MODELS['oracle']['sanitized_name'], args.dataset)
     approx_target_data = load_npz_data_for_dataset(MODELS['approx_target']['base_path'], MODELS['approx_target']['sanitized_name'], args.dataset)
     approx_draft_data = load_npz_data_for_dataset(MODELS['approx_draft']['base_path'], MODELS['approx_draft']['sanitized_name'], args.dataset)
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_path)
 
-    # Find common sample keys across all three necessary files
     common_keys = sorted(list(set(oracle_data.keys()) & set(approx_target_data.keys()) & set(approx_draft_data.keys())))
     if not common_keys or args.sample_idx_in_file >= len(common_keys):
         raise IndexError(f"FATAL: Could not find a common sample at index {args.sample_idx_in_file} for dataset '{args.dataset}'.")
 
     target_sample_key = common_keys[args.sample_idx_in_file]
-    print(f"\nAnalyzing common sample with key: '{target_sample_key}' for dataset {args.dataset}")
 
-    # --- Data Extraction and Processing ---
     oracle_sample = oracle_data[target_sample_key]
     approx_target_sample = approx_target_data[target_sample_key]
     approx_draft_sample = approx_draft_data[target_sample_key]
     
-    # Unpickle relevant ranking dicts
     for data_dict in [approx_target_sample, approx_draft_sample]:
         for rank_type in ['fastkv_rankings', 'gemfilter_rankings', 'speculative_rankings']:
             if rank_type in data_dict and isinstance(data_dict[rank_type], bytes):
                 data_dict[rank_type] = pickle.loads(data_dict[rank_type])
 
-    # --- Define specific layers/k-values to analyze ---
     fastkv_layer, gemfilter_layer = 15, 13
     spec_k_candidates = [8, 4, 2, 1] 
     found_spec_k = None
@@ -258,11 +234,8 @@ def main():
     seq_len = len(input_ids)
     k_absolute = int(seq_len * args.k_percentage)
     
-    print(f"Sequence length: {seq_len}. Strictly selecting top {k_absolute} tokens ({args.k_percentage:.0%}) for comparison.")
-    
     all_indices = {}
 
-    # --- Get Top-K Indices (Strict) ---
     all_indices['Oracle'] = get_top_k_indices(torch.from_numpy(oracle_sample['ranking']).float(), k_absolute, max_index=seq_len)
 
     fastkv_rankings = approx_target_sample.get('fastkv_rankings', {})
@@ -288,7 +261,6 @@ def main():
     all_indices[f'Speculative Prefill (k={found_spec_k})'] = get_top_k_indices(scores, k_absolute, max_index=seq_len)
     print(f"Using Speculative Prefill with k={found_spec_k}.")
     
-    # --- Generate Outputs ---
     plot_selection_density(all_indices, seq_len, args.k_percentage, args.dataset, target_sample_key, output_pdf_file, output_png_file)
     print_token_text(tokenizer, all_indices, input_ids)
 

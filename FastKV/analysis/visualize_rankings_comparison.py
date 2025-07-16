@@ -11,29 +11,24 @@ import torch
 import math
 from typing import Dict, List, Any
 
-# --- Publication-Quality Plotting Style ---
-sns.set_theme(style="whitegrid")
-plt.rcParams.update({
-    'font.family': 'serif',
-    'font.size': 16,          # Base font size
-    'axes.labelsize': 20,     # X and Y labels
-    'axes.titlesize': 18,     # Subplot titles
-    'xtick.labelsize': 14,    # X-axis tick labels
-    'ytick.labelsize': 14,    # Y-axis tick labels
-    'legend.fontsize': 16,    # Legend text
-    'legend.title_fontsize': 18, # Legend title
-    'figure.titlesize': 24,   # Main figure title
-    'grid.linestyle': ':',
-    'grid.linewidth': 0.6,
-    'lines.linewidth': 2.5,   # Make lines slightly thicker
-    'lines.markersize': 7,    # Marker size
-})
+# Import from common visualization utility
+from .viz_utils import set_publication_style
 
-# --- Hardcoded Datasets and Names for the AAAI Publication Figure ---
-DATASETS_TO_PLOT = [
-    'narrativeqa', 'qasper', 'multifieldqa_en', 'hotpotqa', '2wikimqa', 'musique',
-    'gov_report', 'qmsum', 'multi_news', 'trec', 'triviaqa', 'samsum',
-    'passage_count', 'passage_retrieval_en', 'lcc', 'repobench-p'
+# --- Hardcoded Datasets and Names for the Publication Figure ---
+# Ordered by task as shown in the paper's table.
+TASK_ORDERED_DATASETS = [
+    # Single-Document QA
+    'narrativeqa', 'qasper', 'multifieldqa_en',
+    # Multi-Document QA
+    'hotpotqa', '2wikimqa', 'musique',
+    # Summarization
+    'gov_report', 'qmsum', 'multi_news',
+    # Few-shot Learning
+    'trec', 'triviaqa', 'samsum',
+    # Synthetic Task
+    'passage_count', 'passage_retrieval_en',
+    # Code Completion
+    'lcc', 'repobench-p'
 ]
 
 # Map for creating publication-ready names
@@ -175,43 +170,35 @@ def plot_grid_comparison(
 ):
     """Creates a high-quality, compact grid comparison plot for publication."""
     
-    print("Pre-calculating accuracies for sorting...")
+    print("Pre-calculating accuracies for all datasets...")
     all_mean_accuracies = {
-        ds: get_mean_accuracies(ds, all_results, k_percentage) for ds in DATASETS_TO_PLOT
+        ds: get_mean_accuracies(ds, all_results, k_percentage) for ds in TASK_ORDERED_DATASETS
     }
-    
-    def get_sort_key(dataset_name):
-        data = all_mean_accuracies.get(dataset_name, {})
-        if 'fastkv' in data and data['fastkv']:
-            return max(data['fastkv'].values())
-        return -1
-
-    sorted_datasets = sorted(DATASETS_TO_PLOT, key=get_sort_key, reverse=True)
     
     n_rows, n_cols = 4, 4
     fig, axes = plt.subplots(n_rows, n_cols, 
-                             figsize=(18, 16),
+                             figsize=(20, 20),
                              sharex=True, sharey=True,
-                             gridspec_kw={'hspace': 0.3, 'wspace': 0.1})
+                             gridspec_kw={'hspace': 0.45, 'wspace': 0.1})
     axes = axes.flatten()
 
     SPEC_K_POINTS = [1, 8, 32]
+    # Updated labels for clarity and consistency
     styles = {
-        '8B_fastkv':    {'color': '#d62728', 'linestyle': '-', 'marker': 'o', 'label': 'FastKV-style (8B)'},
-        '8B_gemfilter':   {'color': '#ff7f0e', 'linestyle': '-', 'marker': 's', 'label': 'GemFilter-style (8B)'},
+        '8B_fastkv':    {'color': '#d62728', 'linestyle': '-', 'marker': 'o', 'label': 'FastKV (8B)'},
+        '8B_gemfilter':   {'color': '#ff7f0e', 'linestyle': '-', 'marker': 's', 'label': 'GemFilter (8B)'},
         '1B_spec_32':     {'color': '#2ca02c', 'linestyle': (0, (5, 2, 1, 2)), 'label': 'Speculative (1B, k=32)'},
         '1B_spec_8':      {'color': '#1f77b4', 'linestyle': '--', 'label': 'Speculative (1B, k=8)'},
         '1B_spec_1':      {'color': '#9467bd', 'linestyle': ':', 'label': 'Speculative (1B, k=1)'},
     }
 
-    for i, dataset_name in enumerate(tqdm(sorted_datasets, desc="Plotting Grid")):
+    for i, dataset_name in enumerate(tqdm(TASK_ORDERED_DATASETS, desc="Plotting Grid")):
         ax = axes[i]
         dataset_accuracies = all_mean_accuracies.get(dataset_name, {})
-        n_samples = dataset_accuracies.get('common_keys_count', 0)
         pretty_name = DATASET_NAME_MAP.get(dataset_name, dataset_name)
         
-        if n_samples == 0:
-            ax.text(0.5, 0.5, f"{pretty_name}\n(No Data)", ha='center', va='center', style='italic', fontsize=14)
+        if not dataset_accuracies or dataset_accuracies.get('common_keys_count', 0) == 0:
+            ax.text(0.5, 0.5, f"{pretty_name}\n(No Data)", ha='center', va='center', style='italic', fontsize=16)
             ax.set_xticks([])
             ax.set_yticks([])
             continue
@@ -232,10 +219,12 @@ def plot_grid_comparison(
                 style_key = f'1B_spec_{k_point}'
                 ax.axhline(y=mean_acc_spec, **styles[style_key])
         
-        ax.set_title(f"{pretty_name} (n={n_samples})")
+        # Removed n=... from the title
+        ax.set_title(f"{pretty_name}")
 
-    fig.text(0.5, 0.06, 'Model Layer Index', ha='center', va='center', fontsize=22)
-    fig.text(0.06, 0.5, f'Top-{k_percentage:.0%} Retrieval Accuracy', ha='center', va='center', rotation='vertical', fontsize=22)
+    # Use larger font size for axis labels, set by rcParams
+    fig.text(0.5, 0.04, 'Model Layer Index', ha='center', va='center')
+    fig.text(0.04, 0.5, f'Top-{k_percentage:.0%} Retrieval Accuracy', ha='center', va='center', rotation='vertical')
     
     for ax in axes:
         ax.set_xlim(left=-1, right=32)
@@ -246,11 +235,11 @@ def plot_grid_comparison(
     handles = [plt.Line2D([0], [0], **{k:v for k,v in styles[key].items() if k != 'label'}) for key in legend_order_keys]
     labels = [styles[key]['label'] for key in legend_order_keys]
     
-    fig.legend(handles, labels, loc='lower center', bbox_to_anchor=(0.5, -0.02), ncol=5, title='Ranking Method', frameon=False)
+    fig.legend(handles, labels, loc='lower center', bbox_to_anchor=(0.5, 0.0), ncol=3, title='Ranking Method', frameon=False)
         
-    fig.suptitle(f'Comparison of Ranking Methods vs. Oracle (Top-{k_percentage:.0%} Kept)', y=0.98)
+    fig.suptitle(f'Comparison of Ranking Methods vs. Oracle (Top-{k_percentage:.0%} Kept)', y=0.97)
     
-    plt.tight_layout(rect=[0.08, 0.08, 1, 0.95]) 
+    plt.tight_layout(rect=[0.06, 0.08, 0.98, 0.95]) 
 
     plt.savefig(output_pdf_file, format='pdf', dpi=300, bbox_inches='tight')
     print(f"\nGrid plot saved to: {output_pdf_file}")
@@ -260,30 +249,30 @@ def plot_grid_comparison(
     plt.close(fig)
 
 def main():
+    # Set the publication style at the beginning
+    set_publication_style()
+
     parser = argparse.ArgumentParser(description="Visualize and compare ranking methods.")
     MODELS = {
         'oracle': {'sanitized_name': 'meta-llama_Llama-3.1-8B-Instruct', 'base_path': 'analysis_results/oracles'},
         '8B': {'sanitized_name': 'meta-llama_Llama-3.1-8B-Instruct', 'base_path': 'analysis_results/approx_rankings'},
         '1B': {'sanitized_name': 'meta-llama_Llama-3.2-1B-Instruct', 'base_path': 'analysis_results/approx_rankings'},
     }
-    # Datasets and output name are now hardcoded.
     parser.add_argument("--k_percentage", type=float, default=0.2, help="Percentage for top-k analysis.")
     args = parser.parse_args()
     
     if not (0 < args.k_percentage <= 1): raise ValueError("--k_percentage must be between 0 and 1.")
 
-    # --- Create output directory and hardcode filenames ---
     output_dir = "figures"
     os.makedirs(output_dir, exist_ok=True)
     output_pdf_file = os.path.join(output_dir, "ranking_comparison.pdf")
     output_png_file = os.path.join(output_dir, "ranking_comparison.png")
 
-    all_results = load_all_data(MODELS, DATASETS_TO_PLOT)
+    all_results = load_all_data(MODELS, TASK_ORDERED_DATASETS)
     if not all_results or 'oracle' not in all_results or '8B' not in all_results or '1B' not in all_results:
         print("Error: Missing data. Please ensure data files exist for all models.")
         return
 
-    # Call the grid plotting function with hardcoded paths
     plot_grid_comparison(
         all_results, 
         args.k_percentage, 
