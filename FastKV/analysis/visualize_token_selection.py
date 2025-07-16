@@ -59,27 +59,62 @@ def plot_selection_density(
     k_percentage: float,
     dataset_name: str,
     sample_key: str,
-    output_file: str
+    output_pdf_file: str,
+    output_png_file: str
 ):
     """Creates a density plot showing the concentration of selected tokens."""
     fig, ax = plt.subplots(figsize=(20, 6))
-    methods = {
-        'Oracle (Answer-Informed)': {'color': '#2ca02c'},
-        'FastKV-style (Layer 15)': {'color': '#d62728'},
-        'GemFilter-style (Layer 13)': {'color': '#ff7f0e'},
-        'Speculative-style (k=8)': {'color': '#1f77b4'},
+
+    # Define base properties and a canonical order for plotting
+    method_properties = {
+        'Oracle': {'color': '#2ca02c'},
+        'FastKV (Layer 15)': {'color': '#d62728'},
+        'GemFilter (Layer 13)': {'color': '#ff7f0e'},
+        'Speculative Prefill': {'color': '#1f77b4'}, # Generic key for base type
     }
+    canonical_order = ['Oracle', 'FastKV (Layer 15)', 'GemFilter (Layer 13)', 'Speculative Prefill']
+
+    # Build a simple list of items to plot, ensuring the desired order
+    items_to_plot = []
+    for base_name in canonical_order:
+        # Handle the dynamic key of Speculative Prefill
+        if base_name == 'Speculative Prefill':
+            for key in all_indices.keys():
+                if key.startswith('Speculative Prefill'):
+                    if len(all_indices[key]) > 1:
+                        items_to_plot.append({
+                            'name': key,
+                            'indices': all_indices[key].cpu().numpy(),
+                            'color': method_properties['Speculative Prefill']['color']
+                        })
+                    else:
+                        print(f"Warning: Not enough data for '{key}' to plot density. Skipping.")
+                    break  # Found the one speculative key, move on
+        # Handle static keys
+        else:
+            if base_name in all_indices:
+                if len(all_indices[base_name]) > 1:
+                    items_to_plot.append({
+                        'name': base_name,
+                        'indices': all_indices[base_name].cpu().numpy(),
+                        'color': method_properties[base_name]['color']
+                    })
+                else:
+                    print(f"Warning: Not enough data for '{base_name}' to plot density. Skipping.")
+    
     x_grid = np.linspace(0, sequence_length, 1000)
-    for name, props in methods.items():
-        if name in all_indices and len(all_indices[name]) > 1:
-            indices = all_indices[name].cpu().numpy()
-            try:
-                kde = gaussian_kde(indices, bw_method=0.03)
-                density = kde(x_grid)
-                ax.plot(x_grid, density, color=props['color'], label=name, linewidth=2.5)
-                ax.fill_between(x_grid, density, color=props['color'], alpha=0.2)
-            except np.linalg.LinAlgError:
-                ax.hist(indices, bins=min(100, sequence_length//10), density=True, color=props['color'], alpha=0.5, label=f"{name} (hist)")
+
+    # Plot the items from the constructed list
+    for item in items_to_plot:
+        name, indices_np, color = item['name'], item['indices'], item['color']
+        try:
+            kde = gaussian_kde(indices_np, bw_method=0.03)
+            density = kde(x_grid)
+            ax.plot(x_grid, density, color=color, label=name, linewidth=2.5)
+            ax.fill_between(x_grid, density, color=color, alpha=0.2)
+        except (np.linalg.LinAlgError, ValueError) as e:
+            print(f"Warning: KDE failed for '{name}' ({e}). Falling back to histogram.")
+            ax.hist(indices_np, bins=min(50, sequence_length//10), density=True, color=color, alpha=0.5, label=f"{name} (hist)")
 
     ax.set_xlabel('Token Position in Prompt')
     ax.set_ylabel('Density of Selected Tokens')
@@ -93,9 +128,13 @@ def plot_selection_density(
     title += f'Dataset: {dataset_name.replace("_", " ").title()} (Sequence Length: {sequence_length})'
     ax.set_title(title, pad=20)
     plt.tight_layout()
-    plt.savefig(output_file, dpi=300, bbox_inches='tight')
+    
+    plt.savefig(output_pdf_file, dpi=300, bbox_inches='tight')
+    print(f"\nSaved PDF to: {output_pdf_file}")
+    plt.savefig(output_png_file, dpi=300, bbox_inches='tight')
+    print(f"Saved PNG to: {output_png_file}")
+    
     plt.close(fig)
-    print(f"\nSaved to: {output_file}")
 
 def print_token_text(
     tokenizer: AutoTokenizer, 
@@ -108,8 +147,23 @@ def print_token_text(
     print("Qualitative Deep Dive: Text of Top-Selected Tokens (Compact)")
     print("="*80 + "\n")
 
-    for name, indices in all_indices.items():
-        # Updated header to show total selected tokens vs. printed tokens
+    # Define the desired print order, with Oracle first
+    canonical_order = ['Oracle', 'FastKV (Layer 15)', 'GemFilter (Layer 13)']
+    
+    # Find the actual speculative key to append it to the order
+    actual_speculative_key = next((key for key in all_indices if key.startswith('Speculative Prefill')), None)
+    if actual_speculative_key:
+        canonical_order.append(actual_speculative_key)
+
+    # Build the final list of methods to print, respecting the canonical order
+    methods_to_print = [name for name in canonical_order if name in all_indices]
+    
+    # Add any other methods not in the canonical list (for robustness), sorted for consistency
+    remaining_methods = sorted([key for key in all_indices if key not in methods_to_print])
+    methods_to_print.extend(remaining_methods)
+
+    for name in methods_to_print:
+        indices = all_indices[name]
         header = f"--- {name} (Showing top {min(len(indices), num_tokens_to_print)} of {len(indices)} selections, sorted by position) ---"
         print(header)
 
@@ -156,18 +210,23 @@ def main():
     parser.add_argument("--dataset", type=str, default='qasper', help="Dataset to analyze.")
     parser.add_argument("--sample_idx_in_file", type=int, default=0, help="The index of the sample to use from the list of common samples.")
     parser.add_argument("--k_percentage", type=float, default=0.1, help="Percentage for top-k analysis (e.g., 0.1 for top 10%).")
-    parser.add_argument("--output_file", type=str, default="token_selection_density_deep_dive.pdf", help="Path to save the output PDF plot.")
+    parser.add_argument("--output_name", type=str, default="token_selection_density_deep_dive", 
+                        help="Base name for the output plot files (e.g., 'my_plot' will generate 'my_plot.pdf' and 'my_plot.png').")
     args = parser.parse_args()
     
     if not (0 < args.k_percentage <= 1):
         raise ValueError("--k_percentage must be between 0 and 1.")
 
+    # --- Create output directory ---
+    output_dir = "figures"
+    os.makedirs(output_dir, exist_ok=True)
+    output_pdf_file = os.path.join(output_dir, f"{args.output_name}.pdf")
+    output_png_file = os.path.join(output_dir, f"{args.output_name}.png")
+
     # --- Strict Data Loading ---
     print("Loading data with strict, fail-fast settings...")
     oracle_data = load_npz_data_for_dataset(MODELS['oracle']['base_path'], MODELS['oracle']['sanitized_name'], args.dataset)
-    # FastKV/GemFilter come from the TARGET (8B) model's approx results
     approx_target_data = load_npz_data_for_dataset(MODELS['approx_target']['base_path'], MODELS['approx_target']['sanitized_name'], args.dataset)
-    # Speculative comes from the DRAFT (1B) model's approx results
     approx_draft_data = load_npz_data_for_dataset(MODELS['approx_draft']['base_path'], MODELS['approx_draft']['sanitized_name'], args.dataset)
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_path)
 
@@ -191,7 +250,9 @@ def main():
                 data_dict[rank_type] = pickle.loads(data_dict[rank_type])
 
     # --- Define specific layers/k-values to analyze ---
-    fastkv_layer, gemfilter_layer, spec_k = 15, 13, 8
+    fastkv_layer, gemfilter_layer = 15, 13
+    spec_k_candidates = [8, 4, 2, 1] 
+    found_spec_k = None
 
     input_ids = torch.from_numpy(oracle_sample['input_ids'])
     seq_len = len(input_ids)
@@ -202,29 +263,33 @@ def main():
     all_indices = {}
 
     # --- Get Top-K Indices (Strict) ---
-    # 1. Oracle Ranking (from TARGET model)
-    all_indices['Oracle (Answer-Informed)'] = get_top_k_indices(torch.from_numpy(oracle_sample['ranking']).float(), k_absolute, max_index=seq_len)
+    all_indices['Oracle'] = get_top_k_indices(torch.from_numpy(oracle_sample['ranking']).float(), k_absolute, max_index=seq_len)
 
-    # 2. FastKV-style Ranking (from TARGET model)
     fastkv_rankings = approx_target_sample.get('fastkv_rankings', {})
     if fastkv_layer not in fastkv_rankings: raise KeyError(f"FATAL: Layer {fastkv_layer} not found in FastKV rankings for TARGET model.")
     scores = torch.from_numpy(fastkv_rankings[fastkv_layer]).float()
-    all_indices['FastKV-style (Layer 15)'] = get_top_k_indices(scores, k_absolute, max_index=seq_len)
+    all_indices['FastKV (Layer 15)'] = get_top_k_indices(scores, k_absolute, max_index=seq_len)
     
-    # 3. GemFilter-style Ranking (from TARGET model)
     gemfilter_rankings = approx_target_sample.get('gemfilter_rankings', {})
     if gemfilter_layer not in gemfilter_rankings: raise KeyError(f"FATAL: Layer {gemfilter_layer} not found in GemFilter rankings for TARGET model.")
     scores = torch.from_numpy(gemfilter_rankings[gemfilter_layer]).float()
-    all_indices['GemFilter-style (Layer 13)'] = get_top_k_indices(scores, k_absolute, max_index=seq_len)
+    all_indices['GemFilter (Layer 13)'] = get_top_k_indices(scores, k_absolute, max_index=seq_len)
         
-    # 4. Speculative-style Ranking (from DRAFT model)
     spec_rankings = approx_draft_sample.get('speculative_rankings', {})
-    if spec_k not in spec_rankings: raise KeyError(f"FATAL: Lookahead k={spec_k} not found in Speculative rankings for DRAFT model.")
-    scores = torch.from_numpy(spec_rankings[spec_k]).float()
-    all_indices['Speculative-style (k=8)'] = get_top_k_indices(scores, k_absolute, max_index=seq_len)
+    for candidate_k in spec_k_candidates:
+        if candidate_k in spec_rankings:
+            found_spec_k = candidate_k
+            break
+    
+    if found_spec_k is None:
+        raise KeyError(f"FATAL: None of the speculative lookahead k values ({spec_k_candidates}) found in Speculative rankings for DRAFT model.")
+
+    scores = torch.from_numpy(spec_rankings[found_spec_k]).float()
+    all_indices[f'Speculative Prefill (k={found_spec_k})'] = get_top_k_indices(scores, k_absolute, max_index=seq_len)
+    print(f"Using Speculative Prefill with k={found_spec_k}.")
     
     # --- Generate Outputs ---
-    plot_selection_density(all_indices, seq_len, args.k_percentage, args.dataset, target_sample_key, args.output_file)
+    plot_selection_density(all_indices, seq_len, args.k_percentage, args.dataset, target_sample_key, output_pdf_file, output_png_file)
     print_token_text(tokenizer, all_indices, input_ids)
 
 if __name__ == "__main__":

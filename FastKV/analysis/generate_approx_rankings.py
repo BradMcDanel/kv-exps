@@ -1,5 +1,3 @@
-# analysis/generate_approx_rankings.py
-
 import argparse
 import json
 import math
@@ -187,14 +185,13 @@ def _patched_attention_forward_speculative(
     cos, sin = self_attn.rotary_emb(value_states_for_cache, position_ids=position_ids)
     query_states_rotated, key_states_rotated = hf_apply_rotary_pos_emb(query_states, key_states_before_rope, cos, sin, position_ids)
 
-    if not generator_obj.is_generating_speculatively:
-        pass
-    else: 
-        if query_length == 1:
-            generator_obj.captured_qs[self_attn.layer_idx].append(query_states_rotated.detach().clone())
+    # Only capture Qs during the speculative decoding phase
+    if generator_obj.is_generating_speculatively and query_length == 1:
+        generator_obj.captured_qs[self_attn.layer_idx].append(query_states_rotated.detach().clone())
 
+    # This past_key_value is updated IN-PLACE. The original `prompt_only_cache` is preserved outside.
     key_states_for_sdpa, value_states_for_sdpa = past_key_value.update(
-        key_states_rotated, value_states_for_cache, self_attn.layer_idx, cache_position
+        key_states_rotated, value_states_for_cache, self_attn.layer_idx, {"cache_position": cache_position}
     )
     key_states_for_sdpa = hf_repeat_kv(key_states_for_sdpa, num_key_value_groups)
     value_states_for_sdpa = hf_repeat_kv(value_states_for_sdpa, num_key_value_groups)
@@ -227,7 +224,7 @@ class SpeculativeRankingGenerator(BaseRankingGenerator):
         self._validate_pooling_config()
         self.captured_qs: List[List[torch.Tensor]] = []
         self.is_generating_speculatively = False
-        self.rankings: Dict[int, torch.Tensor] = {}
+        self.rankings: Dict[int, torch.Tensor] = {} # Keyed by k, value is the ranking tensor
 
     def _validate_pooling_config(self):
         if self.pool_type not in ['avgpool', 'maxpool', 'none']:
@@ -257,8 +254,6 @@ class SpeculativeRankingGenerator(BaseRankingGenerator):
                 attn_module.forward = types.MethodType(partial(_patched_attention_forward_speculative, generator_obj=self), attn_module)
 
     def _compute_raw_qk_scores(self, prompt_only_cache_tuple: Tuple[Tuple[torch.Tensor, torch.Tensor], ...]) -> torch.Tensor:
-        # The original `_compute_raw_qk_scores` already started with `prompt_only_cache.to_legacy_cache()`.
-        # We are just making the input type match what we will pass it. The body of the function can remain the same.
         if not self.captured_qs or not any(self.captured_qs): return torch.empty(0)
         
         num_layers = self.config.num_hidden_layers
@@ -275,32 +270,59 @@ class SpeculativeRankingGenerator(BaseRankingGenerator):
             all_q_for_layer = torch.cat(self.captured_qs[layer_idx], dim=2)
             attn_logits = torch.matmul(all_q_for_layer, key_prompt_layer_repeated.transpose(-1, -2)) / math.sqrt(head_dim)
             all_layer_scores.append(attn_logits)
-        return torch.stack(all_layer_scores, dim=1) if all_layer_scores else torch.empty(0)
+        if not all_layer_scores: return torch.empty(0)
 
-    def _token_importance_from_attn_scores(self, attention_scores: torch.Tensor):
-        if not attention_scores.numel(): return
-        attention_scores = attention_scores.permute(0, 3, 1, 2, 4) 
-        bs, num_gen_total, num_layers, num_heads, prompt_len = attention_scores.shape
-        if bs != 1: raise NotImplementedError("Batch size > 1 is not supported.")
+        # Shape: [batch_size, num_layers, num_heads, num_gen_tokens, prompt_len]
+        return torch.stack(all_layer_scores, dim=1)
+
+    def _token_importance_from_attn_scores(self, attn_scores: torch.Tensor):
+        # This function now mirrors the logic from the corrected oracle script.
+        if attn_scores.numel() == 0:
+            return
+
+        # Input shape: [batch_size, num_layers, num_heads, num_gen_tokens, prompt_len]
+        bs, num_layers, num_heads, num_gen_tokens, prompt_len = attn_scores.shape
+
+        if bs != 1:
+            raise NotImplementedError("Batch size > 1 is not supported for speculative ranking.")
         
-        probs = F.softmax(attention_scores, dim=-1, dtype=torch.float32)
+        # Softmax over the prompt length dimension
+        probs = F.softmax(attn_scores, dim=-1, dtype=torch.float32)
 
-        if self.pool_kernel_size and self.pool_type != 'none':
-            reshaped_for_pooling = probs.flatten(0, 3) 
-            padding = (self.pool_kernel_size - 1) // 2
-            pool_fn = F.avg_pool1d if self.pool_type == 'avgpool' else F.max_pool1d
-            pooled_tensor = pool_fn(reshaped_for_pooling.unsqueeze(1), kernel_size=self.pool_kernel_size, stride=1, padding=padding).squeeze(1)
-            processed_scores = pooled_tensor.reshape(bs, num_gen_total, num_layers, num_heads, prompt_len)
-        else:
-            processed_scores = probs
+        # Permute to [B, N_gen, S_prompt, L, H] for easier aggregation
+        probs = probs.permute(0, 3, 4, 1, 2)
 
+        # Step 1: Max-aggregation over Layers and Heads
+        peak_importance, _ = torch.max(torch.max(probs, dim=-1)[0], dim=-1)
+        # Shape: [B, N_gen, S_prompt]
+
+        # Now, calculate rankings for each 'k'
         for k in self.lookahead_k_values:
-            if k > num_gen_total: continue
-            scores_for_k = processed_scores[:, :k, :, :, :]
-            flattened_scores = scores_for_k.flatten(2, 3)
-            max_scores, _ = flattened_scores.max(2)
-            final_token_importance = max_scores.mean(1)
-            self.rankings[k] = final_token_importance.to(self.model.dtype).squeeze(0)
+            if k > num_gen_tokens:
+                continue
+            
+            # Step 2: Mean-aggregation over the first 'k' generated tokens
+            scores_for_k = peak_importance[:, :k, :]
+            mean_importance = torch.mean(scores_for_k, dim=1)
+            # Shape: [B, S_prompt]
+
+            # Step 3 (Optional): 1D pooling on the final aggregated scores
+            final_scores = mean_importance
+            kernel_size = self.pool_kernel_size
+            if kernel_size and prompt_len >= kernel_size:
+                scores_for_pooling = final_scores.unsqueeze(1) # Add channel dim
+                
+                pool_fn = F.avg_pool1d if self.pool_type == 'avgpool' else F.max_pool1d
+                
+                pooled_scores = pool_fn(
+                    scores_for_pooling,
+                    kernel_size=kernel_size,
+                    stride=1,
+                    padding=kernel_size // 2
+                )
+                final_scores = pooled_scores.squeeze(1)
+            
+            self.rankings[k] = final_scores.squeeze(0).to(self.model.dtype)
 
     @torch.no_grad()
     def generate_rankings(self, inputs: Dict[str, torch.Tensor]) -> Dict[int, torch.Tensor]:
@@ -308,35 +330,47 @@ class SpeculativeRankingGenerator(BaseRankingGenerator):
         if self.max_k == 0: return {}
         self._patch_model()
         try:
-            input_ids, prompt_length = inputs['input_ids'], inputs['input_ids'].shape[1]
+            input_ids = inputs['input_ids']
+            prompt_length = input_ids.shape[1]
+            
+            # --- Stage 1: Prompt Prefill ---
             self.is_generating_speculatively = False
             prefill_pos = torch.arange(prompt_length, device=self.device)
             prefill_out = self.model(input_ids=input_ids, use_cache=True, cache_position=prefill_pos)
-            past_kv = prefill_out.past_key_values
-
-            # --- REPLICATING THE ORACLE SCRIPT'S LOGIC ---
-            current_cache = DynamicCache.from_legacy_cache(past_kv) if isinstance(past_kv, tuple) else past_kv
-            prompt_only_cache_tuple = current_cache.to_legacy_cache() # This is the snapshot
-            # -----------------------------------------------
-
+            prefill_cache = prefill_out.past_key_values
+            
+            # **FIX**: Snapshot the prompt-only KV cache before speculative generation
+            if isinstance(prefill_cache, tuple): prefill_cache = DynamicCache.from_legacy_cache(prefill_cache)
+            prompt_only_cache_tuple = prefill_cache.to_legacy_cache()
+            
             current_tokens = torch.argmax(prefill_out.logits[:, -1, :], dim=-1, keepdim=True)
+            current_cache = prefill_cache
+
+            # --- Stage 2: Speculative Token Generation ---
             self.is_generating_speculatively = True
             for _ in range(self.max_k):
                 if current_tokens.item() in self.eos_token_ids: break
+                
                 cache_len = current_cache.get_seq_length(0)
                 pos_ids = torch.tensor([[cache_len]], device=self.device)
                 decode_cache_pos = torch.tensor([cache_len], device=self.device)
+                
                 decode_out = self.model(input_ids=current_tokens, position_ids=pos_ids, past_key_values=current_cache, use_cache=True, cache_position=decode_cache_pos)
+                
                 current_cache = decode_out.past_key_values
                 if isinstance(current_cache, tuple): current_cache = DynamicCache.from_legacy_cache(current_cache)
+                
                 current_tokens = torch.argmax(decode_out.logits[:, -1, :], dim=-1, keepdim=True)
             
-            # Pass the pristine tuple to the modified scoring function
+            # --- Stage 3: Score Calculation ---
+            # **FIX**: Pass the pristine prompt-only cache to the scoring function
             raw_qk_scores = self._compute_raw_qk_scores(prompt_only_cache_tuple)
             self._token_importance_from_attn_scores(raw_qk_scores)
+
         finally:
             self._unpatch_model()
             self.captured_qs.clear()
+        
         return self.rankings
 
 
@@ -393,8 +427,13 @@ def main():
         output_path = os.path.join(dataset_output_dir, f"{dataset_name}.npz")
 
         try:
-            existing_data = dict(np.load(output_path, allow_pickle=True))
+            # Added more specific exceptions for robustness
+            if os.path.exists(output_path):
+                existing_data = dict(np.load(output_path, allow_pickle=True))
+            else:
+                existing_data = {}
         except (FileNotFoundError, EOFError, zipfile.BadZipFile):
+            print(f"Warning: Could not load existing data from {output_path}. Starting fresh for this dataset.")
             existing_data = {}
 
         data = load_dataset('THUDM/LongBench', dataset_name, split='test', trust_remote_code=True)
@@ -403,7 +442,11 @@ def main():
         for i, sample in enumerate(data):
             if processed_count >= args.num_samples: break
             sample_key = f'sample_{i}'
-            if sample_key in existing_data: continue
+            # Check if this specific sample and all its ranking types are already done.
+            if sample_key in existing_data and all(f'{name}_rankings' in existing_data[sample_key].item() for name in generators):
+                 print(f"Skipping already fully processed sample {i}.")
+                 processed_count += 1
+                 continue
 
             try:
                 raw_prompt = dataset2prompt[dataset_name].format(**sample)
@@ -436,7 +479,7 @@ def main():
                 continue
 
             processed_count += 1
-            to_numpy = lambda d: {k: v.cpu().to(torch.float32).numpy() for k, v in d.items()} if d else {}
+            to_numpy = lambda d: {k: v.cpu().to(torch.float16).numpy() for k, v in d.items()} if d else {}
             
             sample_data = {'input_ids': inputs.input_ids.squeeze(0).cpu().numpy()}
             for name, ranks in all_rankings.items():

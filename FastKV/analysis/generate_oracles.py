@@ -344,14 +344,18 @@ def main():
 
             print(f"Processing sample {i} ({processed_count + 1}/{args.num_samples}) for {dataset_name} ({prompt_len} tokens)...")
             
-            oracle_ranking_tensor = generator.generate(inputs, max_gen)
+            try:
+                oracle_ranking_tensor = generator.generate(inputs, max_gen)
+            except:
+                print(f"  -> Error: Failed to generate oracle ranking for sample {i}. Skipping.")
+                continue
             
             if oracle_ranking_tensor is not None and oracle_ranking_tensor.numel() > 0:
                 assert oracle_ranking_tensor.shape[1] == prompt_len, \
                     f"Sample {i}: Mismatch! Oracle ranking len {oracle_ranking_tensor.shape[1]} vs Input len {prompt_len}"
 
                 sample_data = {
-                    'ranking': oracle_ranking_tensor.squeeze(0).cpu().to(torch.float32).numpy(),
+                    'ranking': oracle_ranking_tensor.squeeze(0).cpu().to(torch.float16).numpy(),
                     'input_ids': inputs.input_ids.squeeze(0).cpu().numpy(),
                 }
                 existing_data[sample_key] = np.array(sample_data) 
