@@ -51,19 +51,13 @@ def _patched_attention_forward_oracle(
     cos, sin = self_attn.rotary_emb(value_states_for_cache, position_ids=position_ids)
     query_states_rotated, key_states_rotated = hf_apply_rotary_pos_emb(query_states, key_states_before_rope, cos, sin, position_ids)
 
-    # --- CAPTURE LOGIC ---
-    # We capture the queries that will be used to generate the next tokens.
     if not oracle_generator.is_generating_oracle_answer:
-        # This is the prompt prefill pass. Capture the query of the LAST prompt token,
-        # as it's used to generate the FIRST answer token.
         if query_length > 1:
             last_q_vector = query_states_rotated[:, :, -1:, :].detach().clone()
             oracle_generator.captured_qs[self_attn.layer_idx].append(last_q_vector)
     else:
-        # This is the oracle answer generation pass. We are generating one token at a time.
         if query_length == 1:
             oracle_generator.captured_qs[self_attn.layer_idx].append(query_states_rotated.detach().clone())
-    # --- END CAPTURE LOGIC ---
 
     key_states_for_sdpa, value_states_for_sdpa = past_key_value.update(
         key_states_rotated, value_states_for_cache, self_attn.layer_idx, {"cache_position": cache_position}
@@ -117,7 +111,6 @@ class OracleGenerator:
             raise ValueError(f"pool_type is '{self.pool_type}', but pool_kernel_size is not specified.")
             
     def _extract_eos_token_ids(self) -> List[int]:
-        # (Implementation is unchanged)
         config_eos = self.config.eos_token_id
         if isinstance(config_eos, int): return [config_eos]
         if isinstance(config_eos, list): return list(config_eos)
@@ -158,7 +151,7 @@ class OracleGenerator:
         bs, num_gen_tokens, num_layers, num_heads, prompt_len = attention_scores.shape
         if bs != 1: raise NotImplementedError("Batch size > 1 is not supported.")
         
-        probs = F.softmax(attention_scores, dim=-1, dtype=torch.float32)
+        probs = F.softmax(attention_scores, dim=-1, dtype=torch.float16)
 
         if self.pool_kernel_size and self.pool_type != 'none':
             # Reshape for pooling: combine batch, gen_tokens, layers, heads
@@ -214,7 +207,6 @@ class OracleGenerator:
             prompt_length = input_ids.shape[1]
             
             # --- Stage 1: Prompt Prefill ---
-            # is_generating_oracle_answer is False, so patch captures Q of last prompt token
             self.is_generating_oracle_answer = False
             prefill_out = self.model(input_ids=input_ids, use_cache=True, cache_position=torch.arange(prompt_length, device=self.device))
             prefill_cache = prefill_out.past_key_values
@@ -226,7 +218,6 @@ class OracleGenerator:
             current_cache = prefill_cache
 
             # --- Stage 2: Oracle Answer Generation ---
-            # is_generating_oracle_answer is True, so patch captures Q of each generated token
             self.is_generating_oracle_answer = True
             for i in range(max_gen):
                 if current_tokens.item() in self.eos_token_ids: break
@@ -297,19 +288,15 @@ def main():
             print(f"Warning: No prompt format found for {dataset_name}. Skipping.")
             continue
         
-        # --- File I/O setup ---
         dataset_output_dir = os.path.join(args.output_dir, model_name_sanitized)
         os.makedirs(dataset_output_dir, exist_ok=True)
-        # Using .npz for efficient, appendable-like storage
         output_path = os.path.join(dataset_output_dir, f"{dataset_name}.npz")
         
-        # Load existing data if file exists to append new samples
         try:
             existing_data = dict(np.load(output_path, allow_pickle=True))
             print(f"Loaded {len(existing_data)} existing samples from {output_path}. Will append new samples.")
         except FileNotFoundError:
             existing_data = {}
-        # --- End File I/O setup ---
 
         data = load_dataset('THUDM/LongBench', dataset_name, split='test', trust_remote_code=True)
         processed_count = 0
@@ -348,16 +335,12 @@ def main():
                 assert oracle_ranking_tensor.shape[1] == prompt_len, \
                     f"Sample {i}: Mismatch! Oracle ranking len {oracle_ranking_tensor.shape[1]} vs Input len {prompt_len}"
 
-                # We store a dictionary per sample key in the .npz file
-                # The dictionary itself contains the numpy arrays.
-                # This is a bit of a workaround to store structured data in .npz
                 sample_data = {
                     'ranking': oracle_ranking_tensor.squeeze(0).cpu().to(torch.float32).numpy(),
                     'input_ids': inputs.input_ids.squeeze(0).cpu().numpy(),
                 }
-                existing_data[sample_key] = np.array(sample_data) # Store dict as a 0-d array of objects
+                existing_data[sample_key] = np.array(sample_data) 
 
-                # Save after each sample for robustness
                 np.savez_compressed(output_path, **existing_data)
                 
                 processed_count += 1
