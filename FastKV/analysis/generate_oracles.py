@@ -147,7 +147,7 @@ class OracleGenerator:
             raise NotImplementedError("Batch size > 1 is not supported for oracle generation.")
         
         # Softmax over the prompt length dimension
-        probs = F.softmax(attn_scores, dim=-1, dtype=torch.float32)
+        probs = F.softmax(attn_scores, dim=-1, dtype=torch.bfloat16)
 
         # Permute to [B, N_gen, S_prompt, L, H] for easier aggregation
         probs = probs.permute(0, 3, 4, 1, 2)
