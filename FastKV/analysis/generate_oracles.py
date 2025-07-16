@@ -329,7 +329,11 @@ def main():
 
             print(f"Processing sample {i} ({processed_count + 1}/{args.num_samples}) for {dataset_name} ({prompt_len} tokens)...")
             
-            oracle_ranking_tensor = generator.generate(inputs, args.max_gen)
+            try:
+                oracle_ranking_tensor = generator.generate(inputs, args.max_gen)
+            except Exception as e:
+                print(f"  -> Error generating oracle for sample {i}: {e}")
+                continue
             
             if oracle_ranking_tensor is not None and oracle_ranking_tensor.numel() > 0:
                 assert oracle_ranking_tensor.shape[1] == prompt_len, \
