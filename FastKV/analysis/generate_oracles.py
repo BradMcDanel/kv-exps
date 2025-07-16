@@ -202,42 +202,41 @@ class OracleGenerator:
     @torch.no_grad()
     def generate(self, inputs: Dict[str, torch.Tensor], max_gen: int) -> Optional[torch.Tensor]:
         self._patch_model()
-        try:
-            input_ids = inputs['input_ids']
-            prompt_length = input_ids.shape[1]
+        
+        input_ids = inputs['input_ids']
+        prompt_length = input_ids.shape[1]
+        
+        # --- Stage 1: Prompt Prefill ---
+        self.is_generating_oracle_answer = False
+        prefill_out = self.model(input_ids=input_ids, use_cache=True, cache_position=torch.arange(prompt_length, device=self.device))
+        prefill_cache = prefill_out.past_key_values
+        
+        if isinstance(prefill_cache, tuple): prefill_cache = DynamicCache.from_legacy_cache(prefill_cache)
+        prompt_only_cache_tuple = prefill_cache.to_legacy_cache()
+        
+        current_tokens = torch.argmax(prefill_out.logits[:, -1, :], dim=-1, keepdim=True)
+        current_cache = prefill_cache
+
+        # --- Stage 2: Oracle Answer Generation ---
+        self.is_generating_oracle_answer = True
+        for i in range(max_gen):
+            if current_tokens.item() in self.eos_token_ids: break
+
+            cache_len = current_cache.get_seq_length(0)
+            pos_ids = torch.tensor([[cache_len]], device=self.device)
+            decode_cache_pos = torch.tensor([cache_len], device=self.device)
             
-            # --- Stage 1: Prompt Prefill ---
-            self.is_generating_oracle_answer = False
-            prefill_out = self.model(input_ids=input_ids, use_cache=True, cache_position=torch.arange(prompt_length, device=self.device))
-            prefill_cache = prefill_out.past_key_values
+            decode_out = self.model(input_ids=current_tokens, position_ids=pos_ids, past_key_values=current_cache, use_cache=True, cache_position=decode_cache_pos)
             
-            if isinstance(prefill_cache, tuple): prefill_cache = DynamicCache.from_legacy_cache(prefill_cache)
-            prompt_only_cache_tuple = prefill_cache.to_legacy_cache()
-            
-            current_tokens = torch.argmax(prefill_out.logits[:, -1, :], dim=-1, keepdim=True)
-            current_cache = prefill_cache
+            current_cache = decode_out.past_key_values
+            if isinstance(current_cache, tuple): current_cache = DynamicCache.from_legacy_cache(current_cache)
+            current_tokens = torch.argmax(decode_out.logits[:, -1, :], dim=-1, keepdim=True)
 
-            # --- Stage 2: Oracle Answer Generation ---
-            self.is_generating_oracle_answer = True
-            for i in range(max_gen):
-                if current_tokens.item() in self.eos_token_ids: break
+        raw_qk_scores = self._compute_raw_qk_scores(prompt_only_cache_tuple)
+        self._token_importance_from_attn_scores(raw_qk_scores)
 
-                cache_len = current_cache.get_seq_length(0)
-                pos_ids = torch.tensor([[cache_len]], device=self.device)
-                decode_cache_pos = torch.tensor([cache_len], device=self.device)
-                
-                decode_out = self.model(input_ids=current_tokens, position_ids=pos_ids, past_key_values=current_cache, use_cache=True, cache_position=decode_cache_pos)
-                
-                current_cache = decode_out.past_key_values
-                if isinstance(current_cache, tuple): current_cache = DynamicCache.from_legacy_cache(current_cache)
-                current_tokens = torch.argmax(decode_out.logits[:, -1, :], dim=-1, keepdim=True)
-
-            raw_qk_scores = self._compute_raw_qk_scores(prompt_only_cache_tuple)
-            self._token_importance_from_attn_scores(raw_qk_scores)
-
-        finally:
-            self._unpatch_model()
-            self.captured_qs.clear()
+        self._unpatch_model()
+        self.captured_qs.clear()
 
         return self.token_importance_scores
 
@@ -292,11 +291,8 @@ def main():
         os.makedirs(dataset_output_dir, exist_ok=True)
         output_path = os.path.join(dataset_output_dir, f"{dataset_name}.npz")
         
-        try:
-            existing_data = dict(np.load(output_path, allow_pickle=True))
-            print(f"Loaded {len(existing_data)} existing samples from {output_path}. Will append new samples.")
-        except FileNotFoundError:
-            existing_data = {}
+        existing_data = dict(np.load(output_path, allow_pickle=True))
+        print(f"Loaded {len(existing_data)} existing samples from {output_path}. Will append new samples.")
 
         data = load_dataset('THUDM/LongBench', dataset_name, split='test', trust_remote_code=True)
         processed_count = 0
@@ -310,10 +306,7 @@ def main():
                 processed_count += 1
                 continue
 
-            try:
-                raw_prompt = dataset2prompt[dataset_name].format(**sample)
-            except KeyError:
-                continue
+            raw_prompt = dataset2prompt[dataset_name].format(**sample)
 
             datasets_without_chat_template = ["trec", "triviaqa", "samsum", "lsht", "lcc", "repobench-p"]
             if dataset_name not in datasets_without_chat_template:
@@ -329,11 +322,7 @@ def main():
 
             print(f"Processing sample {i} ({processed_count + 1}/{args.num_samples}) for {dataset_name} ({prompt_len} tokens)...")
             
-            try:
-                oracle_ranking_tensor = generator.generate(inputs, args.max_gen)
-            except Exception as e:
-                print(f"  -> Error generating oracle for sample {i}: {e}")
-                continue
+            oracle_ranking_tensor = generator.generate(inputs, args.max_gen)
             
             if oracle_ranking_tensor is not None and oracle_ranking_tensor.numel() > 0:
                 assert oracle_ranking_tensor.shape[1] == prompt_len, \
