@@ -9,7 +9,6 @@ import torch
 from scipy.stats import gaussian_kde
 from tqdm import tqdm
 
-# Import shared constants and styling functions from viz_utils
 from .viz_utils import set_publication_style, METHOD_COLORS
 
 # ==============================================================================
@@ -111,7 +110,6 @@ def plot_density_grid(
 ):
     """Creates the 1x3 grid plot showing token selection density by task difficulty."""
     set_publication_style()
-    # MODIFICATION: Removed sharey=True to allow individual y-axis scaling
     fig, axes = plt.subplots(1, 3, figsize=(24, 8))
     fig.suptitle(f'Token Selection Density by Task Difficulty (Top {k_percentage:.0%} Kept)', fontsize=32, weight='bold')
 
@@ -140,7 +138,6 @@ def plot_density_grid(
         ax.set_title(f"{difficulty} Task ({dataset_name})\nSeq Len: {seq_len}", fontsize=28)
         ax.set_xlabel('Token Position in Prompt', fontsize=24)
 
-    # MODIFICATION: Create a flattened, shared legend at the bottom of the figure
     axes[0].set_ylabel('Density of Selected Tokens', fontsize=28)
     handles = [plt.Line2D([0], [0], color=props['color'], lw=4, label=props['label']) for props in plot_order_map.values()]
     fig.legend(
@@ -152,7 +149,6 @@ def plot_density_grid(
         frameon=False             # Remove the legend box frame
     )
 
-    # MODIFICATION: Adjust layout to make space for the bottom legend and reduce top gap
     plt.tight_layout(rect=[0, 0.1, 1, 0.99])
     
     plt.savefig(output_pdf_file, dpi=300, bbox_inches='tight')
@@ -209,7 +205,24 @@ def main():
             print(f"Warning: No common samples found for dataset '{dataset_name}'. Skipping this plot.")
             continue
         
-        target_sample_key = common_keys[0]
+        # --- MODIFICATION: Find the shortest valid sample instead of the first one ---
+        shortest_sample_key = None
+        min_seq_len = float('inf')
+
+        for key in common_keys:
+            # Use the oracle ranking as the ground truth for sequence length
+            current_seq_len = len(oracle_data.get(key, {}).get('ranking', []))
+            if 0 < current_seq_len < min_seq_len:
+                min_seq_len = current_seq_len
+                shortest_sample_key = key
+        
+        if shortest_sample_key is None:
+            print(f"\nWarning: No valid common samples with sequence length > 0 found for '{dataset_name}'. Skipping.")
+            continue
+
+        target_sample_key = shortest_sample_key
+        print(f"\n  -> For '{dataset_name}', selected shortest sample '{target_sample_key}' (Seq Len: {min_seq_len})")
+        # --- END MODIFICATION ---
 
         oracle_sample = oracle_data[target_sample_key]
         approx_target_sample = approx_target_data[target_sample_key]
@@ -225,6 +238,7 @@ def main():
         
         seq_len = len(oracle_sample.get('ranking', []))
         if seq_len == 0:
+            # This check is now mostly redundant due to the selection logic above, but kept for safety
             print(f"Warning: Sequence length is 0 for {dataset_name}. Skipping.")
             continue
             
