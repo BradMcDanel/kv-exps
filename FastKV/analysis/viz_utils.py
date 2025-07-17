@@ -53,6 +53,12 @@ TASKS_AND_DATASETS = {
     'Code Completion': ['lcc', 'repobench-p'],
 }
 
+DATASET_TO_TASK_MAP = {
+    dataset: task
+    for task, datasets in TASKS_AND_DATASETS.items()
+    for dataset in datasets
+}
+
 # A flattened list of all dataset IDs to be plotted.
 ALL_DATASETS_TO_PLOT = [
     dataset for datasets in TASKS_AND_DATASETS.values() for dataset in datasets

@@ -10,13 +10,19 @@ import torch
 from scipy.stats import gaussian_kde
 from tqdm import tqdm
 
-from .viz_utils import set_publication_style, METHOD_COLORS
+from .viz_utils import (
+    set_publication_style,
+    METHOD_COLORS,
+    DATASET_TO_TASK_MAP,
+    DATASET_NAME_MAP,
+)
 from .retrieval_metrics import (
     load_npz_data_for_dataset,
     get_top_k_indices,
     deserialize_rankings_in_sample,
     calculate_oracle_overlap,
 )
+
 
 # ==============================================================================
 # DATA LOADING AND PROCESSING
@@ -27,14 +33,15 @@ def generate_dummy_data_for_grid(k_percentage: float) -> Dict[str, Any]:
     print("--- Using --debug mode: Generating random dummy data ---")
     all_plot_data = {}
     difficulty_configs = {
-        'Easy': {'name': 'Dummy Easy', 'seq_len': 2048},
-        'Medium': {'name': 'Dummy Medium', 'seq_len': 8192},
-        'Hard': {'name': 'Dummy Hard', 'seq_len': 4096},
+        'Easy': {'id': '2wikimqa', 'seq_len': 2048},
+        'Medium': {'id': 'trec', 'seq_len': 4096},
+        'Hard': {'id': 'gov_report', 'seq_len': 8192},
     }
     methods = ['Oracle', 'FastKV (Layer 15)', 'GemFilter (Layer 13)', 'Speculative Prefill']
 
     for difficulty, config in difficulty_configs.items():
         seq_len = config['seq_len']
+        dataset_id = config['id']
         k_absolute = int(seq_len * k_percentage)
         indices = {}
         for method in methods:
@@ -52,7 +59,8 @@ def generate_dummy_data_for_grid(k_percentage: float) -> Dict[str, Any]:
             indices[method] = torch.clamp(dummy_indices, 0, seq_len - 1)
         
         all_plot_data[difficulty] = {
-            'name': config['name'],
+            'name': DATASET_NAME_MAP.get(dataset_id, dataset_id.title()),
+            'task_category': DATASET_TO_TASK_MAP.get(dataset_id, 'Unknown'),
             'indices': indices,
             'seq_len': seq_len,
             'accuracies': {
@@ -90,7 +98,6 @@ def plot_single_density(
                     print(f"Warning: KDE failed for '{key}'. Plotting a histogram.")
                     ax.hist(indices_np, bins=50, density=True, color=props['color'], alpha=0.5, label=f"{props['label']} (hist)")
 
-    # Add the accuracy text box
     if accuracies:
         text_lines = ["Oracle Overlap (Top-10%):"]
         display_map = {'FastKV': 'FastKV', 'GemFilter': 'GemFilter', 'Speculative Prefill': 'Spec. Prefill'}
@@ -99,8 +106,8 @@ def plot_single_density(
                 text_lines.append(f"{label}: {accuracies[key]:.1%}")
         text_string = "\n".join(text_lines)
         
-        ax.text(0.97, 0.97, text_string, transform=ax.transAxes, fontsize=14,
-                verticalalignment='top', horizontalalignment='right',
+        ax.text(0.5, 0.97, text_string, transform=ax.transAxes, fontsize=20,
+                verticalalignment='top', horizontalalignment='center',
                 bbox=dict(boxstyle='round,pad=0.5', fc='white', alpha=0.7))
 
     ax.set_xlim(0, sequence_length)
@@ -116,8 +123,10 @@ def plot_density_grid(
 ):
     """Creates the 1x3 grid plot showing token selection density by task difficulty."""
     set_publication_style()
+    plt.rcParams.update({'axes.labelsize': 30, 'xtick.labelsize': 26})
+
     fig, axes = plt.subplots(1, 3, figsize=(24, 8))
-    fig.suptitle(f'Positional Distribution of Top-{int(100.*k_percentage)}% Ranked Tokens Varies with Task Difficulty', fontsize=32, weight='bold')
+    fig.suptitle(f'Positional Distribution of Top-{int(100.*k_percentage)}% Ranked Tokens by Task Structure', fontsize=32, weight='bold')
 
     plot_order_map = {
         'Oracle': {'label': 'Oracle', 'color': METHOD_COLORS['Oracle']},
@@ -136,15 +145,20 @@ def plot_density_grid(
             continue
 
         data = all_plot_data[difficulty]
-        dataset_name = data['name'].replace("_", " ").title()
+        dataset_name = data['name']
+        task_category = data.get('task_category', '')
         seq_len = data['seq_len']
         accuracies = data.get('accuracies', {})
 
         plot_single_density(ax, data['indices'], seq_len, plot_order_map, accuracies)
-        ax.set_title(f"{difficulty} Task ({dataset_name})", fontsize=28)
-        ax.set_xlabel('Token Position in Prompt', fontsize=24)
+        
+        # Set the new, more detailed title
+        title_text = f"{difficulty} Task: {dataset_name}\n({task_category})"
+        ax.set_title(title_text, fontsize=28)
+        
+        ax.set_xlabel('Token Position in Prompt')
 
-    axes[0].set_ylabel('Density of Selected Tokens', fontsize=28)
+    axes[0].set_ylabel('Density of Selected Tokens')
     handles = [plt.Line2D([0], [0], color=props['color'], lw=4, label=props['label']) for props in plot_order_map.values()]
     fig.legend(handles, [h.get_label() for h in handles], loc='lower center',
                bbox_to_anchor=(0.5, 0.02), ncol=4, frameon=False)
@@ -186,14 +200,14 @@ def main():
         'approx_draft': {'sanitized_name': DRAFT_MODEL.replace('/', '_'), 'base_path': 'analysis_results/approx_rankings'},
     }
     
-    DATASETS_BY_DIFFICULTY = {'Easy': '2wikimqa', 'Medium': 'gov_report', 'Hard': 'trec'}
+    DATASETS_BY_DIFFICULTY = {'Easy': '2wikimqa', 'Medium': 'trec', 'Hard': 'gov_report'}
     all_plot_data = {}
     print("Loading and processing data for the grid plot...")
     
-    for difficulty, dataset_name in tqdm(DATASETS_BY_DIFFICULTY.items(), desc="Processing datasets"):
-        oracle_data = load_npz_data_for_dataset(MODELS['oracle']['base_path'], MODELS['oracle']['sanitized_name'], dataset_name)
-        approx_target_data = load_npz_data_for_dataset(MODELS['approx_target']['base_path'], MODELS['approx_target']['sanitized_name'], dataset_name)
-        approx_draft_data = load_npz_data_for_dataset(MODELS['approx_draft']['base_path'], MODELS['approx_draft']['sanitized_name'], dataset_name)
+    for difficulty, dataset_id in tqdm(DATASETS_BY_DIFFICULTY.items(), desc="Processing datasets"):
+        oracle_data = load_npz_data_for_dataset(MODELS['oracle']['base_path'], MODELS['oracle']['sanitized_name'], dataset_id)
+        approx_target_data = load_npz_data_for_dataset(MODELS['approx_target']['base_path'], MODELS['approx_target']['sanitized_name'], dataset_id)
+        approx_draft_data = load_npz_data_for_dataset(MODELS['approx_draft']['base_path'], MODELS['approx_draft']['sanitized_name'], dataset_id)
         
         common_keys = sorted(list(set(oracle_data.keys()) & set(approx_target_data.keys()) & set(approx_draft_data.keys())))
         if not common_keys: continue
@@ -209,7 +223,7 @@ def main():
         
         if best_sample_key is None: continue
         target_sample_key = best_sample_key
-        print(f"\n  -> For '{dataset_name}', selected sample '{target_sample_key}' (Seq Len: {best_seq_len})")
+        print(f"\n  -> For '{dataset_id}', selected sample '{target_sample_key}' (Seq Len: {best_seq_len})")
 
         oracle_sample = oracle_data[target_sample_key]
         approx_target_sample = approx_target_data.get(target_sample_key, {})
@@ -227,7 +241,6 @@ def main():
         oracle_ranking_tensor = torch.from_numpy(oracle_sample['ranking']).float()
         all_indices['Oracle'] = get_top_k_indices(oracle_ranking_tensor, k_absolute, seq_len)
         
-        # Calculate and store indices and accuracies
         fk_rankings = approx_target_sample.get('fastkv_rankings', {})
         if fastkv_layer in fk_rankings:
             all_indices['FastKV (Layer 15)'] = get_top_k_indices(torch.from_numpy(fk_rankings[fastkv_layer]).float(), k_absolute, seq_len)
@@ -248,7 +261,8 @@ def main():
             if found_spec_k in sp_accs: accuracies_for_plot['Speculative Prefill'] = sp_accs[found_spec_k]
         
         all_plot_data[difficulty] = {
-            'name': dataset_name,
+            'name': DATASET_NAME_MAP.get(dataset_id, dataset_id.title()),
+            'task_category': DATASET_TO_TASK_MAP.get(dataset_id, 'Unknown'),
             'indices': all_indices,
             'seq_len': seq_len,
             'accuracies': accuracies_for_plot,
