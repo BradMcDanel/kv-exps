@@ -144,6 +144,17 @@ def setup_model_and_tokenizer(args):
 
         if args.mode == 'fastkv':
             from baseline.fastkv.fastkv_utils import compress
+            # Handle potentially conflicting capacity arguments. Prioritize percentage.
+            if args.max_capacity_prompt_percentage is not None:
+                if args.max_capacity_prompt is not None:
+                    logging.info(f"Using `max_capacity_prompt_percentage={args.max_capacity_prompt_percentage}`. Ignoring `max_capacity_prompt={args.max_capacity_prompt}`.") 
+                args.max_capacity_prompt_percentage = args.max_capacity_prompt_percentage
+            else:
+                args.max_capacity_prompt_percentage = None
+            # Handle potentially conflicting TSP length arguments. Prioritize percentage.
+            if args.tsp_len_percentage is not None:
+                if args.tsp_len is not None:
+                    logging.info(f"Using `tsp_len_percentage={args.tsp_len_percentage}`. Ignoring `tsp_len={args.tsp_len}`.")
             compress(model, args)
         elif args.mode == 'hfastkv':
             from baseline.hfastkv.hfastkv_utils import compress
@@ -333,6 +344,7 @@ if __name__ == "__main__":
     # FastKV
     parser.add_argument("--tsp_idx", type=int, default=15)
     parser.add_argument("--tsp_len", type=int, default=2048)
+    parser.add_argument("--tsp_len_percentage", type=float, default=None, help="Use a percentage of the prompt length for TSP length.")
     # GemFilter
     parser.add_argument("--filter_idx", type=int, default=13)
     # AdaKV
