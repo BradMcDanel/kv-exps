@@ -1,70 +1,88 @@
-# analysis/visualize_token_selection.py
-
 import argparse
 import os
 import pickle
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict
 
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
 from scipy.stats import gaussian_kde
-from transformers import AutoTokenizer
+from tqdm import tqdm
 
+# Import shared constants and styling functions from viz_utils
 from .viz_utils import set_publication_style, METHOD_COLORS
 
-def load_npz_data_for_dataset(base_path, model_name, dataset_name):
+# ==============================================================================
+# DATA LOADING AND PROCESSING
+# ==============================================================================
+
+def load_npz_data_for_dataset(base_path: str, model_name: str, dataset_name: str) -> Dict[str, Any]:
+    """Loads and deserializes data from a single NPZ file for a given dataset."""
     file_path = os.path.join(base_path, model_name, f"{dataset_name}.npz")
-    if not os.path.exists(file_path): raise FileNotFoundError(f"FATAL: Data file not found: {file_path}")
+    if not os.path.exists(file_path):
+        return {}
     try:
         npz_file = np.load(file_path, allow_pickle=True)
         return {key: npz_file[key].item() for key in npz_file.files}
-    except Exception as e: raise IOError(f"FATAL: Could not load {file_path}. Error: {e}")
+    except Exception as e:
+        print(f"Warning: Could not load or process {file_path}. Error: {e}")
+        return {}
 
-def get_top_k_indices(scores, k, max_index=None):
-    if max_index: scores = scores[:max_index]
-    if scores.numel() < k: raise ValueError(f"FATAL: Cannot select top {k}, only {scores.numel()} available.")
-    _, top_k_indices = torch.topk(scores, k=k)
+def get_top_k_indices(scores: torch.Tensor, k: int, max_index: int) -> torch.Tensor:
+    """Safely gets the indices of the top-k scores from a tensor."""
+    scores = scores[:max_index]
+    if scores.numel() == 0:
+        return torch.tensor([], dtype=torch.long)
+    
+    actual_k = min(k, scores.numel())
+    if actual_k < k:
+        print(f"Warning: Can only select top {actual_k} tokens, not {k}. Using {actual_k}.")
+        
+    _, top_k_indices = torch.topk(scores, k=actual_k)
     return top_k_indices
 
-def print_token_text(tokenizer, all_indices, all_tokens, num_tokens_to_print=512):
-    print("\n" + "="*80 + "\nQualitative Deep Dive: Text of Top-Selected Tokens\n" + "="*80 + "\n")
-    canonical_order = ['Oracle', 'FastKV (Layer 15)', 'GemFilter (Layer 13)']
-    actual_speculative_key = next((key for key in all_indices if key.startswith('Speculative Prefill')), None)
-    if actual_speculative_key: canonical_order.append(actual_speculative_key)
-    methods_to_print = [name for name in canonical_order if name in all_indices]
-    for name in methods_to_print:
-        indices = all_indices[name]
-        header = f"--- {name} (Top {min(len(indices), num_tokens_to_print)} of {len(indices)}) ---"
-        print(header)
-        sorted_indices = torch.sort(indices).values[:num_tokens_to_print]
-        groups = []
-        if sorted_indices.numel() > 0:
-            current_group = [sorted_indices[0].item()]
-            for i in range(1, len(sorted_indices)):
-                if sorted_indices[i] == sorted_indices[i-1] + 1: current_group.append(sorted_indices[i].item())
-                else:
-                    groups.append(current_group)
-                    current_group = [sorted_indices[i].item()]
-            groups.append(current_group)
-        decoded_parts = [f"...'{repr(tokenizer.decode(all_tokens[torch.tensor(g)]))}'..." for g in groups]
-        print("  " + " | ".join(decoded_parts) + "\n")
-
-def plot_selection_density(all_indices, sequence_length, k_percentage, dataset_name, output_pdf_file, output_png_file):
-    """Creates a density plot using the unified color scheme."""
-    fig, ax = plt.subplots(figsize=(20, 7))
-
-    # Define a canonical order for plotting layers
-    plot_order_map = {
-        'Oracle': {'label': 'Oracle', 'color': METHOD_COLORS['Oracle']},
-        'FastKV (Layer 15)': {'label': 'FastKV (Layer 15)', 'color': METHOD_COLORS['FastKV']},
-        'GemFilter (Layer 13)': {'label': 'GemFilter (Layer 13)', 'color': METHOD_COLORS['GemFilter']},
+def generate_dummy_data_for_grid(k_percentage: float) -> Dict[str, Any]:
+    """Generates random data for layout and debugging purposes."""
+    print("--- Using --debug mode: Generating random dummy data ---")
+    all_plot_data = {}
+    difficulty_configs = {
+        'Easy': {'name': 'Dummy Easy', 'seq_len': 2048},
+        'Medium': {'name': 'Dummy Medium', 'seq_len': 8192},
+        'Hard': {'name': 'Dummy Hard', 'seq_len': 4096},
     }
-    # Find the dynamic speculative key to add it to the map
-    spec_key = next((k for k in all_indices if k.startswith('Speculative Prefill')), None)
-    if spec_key:
-        plot_order_map[spec_key] = {'label': spec_key, 'color': METHOD_COLORS['Speculative']}
+    methods = ['Oracle', 'FastKV (Layer 15)', 'GemFilter (Layer 13)', 'Speculative Prefill']
 
+    for difficulty, config in difficulty_configs.items():
+        seq_len = config['seq_len']
+        k_absolute = int(seq_len * k_percentage)
+        indices = {}
+        for method in methods:
+            if difficulty == 'Easy':
+                mean = seq_len * (0.7 if method == 'Oracle' else np.random.uniform(0.6, 0.8))
+                std = seq_len * (0.05 if method == 'Oracle' else 0.1)
+            elif difficulty == 'Medium':
+                mean = seq_len * (0.5 if method == 'Oracle' else np.random.uniform(0.4, 0.6))
+                std = seq_len * (0.1 if method == 'Oracle' else 0.15)
+            else: # Hard
+                mean = seq_len * 0.5
+                std = seq_len * 0.3
+            
+            dummy_indices = torch.normal(mean=mean, std=std, size=(k_absolute,)).long()
+            indices[method] = torch.clamp(dummy_indices, 0, seq_len - 1)
+        
+        all_plot_data[difficulty] = {
+            'name': config['name'],
+            'indices': indices,
+            'seq_len': seq_len
+        }
+    return all_plot_data
+
+# ==============================================================================
+# CORE PLOTTING LOGIC
+# ==============================================================================
+
+def plot_single_density(ax: plt.Axes, all_indices: Dict[str, torch.Tensor], sequence_length: int, plot_order_map: Dict):
+    """Plots the density for one sample on a given Matplotlib axis."""
     x_grid = np.linspace(0, sequence_length, 1000)
 
     for key, props in plot_order_map.items():
@@ -77,20 +95,65 @@ def plot_selection_density(all_indices, sequence_length, k_percentage, dataset_n
                     ax.plot(x_grid, density, color=props['color'], label=props['label'])
                     ax.fill_between(x_grid, density, color=props['color'], alpha=0.2)
                 except (np.linalg.LinAlgError, ValueError):
+                    print(f"Warning: KDE failed for '{key}'. Plotting a histogram as a fallback.")
                     ax.hist(indices_np, bins=50, density=True, color=props['color'], alpha=0.5, label=f"{props['label']} (hist)")
-    
-    ax.set_xlabel('Token Position in Prompt')
-    ax.set_ylabel('Density of Selected Tokens')
-    ax.grid(axis='y', linestyle=':', linewidth=0.7)
-    ax.spines[['right', 'top']].set_visible(False)
-    ax.legend(title="Ranking Method")
+
     ax.set_xlim(0, sequence_length)
     ax.set_yticklabels([])
     ax.tick_params(axis='y', length=0)
-    title = f'Density of Top-{k_percentage:.0%} Selected Tokens\n'
-    title += f'Dataset: {dataset_name.replace("_", " ").title()} (Seq Len: {sequence_length})'
-    ax.set_title(title, pad=20)
-    plt.tight_layout()
+    ax.spines[['right', 'top', 'left']].set_visible(False)
+
+def plot_density_grid(
+    all_plot_data: Dict[str, Any],
+    k_percentage: float,
+    output_pdf_file: str,
+    output_png_file: str
+):
+    """Creates the 1x3 grid plot showing token selection density by task difficulty."""
+    set_publication_style()
+    # MODIFICATION: Removed sharey=True to allow individual y-axis scaling
+    fig, axes = plt.subplots(1, 3, figsize=(24, 8))
+    fig.suptitle(f'Token Selection Density by Task Difficulty (Top {k_percentage:.0%} Kept)', fontsize=32, weight='bold')
+
+    plot_order_map = {
+        'Oracle': {'label': 'Oracle', 'color': METHOD_COLORS['Oracle']},
+        'FastKV (Layer 15)': {'label': 'FastKV (Layer 15)', 'color': METHOD_COLORS['FastKV']},
+        'GemFilter (Layer 13)': {'label': 'GemFilter (Layer 13)', 'color': METHOD_COLORS['GemFilter']},
+        'Speculative Prefill': {'label': 'Speculative Prefill', 'color': METHOD_COLORS['Speculative']},
+    }
+
+    difficulty_order = ['Easy', 'Medium', 'Hard']
+    for i, difficulty in enumerate(difficulty_order):
+        ax = axes[i]
+        if difficulty not in all_plot_data:
+            ax.text(0.5, 0.5, f"Data not found for\n{difficulty} task", ha='center', va='center', style='italic', fontsize=20)
+            ax.set_title(f"{difficulty} Task", fontsize=28)
+            ax.set_xticks([])
+            ax.set_yticks([])
+            continue
+
+        data = all_plot_data[difficulty]
+        dataset_name = data['name'].replace("_", " ").title()
+        seq_len = data['seq_len']
+
+        plot_single_density(ax, data['indices'], seq_len, plot_order_map)
+        ax.set_title(f"{difficulty} Task ({dataset_name})\nSeq Len: {seq_len}", fontsize=28)
+        ax.set_xlabel('Token Position in Prompt', fontsize=24)
+
+    # MODIFICATION: Create a flattened, shared legend at the bottom of the figure
+    axes[0].set_ylabel('Density of Selected Tokens', fontsize=28)
+    handles = [plt.Line2D([0], [0], color=props['color'], lw=4, label=props['label']) for props in plot_order_map.values()]
+    fig.legend(
+        handles, 
+        [h.get_label() for h in handles],
+        loc='lower center',
+        bbox_to_anchor=(0.5, 0.02), # Position legend at the bottom center
+        ncol=4,                   # Make it horizontal
+        frameon=False             # Remove the legend box frame
+    )
+
+    # MODIFICATION: Adjust layout to make space for the bottom legend and reduce top gap
+    plt.tight_layout(rect=[0, 0.1, 1, 0.99])
     
     plt.savefig(output_pdf_file, dpi=300, bbox_inches='tight')
     print(f"\nSaved PDF to: {output_pdf_file}")
@@ -98,9 +161,27 @@ def plot_selection_density(all_indices, sequence_length, k_percentage, dataset_n
     print(f"Saved PNG to: {output_png_file}")
     plt.close(fig)
 
+# ==============================================================================
+# MAIN EXECUTION
+# ==============================================================================
+
 def main():
-    set_publication_style() # Apply unified styling
-    parser = argparse.ArgumentParser(description="Deep dive density plot for token selection.")
+    parser = argparse.ArgumentParser(description="Generate a grid of token selection density plots by task difficulty.")
+    parser.add_argument("--k_percentage", type=float, default=0.1, help="Top-k percentage for token selection.")
+    parser.add_argument("--debug", action="store_true", help="Use dummy data for fast layout iteration.")
+    args = parser.parse_args()
+
+    output_dir = "figures"
+    os.makedirs(output_dir, exist_ok=True)
+    output_pdf = os.path.join(output_dir, "token_selection.pdf")
+    output_png = os.path.join(output_dir, "token_selection.png")
+
+    if args.debug:
+        all_plot_data = generate_dummy_data_for_grid(args.k_percentage)
+        plot_density_grid(all_plot_data, args.k_percentage, output_pdf, output_png)
+        return
+
+    # --- Real Data Loading and Processing ---
     TARGET_MODEL = 'meta-llama/Llama-3.1-8B-Instruct'
     DRAFT_MODEL = 'meta-llama/Llama-3.2-1B-Instruct'
     MODELS = {
@@ -108,53 +189,68 @@ def main():
         'approx_target': {'sanitized_name': TARGET_MODEL.replace('/', '_'), 'base_path': 'analysis_results/approx_rankings'},
         'approx_draft': {'sanitized_name': DRAFT_MODEL.replace('/', '_'), 'base_path': 'analysis_results/approx_rankings'},
     }
-    parser.add_argument("--tokenizer_path", type=str, default=TARGET_MODEL)
-    parser.add_argument("--dataset", type=str, default='qasper')
-    parser.add_argument("--sample_idx_in_file", type=int, default=0)
-    parser.add_argument("--k_percentage", type=float, default=0.1)
-    parser.add_argument("--output_name", type=str, default="token_selection_density_deep_dive")
-    args = parser.parse_args()
     
-    output_dir = "figures"
-    os.makedirs(output_dir, exist_ok=True)
-    output_pdf_file = os.path.join(output_dir, f"{args.output_name}.pdf")
-    output_png_file = os.path.join(output_dir, f"{args.output_name}.png")
+    DATASETS_BY_DIFFICULTY = {
+        'Easy': '2wikimqa',
+        'Medium': 'passage_retrieval_en',
+        'Hard': 'gov_report',
+    }
 
-    oracle_data = load_npz_data_for_dataset(MODELS['oracle']['base_path'], MODELS['oracle']['sanitized_name'], args.dataset)
-    approx_target_data = load_npz_data_for_dataset(MODELS['approx_target']['base_path'], MODELS['approx_target']['sanitized_name'], args.dataset)
-    approx_draft_data = load_npz_data_for_dataset(MODELS['approx_draft']['base_path'], MODELS['approx_draft']['sanitized_name'], args.dataset)
-    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_path)
-
-    common_keys = sorted(list(set(oracle_data.keys()) & set(approx_target_data.keys()) & set(approx_draft_data.keys())))
-    target_sample_key = common_keys[args.sample_idx_in_file]
-
-    oracle_sample = oracle_data[target_sample_key]
-    approx_target_sample = approx_target_data[target_sample_key]
-    approx_draft_sample = approx_draft_data[target_sample_key]
+    all_plot_data = {}
+    print("Loading and processing data for the grid plot...")
     
-    for data_dict in [approx_target_sample, approx_draft_sample]:
-        for rank_type in ['fastkv_rankings', 'gemfilter_rankings', 'speculative_rankings']:
-            if rank_type in data_dict and isinstance(data_dict[rank_type], bytes):
-                data_dict[rank_type] = pickle.loads(data_dict[rank_type])
+    for difficulty, dataset_name in tqdm(DATASETS_BY_DIFFICULTY.items(), desc="Processing datasets"):
+        oracle_data = load_npz_data_for_dataset(MODELS['oracle']['base_path'], MODELS['oracle']['sanitized_name'], dataset_name)
+        approx_target_data = load_npz_data_for_dataset(MODELS['approx_target']['base_path'], MODELS['approx_target']['sanitized_name'], dataset_name)
+        approx_draft_data = load_npz_data_for_dataset(MODELS['approx_draft']['base_path'], MODELS['approx_draft']['sanitized_name'], dataset_name)
+        
+        common_keys = sorted(list(set(oracle_data.keys()) & set(approx_target_data.keys()) & set(approx_draft_data.keys())))
+        if not common_keys:
+            print(f"Warning: No common samples found for dataset '{dataset_name}'. Skipping this plot.")
+            continue
+        
+        target_sample_key = common_keys[0]
 
-    fastkv_layer, gemfilter_layer, spec_k_candidates = 15, 13, [8, 4, 2, 1]
-    input_ids = torch.from_numpy(oracle_sample['input_ids'])
-    seq_len = len(input_ids)
-    k_absolute = int(seq_len * args.k_percentage)
-    all_indices = {}
+        oracle_sample = oracle_data[target_sample_key]
+        approx_target_sample = approx_target_data[target_sample_key]
+        approx_draft_sample = approx_draft_data[target_sample_key]
+        
+        for data_dict in [approx_target_sample, approx_draft_sample]:
+            for rank_type in ['fastkv_rankings', 'gemfilter_rankings', 'speculative_rankings']:
+                if rank_type in data_dict and isinstance(data_dict[rank_type], bytes):
+                    data_dict[rank_type] = pickle.loads(data_dict[rank_type])
 
-    all_indices['Oracle'] = get_top_k_indices(torch.from_numpy(oracle_sample['ranking']).float(), k_absolute, seq_len)
-    all_indices['FastKV (Layer 15)'] = get_top_k_indices(torch.from_numpy(approx_target_sample['fastkv_rankings'][fastkv_layer]).float(), k_absolute, seq_len)
-    all_indices['GemFilter (Layer 13)'] = get_top_k_indices(torch.from_numpy(approx_target_sample['gemfilter_rankings'][gemfilter_layer]).float(), k_absolute, seq_len)
-    
-    spec_rankings = approx_draft_sample.get('speculative_rankings', {})
-    found_spec_k = next((k for k in spec_k_candidates if k in spec_rankings), None)
-    if found_spec_k:
-        scores = torch.from_numpy(spec_rankings[found_spec_k]).float()
-        all_indices[f'Speculative Prefill (k={found_spec_k})'] = get_top_k_indices(scores, k_absolute, seq_len)
+        fastkv_layer, gemfilter_layer = 15, 13
+        spec_k_candidates = [8, 4, 1]
+        
+        seq_len = len(oracle_sample.get('ranking', []))
+        if seq_len == 0:
+            print(f"Warning: Sequence length is 0 for {dataset_name}. Skipping.")
+            continue
+            
+        k_absolute = int(seq_len * args.k_percentage)
+        all_indices = {}
 
-    plot_selection_density(all_indices, seq_len, args.k_percentage, args.dataset, output_pdf_file, output_png_file)
-    print_token_text(tokenizer, all_indices, input_ids)
+        all_indices['Oracle'] = get_top_k_indices(torch.from_numpy(oracle_sample['ranking']).float(), k_absolute, seq_len)
+        
+        if 'fastkv_rankings' in approx_target_sample and fastkv_layer in approx_target_sample['fastkv_rankings']:
+            all_indices['FastKV (Layer 15)'] = get_top_k_indices(torch.from_numpy(approx_target_sample['fastkv_rankings'][fastkv_layer]).float(), k_absolute, seq_len)
+        if 'gemfilter_rankings' in approx_target_sample and gemfilter_layer in approx_target_sample['gemfilter_rankings']:
+            all_indices['GemFilter (Layer 13)'] = get_top_k_indices(torch.from_numpy(approx_target_sample['gemfilter_rankings'][gemfilter_layer]).float(), k_absolute, seq_len)
+
+        spec_rankings = approx_draft_sample.get('speculative_rankings', {})
+        found_spec_k = next((k for k in spec_k_candidates if k in spec_rankings), None)
+        if found_spec_k:
+            scores = torch.from_numpy(spec_rankings[found_spec_k]).float()
+            all_indices['Speculative Prefill'] = get_top_k_indices(scores, k_absolute, seq_len)
+        
+        all_plot_data[difficulty] = {
+            'name': dataset_name,
+            'indices': all_indices,
+            'seq_len': seq_len
+        }
+
+    plot_density_grid(all_plot_data, args.k_percentage, output_pdf, output_png)
 
 if __name__ == "__main__":
     main()
