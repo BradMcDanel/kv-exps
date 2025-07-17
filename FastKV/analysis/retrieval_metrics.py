@@ -7,7 +7,7 @@ including data loading, processing, retrieval accuracy calculations, and aggrega
 import os
 import math
 import pickle
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Set
 from collections import defaultdict
 
 import numpy as np
@@ -135,3 +135,190 @@ def find_global_max_accuracy(all_accuracies: Dict) -> float:
             elif method_accs:
                 max_val = max(max_val, max(method_accs.values()))
     return max_val if max_val > 0 else 1.0
+
+
+# --- STABILITY EVOLUTION METRICS ---
+
+def get_top_k_indices_np(ranking: np.ndarray, k: int) -> Set[int]:
+    """
+    Efficiently returns the set of indices for the top-k scores from a NumPy array.
+    Uses np.argpartition for performance.
+    """
+    k = min(k, ranking.size)
+    if k <= 0:
+        return set()
+    
+    # argpartition is faster than argsort for finding top-k. It partitions the
+    # array such that the k-th largest element is in its sorted place.
+    indices = np.argpartition(ranking, -k)[-k:]
+    return set(indices)
+
+def calculate_jaccard_similarity(set1: Set[int], set2: Set[int]) -> float:
+    """Calculates Jaccard similarity (intersection over union) between two sets."""
+    if not isinstance(set1, set) or not isinstance(set2, set):
+        raise TypeError("Inputs must be sets.")
+        
+    intersection_size = len(set1.intersection(set2))
+    union_size = len(set1.union(set2))
+    
+    if union_size == 0:
+        return 1.0  # Jaccard of two empty sets is 1.0
+        
+    return intersection_size / union_size
+
+def calculate_stability_evolution_metrics(
+    oracle_ranking: np.ndarray,
+    fastkv_rankings: Dict[int, np.ndarray],
+    k_percentage: float,
+    stability_threshold: float
+) -> Dict[str, Any]:
+    """
+    Calculates metrics for ranking stability and quality evolution across layers.
+
+    Args:
+        oracle_ranking: A NumPy array of oracle scores for each token.
+        fastkv_rankings: A dictionary mapping layer index to a NumPy array of FastKV scores.
+        k_percentage: The percentage of top tokens to consider for accuracy and stability.
+        stability_threshold: The Jaccard similarity threshold for determining the early-exit layer.
+
+    Returns:
+        A dictionary containing calculated metrics:
+        - 'valid_layers': Sorted list of layers with rankings.
+        - 'accuracies': List of Jaccard similarities against the oracle for each layer.
+        - 'pairwise_jaccard': List of Jaccard similarities between consecutive layers.
+        - 'exit_layer': The layer index where stability threshold was first met or exceeded.
+        - 'k_absolute': The absolute number of top tokens considered.
+    """
+    if not fastkv_rankings:
+        return {
+            'valid_layers': [], 'accuracies': [], 'pairwise_jaccard': [], 
+            'exit_layer': -1, 'k_absolute': 0
+        }
+
+    prompt_len = len(oracle_ranking)
+    k_absolute = max(1, math.ceil(prompt_len * k_percentage))
+
+    oracle_top_k_set = get_top_k_indices_np(oracle_ranking, k_absolute)
+    valid_layers = sorted(fastkv_rankings.keys())
+        
+    # 1. Accuracy vs. Oracle (Jaccard similarity of top-k sets)
+    accuracies = [
+        calculate_jaccard_similarity(
+            get_top_k_indices_np(fastkv_rankings[layer], k_absolute), 
+            oracle_top_k_set
+        ) for layer in valid_layers
+    ]
+
+    # 2. Pairwise Top-K Jaccard Similarity between consecutive layers
+    pairwise_jaccard = []
+    if len(valid_layers) >= 2:
+        for i in range(1, len(valid_layers)):
+            prev_layer_idx, curr_layer_idx = valid_layers[i-1], valid_layers[i]
+            prev_top_k = get_top_k_indices_np(fastkv_rankings[prev_layer_idx], k_absolute)
+            curr_top_k = get_top_k_indices_np(fastkv_rankings[curr_layer_idx], k_absolute)
+            similarity = calculate_jaccard_similarity(prev_top_k, curr_top_k)
+            pairwise_jaccard.append(similarity)
+
+    # 3. Determine Early Exit Layer
+    exit_layer = -1
+    if pairwise_jaccard:
+        for i, similarity in enumerate(pairwise_jaccard):
+            if similarity >= stability_threshold:
+                # Exit layer is the current layer in the pair (i.e., the second one)
+                exit_layer = valid_layers[i+1] 
+                break
+    
+    return {
+        'valid_layers': valid_layers,
+        'accuracies': accuracies,
+        'pairwise_jaccard': pairwise_jaccard,
+        'exit_layer': exit_layer,
+        'k_absolute': k_absolute
+    }
+
+def compute_adaptive_exit_metrics_for_dataset(
+    oracle_data_for_ds: Dict,
+    fastkv_data_for_ds: Dict,
+    k_percentage: float,
+    stability_threshold: float,
+    fixed_layer: int,
+) -> Dict[str, float]:
+    """
+    Computes and aggregates adaptive vs. fixed layer metrics across all samples in a dataset.
+
+    For each sample, this function:
+    1. Calculates the adaptive exit layer based on stability (`stability_threshold`).
+    2. Records the retrieval accuracy at that adaptive layer.
+    3. Records the retrieval accuracy at a specified `fixed_layer`.
+    4. Averages these metrics across all common samples in the dataset.
+
+    Returns:
+        A dictionary with aggregated results, or an empty dict if no valid samples are found.
+        Example: {'avg_adaptive_layer': 12.3, 'avg_adaptive_accuracy': 0.85, 'avg_fixed_accuracy': 0.88}
+    """
+    common_keys = sorted(list(set(oracle_data_for_ds.keys()) & set(fastkv_data_for_ds.keys())))
+    if not common_keys:
+        return {}
+
+    adaptive_layers, adaptive_accuracies, fixed_accuracies = [], [], []
+
+    for sample_key in common_keys:
+        oracle_sample = oracle_data_for_ds[sample_key]
+        fastkv_sample = fastkv_data_for_ds[sample_key]
+
+        # Ensure rankings data is deserialized from bytes if needed
+        deserialize_rankings_in_sample(fastkv_sample)
+
+        oracle_ranking = oracle_sample.get('ranking')
+        fastkv_rankings = fastkv_sample.get('fastkv_rankings', {})
+
+        if oracle_ranking is None or not fastkv_rankings:
+            continue
+        
+        # Calculate evolution metrics for this single sample
+        metrics = calculate_stability_evolution_metrics(
+            oracle_ranking=oracle_ranking,
+            fastkv_rankings=fastkv_rankings,
+            k_percentage=k_percentage,
+            stability_threshold=stability_threshold,
+        )
+
+        valid_layers = metrics['valid_layers']
+        per_layer_accuracies = metrics['accuracies']
+        if not valid_layers or not per_layer_accuracies:
+            continue
+
+        # 1. Determine Adaptive Exit Layer and its Accuracy
+        exit_layer = metrics['exit_layer']
+        # Fallback: if stability is never reached, use the last available layer
+        layer_to_use = exit_layer if exit_layer != -1 else valid_layers[-1]
+        
+        try:
+            adaptive_idx = valid_layers.index(layer_to_use)
+            adaptive_layers.append(layer_to_use)
+            adaptive_accuracies.append(per_layer_accuracies[adaptive_idx])
+        except (ValueError, IndexError):
+            continue # Skip sample if the layer isn't found for some reason
+
+        # 2. Determine Fixed Layer Accuracy
+        # Find the closest available layer to the target fixed_layer
+        closest_layer = min(valid_layers, key=lambda l: abs(l - fixed_layer))
+        try:
+            fixed_idx = valid_layers.index(closest_layer)
+            fixed_accuracies.append(per_layer_accuracies[fixed_idx])
+        except (ValueError, IndexError):
+            # This can happen if adaptive logic ran but fixed didn't have a match
+            # To keep lists aligned, we might skip or use a nan. Skipping is safer.
+            adaptive_layers.pop()
+            adaptive_accuracies.pop()
+            continue
+            
+    if not adaptive_accuracies: # Check if any samples were successfully processed
+        return {}
+        
+    return {
+        'avg_adaptive_layer': np.mean(adaptive_layers),
+        'avg_adaptive_accuracy': np.mean(adaptive_accuracies),
+        'avg_fixed_accuracy': np.mean(fixed_accuracies),
+    }
+

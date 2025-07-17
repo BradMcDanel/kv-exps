@@ -3,6 +3,8 @@
 import matplotlib.pyplot as plt
 import seaborn as sns
 
+FIXED_EXIT_LAYER = 15
+
 # ==============================================================================
 # PLOTTING STYLES AND COLORS
 # ==============================================================================
@@ -16,6 +18,8 @@ METHOD_COLORS = {
     'Speculative (k=1)': '#d6b3ff',     # Light purple
     'Speculative (k=8)': '#a066cc',     # Medium purple
     'Speculative (k=32)': '#5e2b8c',    # Dark purple
+    'Adaptive Exit': '#1f77b4',         # Standard blue
+    'Fixed Exit': '#d62728',            # Standard red (same as FastKV)
 }
 
 def set_publication_style():
