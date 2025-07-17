@@ -12,6 +12,8 @@ from collections import defaultdict
 
 import numpy as np
 import torch
+from scipy.stats import spearmanr
+
 
 
 # --- DATA LOADING AND PROCESSING UTILITIES ---
@@ -140,16 +142,9 @@ def find_global_max_accuracy(all_accuracies: Dict) -> float:
 # --- STABILITY EVOLUTION METRICS ---
 
 def get_top_k_indices_np(ranking: np.ndarray, k: int) -> Set[int]:
-    """
-    Efficiently returns the set of indices for the top-k scores from a NumPy array.
-    Uses np.argpartition for performance.
-    """
+    """Efficiently returns the set of indices for the top-k scores from a NumPy array."""
     k = min(k, ranking.size)
-    if k <= 0:
-        return set()
-    
-    # argpartition is faster than argsort for finding top-k. It partitions the
-    # array such that the k-th largest element is in its sorted place.
+    if k <= 0: return set()
     indices = np.argpartition(ranking, -k)[-k:]
     return set(indices)
 
@@ -157,83 +152,92 @@ def calculate_jaccard_similarity(set1: Set[int], set2: Set[int]) -> float:
     """Calculates Jaccard similarity (intersection over union) between two sets."""
     if not isinstance(set1, set) or not isinstance(set2, set):
         raise TypeError("Inputs must be sets.")
-        
     intersection_size = len(set1.intersection(set2))
     union_size = len(set1.union(set2))
-    
     if union_size == 0:
-        return 1.0  # Jaccard of two empty sets is 1.0
-        
+        return 1.0
     return intersection_size / union_size
 
-def calculate_stability_evolution_metrics(
+def calculate_stability_evolution_metrics( 
     oracle_ranking: np.ndarray,
     fastkv_rankings: Dict[int, np.ndarray],
-    k_percentage: float,
-    stability_threshold: float
+    k_percentage: float, # Note: this is now only for the accuracy EVALUATION
+    stability_threshold: float,
+    stability_window: int = 3,
 ) -> Dict[str, Any]:
     """
-    Calculates metrics for ranking stability and quality evolution across layers.
+    Calculates metrics for ranking stability and quality evolution across layers
+    using Spearman's Rank Correlation with a sliding window.
 
     Args:
         oracle_ranking: A NumPy array of oracle scores for each token.
         fastkv_rankings: A dictionary mapping layer index to a NumPy array of FastKV scores.
-        k_percentage: The percentage of top tokens to consider for accuracy and stability.
-        stability_threshold: The Jaccard similarity threshold for determining the early-exit layer.
+        k_percentage: The percentage of top tokens to consider for ACCURACY evaluation.
+        stability_threshold: The Spearman's ρ threshold for determining the early-exit layer.
+        stability_window: The number of consecutive layers that must average above the threshold.
 
     Returns:
-        A dictionary containing calculated metrics:
-        - 'valid_layers': Sorted list of layers with rankings.
-        - 'accuracies': List of Jaccard similarities against the oracle for each layer.
-        - 'pairwise_jaccard': List of Jaccard similarities between consecutive layers.
-        - 'exit_layer': The layer index where stability threshold was first met or exceeded.
-        - 'k_absolute': The absolute number of top tokens considered.
+        A dictionary containing calculated metrics. The 'pairwise_stability' key
+        now contains Spearman correlations.
     """
     if not fastkv_rankings:
-        return {
-            'valid_layers': [], 'accuracies': [], 'pairwise_jaccard': [], 
-            'exit_layer': -1, 'k_absolute': 0
-        }
+        return {'valid_layers': [], 'accuracies': [], 'pairwise_stability': [], 'exit_layer': -1}
 
     prompt_len = len(oracle_ranking)
     k_absolute = max(1, math.ceil(prompt_len * k_percentage))
-
     oracle_top_k_set = get_top_k_indices_np(oracle_ranking, k_absolute)
+
     valid_layers = sorted(fastkv_rankings.keys())
-        
-    # 1. Accuracy vs. Oracle (Jaccard similarity of top-k sets)
+    
+    # 1. Accuracy vs. Oracle (Jaccard similarity of top-k sets) - This is for EVALUATION only.
     accuracies = [
         calculate_jaccard_similarity(
-            get_top_k_indices_np(fastkv_rankings[layer], k_absolute), 
+            get_top_k_indices_np(fastkv_rankings[layer], k_absolute),
             oracle_top_k_set
         ) for layer in valid_layers
     ]
 
-    # 2. Pairwise Top-K Jaccard Similarity between consecutive layers
-    pairwise_jaccard = []
+    # 2. Pairwise Spearman Correlation between consecutive layers - This is the new STABILITY SIGNAL.
+    pairwise_stability = []
     if len(valid_layers) >= 2:
         for i in range(1, len(valid_layers)):
             prev_layer_idx, curr_layer_idx = valid_layers[i-1], valid_layers[i]
-            prev_top_k = get_top_k_indices_np(fastkv_rankings[prev_layer_idx], k_absolute)
-            curr_top_k = get_top_k_indices_np(fastkv_rankings[curr_layer_idx], k_absolute)
-            similarity = calculate_jaccard_similarity(prev_top_k, curr_top_k)
-            pairwise_jaccard.append(similarity)
+            len_prev = len(fastkv_rankings[prev_layer_idx])
+            len_curr = len(fastkv_rankings[curr_layer_idx])
+            min_len = min(len_prev, len_curr)
+            
+            # Spearman correlation is the new stability signal
+            corr, _ = spearmanr(
+                fastkv_rankings[prev_layer_idx][:min_len],
+                fastkv_rankings[curr_layer_idx][:min_len]
+            )
+            pairwise_stability.append(corr if np.isfinite(corr) else 0.0)
 
-    # 3. Determine Early Exit Layer
+    # 3. Determine Early Exit Layer using a sliding window on Spearman correlation
     exit_layer = -1
-    if pairwise_jaccard:
-        for i, similarity in enumerate(pairwise_jaccard):
-            if similarity >= stability_threshold:
-                # Exit layer is the current layer in the pair (i.e., the second one)
-                exit_layer = valid_layers[i+1] 
-                break
+    # We need at least `stability_window` correlations to make a decision
+    if len(pairwise_stability) >= stability_window:
+        correlations_np = np.array(pairwise_stability)
+        # Create a view of the array with sliding windows
+        # shape: (num_windows, window_size)
+        windows = np.lib.stride_tricks.sliding_window_view(correlations_np, window_shape=stability_window)
+        avg_correlations = np.mean(windows, axis=1)
+        
+        # Find the first window where the average exceeds the threshold
+        stable_indices = np.where(avg_correlations >= stability_threshold)[0]
+        if len(stable_indices) > 0:
+            first_stable_window_idx = stable_indices[0]
+            # The exit layer is the layer at the END of this first stable window.
+            # The correlations start at valid_layers[1]. A window of size 3 at index 0
+            # involves layers [1, 2, 3]. So the exit is at layer 3.
+            # General formula: index_in_valid_layers = first_stable_window_idx + stability_window
+            exit_layer = valid_layers[first_stable_window_idx + stability_window]
     
     return {
         'valid_layers': valid_layers,
         'accuracies': accuracies,
-        'pairwise_jaccard': pairwise_jaccard,
+        'pairwise_stability': pairwise_stability, # Note the new name
         'exit_layer': exit_layer,
-        'k_absolute': k_absolute
     }
 
 def compute_adaptive_exit_metrics_for_dataset(
@@ -241,20 +245,20 @@ def compute_adaptive_exit_metrics_for_dataset(
     fastkv_data_for_ds: Dict,
     k_percentage: float,
     stability_threshold: float,
+    stability_window: int,
     fixed_layer: int,
 ) -> Dict[str, float]:
     """
-    Computes and aggregates adaptive vs. fixed layer metrics across all samples in a dataset.
+    Computes and aggregates adaptive (Spearman's ρ) vs. fixed layer metrics across all samples in a dataset.
 
     For each sample, this function:
-    1. Calculates the adaptive exit layer based on stability (`stability_threshold`).
+    1. Calculates the adaptive exit layer based on Spearman's ρ with a sliding window.
     2. Records the retrieval accuracy at that adaptive layer.
     3. Records the retrieval accuracy at a specified `fixed_layer`.
     4. Averages these metrics across all common samples in the dataset.
 
     Returns:
         A dictionary with aggregated results, or an empty dict if no valid samples are found.
-        Example: {'avg_adaptive_layer': 12.3, 'avg_adaptive_accuracy': 0.85, 'avg_fixed_accuracy': 0.88}
     """
     common_keys = sorted(list(set(oracle_data_for_ds.keys()) & set(fastkv_data_for_ds.keys())))
     if not common_keys:
@@ -263,10 +267,9 @@ def compute_adaptive_exit_metrics_for_dataset(
     adaptive_layers, adaptive_accuracies, fixed_accuracies = [], [], []
 
     for sample_key in common_keys:
-        oracle_sample = oracle_data_for_ds[sample_key]
-        fastkv_sample = fastkv_data_for_ds[sample_key]
+        oracle_sample = oracle_data_for_ds.get(sample_key, {})
+        fastkv_sample = fastkv_data_for_ds.get(sample_key, {})
 
-        # Ensure rankings data is deserialized from bytes if needed
         deserialize_rankings_in_sample(fastkv_sample)
 
         oracle_ranking = oracle_sample.get('ranking')
@@ -275,12 +278,13 @@ def compute_adaptive_exit_metrics_for_dataset(
         if oracle_ranking is None or not fastkv_rankings:
             continue
         
-        # Calculate evolution metrics for this single sample
+        # Use our new stability metric function to get the exit layer and accuracies for this sample
         metrics = calculate_stability_evolution_metrics(
             oracle_ranking=oracle_ranking,
             fastkv_rankings=fastkv_rankings,
             k_percentage=k_percentage,
             stability_threshold=stability_threshold,
+            stability_window=stability_window,
         )
 
         valid_layers = metrics['valid_layers']
@@ -298,7 +302,7 @@ def compute_adaptive_exit_metrics_for_dataset(
             adaptive_layers.append(layer_to_use)
             adaptive_accuracies.append(per_layer_accuracies[adaptive_idx])
         except (ValueError, IndexError):
-            continue # Skip sample if the layer isn't found for some reason
+            continue # Skip sample if the layer isn't found
 
         # 2. Determine Fixed Layer Accuracy
         # Find the closest available layer to the target fixed_layer
@@ -307,8 +311,8 @@ def compute_adaptive_exit_metrics_for_dataset(
             fixed_idx = valid_layers.index(closest_layer)
             fixed_accuracies.append(per_layer_accuracies[fixed_idx])
         except (ValueError, IndexError):
-            # This can happen if adaptive logic ran but fixed didn't have a match
-            # To keep lists aligned, we might skip or use a nan. Skipping is safer.
+            # If fixed layer calc fails, we must discard the adaptive results for this sample
+            # to keep the lists parallel for accurate averaging.
             adaptive_layers.pop()
             adaptive_accuracies.pop()
             continue
@@ -321,4 +325,3 @@ def compute_adaptive_exit_metrics_for_dataset(
         'avg_adaptive_accuracy': np.mean(adaptive_accuracies),
         'avg_fixed_accuracy': np.mean(fixed_accuracies),
     }
-
