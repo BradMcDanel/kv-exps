@@ -125,11 +125,10 @@ def aggregate_results(base_path):
             if method_root == "fullkv":
                 continue
             
-            # *** FIX: Construct folder name based on the method ***
             if method_root in ["fastkv", "oracle"]:
-                folder_name = f"{method_root}_l{TSP_LAYER}_{rate}p"
-            else: # For specprefill and other potential future methods
-                folder_name = f"{method_root}_{rate}p"
+                folder_name = f"{method_root}-l{TSP_LAYER}-{rate}p"
+            else:
+                folder_name = f"{method_root}-l{TSP_LAYER}-{rate}p"
             
             process_folder(folder_name, method_root, rate)
 
