@@ -69,11 +69,23 @@ def setup_model_and_tokenizer(args):
     elif args.mode == "oracle":
         from baseline.oracle.main import OraclePrefillPipeline as Pipeline
         logging.info("Initializing OraclePrefillPipeline...")
+        
+        # Handle potentially conflicting capacity arguments. Prioritize percentage.
+        max_cap_prompt = args.max_capacity_prompt
+        max_cap_pct = args.max_capacity_prompt_percentage
+        if max_cap_pct is not None:
+            if max_cap_prompt is not None:
+                logging.info(f"Using `max_capacity_prompt_percentage={max_cap_pct}`. Ignoring `max_capacity_prompt={max_cap_prompt}`.")
+            max_cap_prompt = None # Nullify absolute value if percentage is given
+        
         pipeline = Pipeline(
             base_model_name=args.model,
             tokenizer=tokenizer,
             oracle_rankings_path=args.oracle_rankings_path,
             keep_percentage=args.keep_percentage,
+            tsp_idx=args.tsp_idx,
+            max_capacity_prompt=max_cap_prompt,
+            max_capacity_prompt_percentage=max_cap_pct,
         )
     elif args.mode == "uniform":
         from baseline.uniform.main import UniformRandomPipeline as Pipeline

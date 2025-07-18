@@ -6,6 +6,7 @@ device=0
 keep_percentage=0.1
 oracle_rankings_path="analysis_results/oracles"
 path="oracle"
+tsp_idx=15  # Set to None or comment out to disable TSP
 
 for dataset in $dataset_list
 do
@@ -15,7 +16,8 @@ do
         --save_path $path \
         --dataset $dataset \
         --keep_percentage $keep_percentage \
-        --oracle_rankings_path $oracle_rankings_path
+        --oracle_rankings_path $oracle_rankings_path \
+        --tsp_idx $tsp_idx
 
     CUDA_VISIBLE_DEVICES=$device python -m eval.longbench.evaluate \
         --model $model \

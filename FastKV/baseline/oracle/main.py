@@ -23,6 +23,9 @@ class OraclePrefillPipeline:
         oracle_rankings_path: str,
         keep_percentage: float = 0.1,
         detailed_timing: bool = True,
+        tsp_idx: Optional[int] = None,
+        max_capacity_prompt: Optional[int] = None,
+        max_capacity_prompt_percentage: Optional[float] = None,
     ):
         self.base_model_name = base_model_name
         self.tokenizer = tokenizer
@@ -34,6 +37,9 @@ class OraclePrefillPipeline:
         self.oracle_rankings_path = oracle_rankings_path
         self.keep_percentage = keep_percentage
         self.detailed_timing = detailed_timing
+        self.tsp_idx = tsp_idx
+        self.max_capacity_prompt = max_capacity_prompt
+        self.max_capacity_prompt_percentage = max_capacity_prompt_percentage
         
         self._validate_config()
         self.eos_token_ids = self._extract_eos_token_ids()
@@ -123,7 +129,14 @@ class OraclePrefillPipeline:
             raise ValueError("Input IDs from prompt do not match Input IDs from the oracle file!")
 
         ranking_scores = torch.from_numpy(oracle_data['ranking']).to(self.device)
-        num_to_keep = int(prompt_length * self.keep_percentage)
+        
+        # Use max_capacity_prompt parameters like FastKV, with keep_percentage as fallback
+        if self.max_capacity_prompt_percentage is not None:
+            num_to_keep = int(prompt_length * self.max_capacity_prompt_percentage)
+        elif self.max_capacity_prompt is not None:
+            num_to_keep = self.max_capacity_prompt
+        else:
+            num_to_keep = int(prompt_length * self.keep_percentage)
 
         if num_to_keep >= prompt_length:
             indices_to_keep = torch.arange(prompt_length, device=self.device, dtype=torch.long)
@@ -139,6 +152,7 @@ class OraclePrefillPipeline:
         run_metadata["prompt_input_length"] = prompt_length
         run_metadata["selective_prefill_kept_token_count"] = selected_prompt_ids.shape[1]
         run_metadata["token_keep_rate"] = (selected_prompt_ids.shape[1] / prompt_length * 100.0) if prompt_length > 0 else 100.0
+        run_metadata["tsp_enabled"] = self.tsp_idx is not None
 
         # --- Stage 2: Base Model Selective Prefill ---
         if self.detailed_timing: prefill_start_event.record()
@@ -150,6 +164,12 @@ class OraclePrefillPipeline:
             use_cache=True,
             cache_position=selective_cache_pos
         )
+        
+        # TSP is just a layer designation - the token selection has already been done
+        # using oracle rankings instead of FastKV's attention-based selection
+        tsp_position_ids = selective_pos_ids
+        
+        # Get next token from the last position
         base_model_next_token_ids = torch.argmax(base_out.logits[:, -1, :], dim=-1, keepdim=True)
         base_model_cache_after_prefill = base_out.past_key_values
 
@@ -173,7 +193,9 @@ class OraclePrefillPipeline:
             if first_gen_token_id not in self.eos_token_ids:
                 # The generation must continue from the position of the LAST token in the original sequence
                 # that we kept, not from the length of the compressed cache.
-                start_pos_for_generation = (selective_pos_ids[0, -1] + 1).item() if selective_pos_ids.numel() > 0 else 0
+                # Use TSP position IDs if available, otherwise use selective position IDs
+                pos_ids_to_use = tsp_position_ids if self.tsp_idx is not None else selective_pos_ids
+                start_pos_for_generation = (pos_ids_to_use[0, -1] + 1).item() if pos_ids_to_use.numel() > 0 else 0
 
                 for i in range(max_generation_length - 1):
                     current_cache_len = current_decode_kv_cache.get_seq_length(0)
@@ -218,6 +240,7 @@ def main():
     parser.add_argument("--keep_percentage", type=float, default=0.05, help="Percentage of prompt tokens to keep for prefill (e.g., 0.05 for 5%).")
     parser.add_argument("--max_generation_length", type=int, default=128, help="Maximum number of tokens to generate.")
     parser.add_argument("--max_prompt_len", type=int, default=8192, help="Maximum prompt length to consider.")
+    parser.add_argument("--tsp_idx", type=int, default=None, help="Layer index for TSP token selection. If None, TSP is disabled.")
     
     args = parser.parse_args()
     
@@ -230,6 +253,7 @@ def main():
         tokenizer=tokenizer,
         oracle_rankings_path=args.oracle_rankings_path,
         keep_percentage=args.keep_percentage,
+        tsp_idx=args.tsp_idx,
     )
 
     # --- Load Prompt and Find Sample Key ---
@@ -274,6 +298,7 @@ def main():
     print(f"Base Model: {args.base_model_name}")
     print(f"Dataset: {args.dataset_name} | Sample Key: {target_sample_key}")
     print(f"Keep Percentage: {args.keep_percentage:.1%}")
+    print(f"TSP Layer: {args.tsp_idx if args.tsp_idx is not None else 'Disabled'}")
     print("-" * 43)
 
     generated_text, run_metadata = pipeline.run(
@@ -292,6 +317,9 @@ def main():
     print(f"Prompt Length (Original): {run_metadata.get('prompt_input_length', 'N/A')} tokens")
     print(f"Kept for Prefill (Compressed): {run_metadata.get('selective_prefill_kept_token_count', 'N/A')} tokens")
     print(f"Token Keep Rate: {run_metadata.get('token_keep_rate', 0):.2f}%")
+    print(f"TSP Enabled: {run_metadata.get('tsp_enabled', False)}")
+    if run_metadata.get('tsp_enabled', False):
+        print(f"TSP Applied Tokens: {run_metadata.get('tsp_applied_tokens', 'N/A')}")
     print(f"Time to First Token (TTFT): {run_metadata.get('ttft', 0):.4f} seconds")
     print(f"  - Base Model Prefill Time: {run_metadata.get('base_prefill_time', 0):.4f} s")
     print(f"Decoding Time: {run_metadata.get('decode_time', 0):.4f} seconds")

@@ -1,4 +1,5 @@
-#!/usr/bin/env python3
+# eval/longbench/aggregate.py
+
 """
 Script to aggregate LongBench results across different KV cache methods.
 Reads results.json files from each method folder and outputs to CSV.
