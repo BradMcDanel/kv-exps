@@ -20,12 +20,12 @@ MODEL_NAME = "LLaMA-3.1-8B-Instruct"
 # Hardcoded TSP layer for methods that require it ***
 TSP_LAYER = 0
 
-METHOD_ROOTS = ["fullkv", "fastkv", "specprefill", "oracle"]
+METHOD_ROOTS = ["fullkv", "oracle", "fastkv", "specprefill"]
 
 METHOD_DISPLAY_NAMES = {
     "fullkv": "Full~KV",
-    "fastkv": "FastKV",
-    "specprefill": "SpecPrefill",
+    "fastkv": "FastKV~\\cite{jo2025fastkv}",
+    "specprefill": "SpecPrefill~\\cite{liu2025speculative}",
     "oracle": "Oracle"
 }
 
@@ -133,7 +133,7 @@ def aggregate_results(base_path):
             process_folder(folder_name, method_root, rate)
 
     for rate in grouped_results:
-        grouped_results[rate].sort(key=lambda x: x['method_name'])
+        grouped_results[rate].sort(key=lambda x: METHOD_ROOTS.index(x['method_root']))
         
     return grouped_results
 
@@ -171,7 +171,7 @@ def generate_latex_table(grouped_results):
     print(r"      \midrule")
     print(r"      \midrule")
 
-    sorted_keep_rates = sorted(grouped_results.keys(), reverse=True)
+    sorted_keep_rates = sorted(grouped_results.keys())
     
     for i, rate in enumerate(sorted_keep_rates):
         results_for_rate = grouped_results[rate]
@@ -179,8 +179,8 @@ def generate_latex_table(grouped_results):
         valid_avgs = [res['avg'] for res in results_for_rate if res['avg'] is not None]
         max_avg = max(valid_avgs) if valid_avgs else None
         
-        rate_display = "100\\% (Full KV)" if rate == 100 else f"{rate}\\%"
-        print(rf"\multicolumn{{18}}{{c}}{{\textbf{{{MODEL_NAME}, Keep Token Rate = {rate_display}}}}} \\")
+        rate_display = "100\\%" if rate == 100 else f"{rate * 10}\\%"
+        print(rf"\multicolumn{{18}}{{c}}{{\textbf{{Keep Token Rate = {rate_display}}}}} \\")
         print(r"\midrule")
         
         for res in results_for_rate:
@@ -199,9 +199,6 @@ def generate_latex_table(grouped_results):
             else:
                 avg_str = "   -"
             
-            # *** UPDATED: Added 'oracle' to the highlight list ***
-            if res['method_root'] in ['fastkv', 'specprefill', 'oracle']:
-                print(r"\rowcolor[HTML]{DAE8FC}")
 
             line1 = f"{method_cell} & " + " & ".join(score_cells[0:6])
             line2 = "          & " + " & ".join(score_cells[6:12])
