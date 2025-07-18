@@ -24,8 +24,8 @@ METHOD_ROOTS = ["fullkv", "oracle", "fastkv", "specprefill"]
 
 METHOD_DISPLAY_NAMES = {
     "fullkv": "Full~KV",
-    "fastkv": "FastKV~\\cite{jo2025fastkv}",
-    "specprefill": "SpecPrefill~\\cite{liu2025speculative}",
+    "fastkv": "FastKV",
+    "specprefill": "SpecPrefill",
     "oracle": "Oracle"
 }
 
