@@ -171,7 +171,7 @@ def generate_latex_table(grouped_results):
     print(r"      \midrule")
     print(r"      \midrule")
 
-    sorted_keep_rates = sorted(grouped_results.keys())
+    sorted_keep_rates = sorted(grouped_results.keys(), key=lambda x: (x != 100, x))
     
     for i, rate in enumerate(sorted_keep_rates):
         results_for_rate = grouped_results[rate]
