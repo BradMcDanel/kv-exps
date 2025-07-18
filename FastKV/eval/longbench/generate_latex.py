@@ -125,8 +125,8 @@ def aggregate_results(base_path):
             if method_root == "fullkv":
                 continue
             
-            if method_root in ["fastkv", "oracle"]:
-                folder_name = f"{method_root}-l{TSP_LAYER}-{rate}p"
+            if method_root == "specprefill":
+                folder_name = f"{method_root}-{rate}p"
             else:
                 folder_name = f"{method_root}-l{TSP_LAYER}-{rate}p"
             
