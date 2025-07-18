@@ -1,10 +1,13 @@
 # baseline/uniform/main.py
 import os
 import time
+import argparse
+import json
 from typing import List, Dict, Tuple, Optional, Any
 
 import torch
 import numpy as np
+from datasets import load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
 from transformers.cache_utils import Cache, DynamicCache
 
@@ -22,6 +25,7 @@ class UniformRandomPipeline:
         first_k: int = 64,
         last_k: int = 256,
         detailed_timing: bool = True,
+        tsp_idx: Optional[int] = None,
     ):
         self.base_model_name = base_model_name
         self.tokenizer = tokenizer
@@ -34,6 +38,7 @@ class UniformRandomPipeline:
         self.first_k = first_k
         self.last_k = last_k
         self.detailed_timing = detailed_timing
+        self.tsp_idx = tsp_idx
         
         self._validate_config()
         self.eos_token_ids = self._extract_eos_token_ids()
@@ -105,6 +110,7 @@ class UniformRandomPipeline:
         run_metadata["prompt_input_length"] = prompt_length
         run_metadata["selective_prefill_kept_token_count"] = selected_prompt_ids.shape[1]
         run_metadata["token_keep_rate"] = (selected_prompt_ids.shape[1] / prompt_length * 100.0) if prompt_length > 0 else 100.0
+        run_metadata["tsp_enabled"] = self.tsp_idx is not None
 
         # --- Stage 2: Base Model Selective Prefill ---
         if self.detailed_timing: prefill_start_event.record()
@@ -147,3 +153,83 @@ class UniformRandomPipeline:
 
         final_gen_text = self.tokenizer.decode(gen_token_ids_list, skip_special_tokens=True)
         return final_gen_text, run_metadata
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Run uniform random baseline for KV cache compression.",
+                                     formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    parser.add_argument("--base_model_name", type=str, default="meta-llama/Llama-3.1-8B-Instruct")
+    parser.add_argument("--dataset_name", type=str, default="qasper", help="Name of the LongBench dataset to test.")
+    parser.add_argument("--sample_idx", type=int, default=0, help="The index of the sample to use from the dataset.")
+    parser.add_argument("--keep_percentage", type=float, default=0.05, help="Percentage of prompt tokens to keep for prefill (e.g., 0.05 for 5%).")
+    parser.add_argument("--first_k", type=int, default=64, help="Number of first tokens to always keep.")
+    parser.add_argument("--last_k", type=int, default=256, help="Number of last tokens to always keep.")
+    parser.add_argument("--max_generation_length", type=int, default=128, help="Maximum number of tokens to generate.")
+    parser.add_argument("--max_prompt_len", type=int, default=8192, help="Maximum prompt length to consider.")
+    parser.add_argument("--tsp_idx", type=int, default=None, help="Layer index for TSP token selection. If None, TSP is disabled.")
+    
+    args = parser.parse_args()
+    
+    tokenizer = AutoTokenizer.from_pretrained(args.base_model_name, trust_remote_code=True)
+    if tokenizer.pad_token is None and tokenizer.eos_token is not None:
+        tokenizer.pad_token = tokenizer.eos_token
+        
+    pipeline = UniformRandomPipeline(
+        base_model_name=args.base_model_name,
+        tokenizer=tokenizer,
+        keep_percentage=args.keep_percentage,
+        first_k=args.first_k,
+        last_k=args.last_k,
+        tsp_idx=args.tsp_idx,
+    )
+
+    # --- Load Prompt ---
+    try:
+        # Construct path relative to this script's location
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        project_root = os.path.abspath(os.path.join(script_dir, '..', '..'))
+        prompt_config_path = os.path.join(project_root, 'eval', 'longbench', 'config', 'dataset2prompt.json')
+        
+        with open(prompt_config_path, "r") as f:
+            dataset2prompt = json.load(f)
+        
+        data = load_dataset('THUDM/LongBench', args.dataset_name, split='test', trust_remote_code=True)
+        sample = data[args.sample_idx]
+
+        raw_prompt = dataset2prompt[args.dataset_name].format(**sample)
+        messages = [{"role": "user", "content": raw_prompt}]
+        templated_prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+
+    except (FileNotFoundError, IndexError, KeyError) as e:
+        print(f"Error loading data or prompt: {e}")
+        return
+
+    inputs = tokenizer(templated_prompt, return_tensors="pt", truncation=True, max_length=args.max_prompt_len).to(pipeline.device)
+
+    print(f"\n--- Running Uniform Random Baseline ---")
+    print(f"Base Model: {args.base_model_name}")
+    print(f"Dataset: {args.dataset_name} | Sample: {args.sample_idx}")
+    print(f"Keep Percentage: {args.keep_percentage:.1%}")
+    print(f"First K: {args.first_k} | Last K: {args.last_k}")
+    print(f"TSP Layer: {args.tsp_idx if args.tsp_idx is not None else 'Disabled'}")
+    print("-" * 43)
+
+    generated_text, run_metadata = pipeline.run(
+        input_ids=inputs.input_ids,
+        max_generation_length=args.max_generation_length,
+    )
+    
+    print(f"\n--- Generated Text ---")
+    print(generated_text)
+    print("-" * 22)
+
+    print("\n--- Performance Metrics ---")
+    print(f"Prompt Length (Original): {run_metadata.get('prompt_input_length', 'N/A')} tokens")
+    print(f"Kept for Prefill (Compressed): {run_metadata.get('selective_prefill_kept_token_count', 'N/A')} tokens")
+    print(f"Token Keep Rate: {run_metadata.get('token_keep_rate', 0):.2f}%")
+    print(f"TSP Enabled: {run_metadata.get('tsp_enabled', False)}")
+    print(f"Time to First Token (TTFT): {run_metadata.get('ttft', 0):.4f} seconds")
+    print("-" * 27)
+
+if __name__ == "__main__":
+    main()
