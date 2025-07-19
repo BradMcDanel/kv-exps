@@ -49,6 +49,10 @@ def main(args):
         from baseline.hfastkv.monkeypatch import replace_llama, replace_mistral
         replace_llama()
         replace_mistral()
+    elif args.mode == 'taper':
+        from baseline.taper.monkeypatch import replace_llama, replace_mistral
+        replace_llama()
+        replace_mistral()
     elif args.mode == 'snapkv':
         from baseline.snapkv.monkeypatch import replace_llama, replace_mistral, replace_phi3
         replace_llama()
@@ -98,22 +102,20 @@ def main(args):
         from baseline.speculative_prefill.main import SpeculativePrefillPipeline
         print("Initializing SpeculativePrefillPipeline for benchmarking...")
         
-        # FIX: Handle potentially conflicting capacity arguments. Prioritize percentage.
         max_cap_prompt = args.max_capacity_prompt
         if args.max_capacity_prompt_percentage is not None:
-            # If percentage is specified, nullify the absolute value to avoid conflict.
             max_cap_prompt = None
 
         pipeline = SpeculativePrefillPipeline(
             base_model_name=args.model,
             speculator_model_name=args.speculator_model_name,
             tokenizer=tokenizer,
-            max_capacity_prompt=max_cap_prompt, # Use the corrected value
+            max_capacity_prompt=max_cap_prompt,
             max_capacity_prompt_percentage=args.max_capacity_prompt_percentage,
             pool_kernel_size=args.kernel_size if args.pooling != 'none' else None,
             pool_type=args.pooling,
-            use_chunk_selection=True, # Assuming default behavior
-            chunk_size=64, # Assuming default behavior
+            use_chunk_selection=True,
+            chunk_size=64,
             detailed_timing=args.detailed_timing,
         )
         model_device = pipeline.device
@@ -126,6 +128,9 @@ def main(args):
         if args.mode == 'fastkv':
             from baseline.fastkv.fastkv_utils import compress
             compress(model, args)
+        elif args.mode == 'taper':
+            from baseline.taper.taper_utils import compress
+            compress(model, args)
         elif args.mode == 'hfastkv':
             from baseline.hfastkv.hfastkv_utils import compress
             compress(model, args)
@@ -136,7 +141,7 @@ def main(args):
             from baseline.adakv.adaptive_snapkv.snapkv_utils import compress
             compress(model, args)
         elif args.mode == 'headkv':
-            from baseline.headkv.headkv.snapkv_utils import compress
+            from baseline.headkv.headkv_utils import compress
             compress(model, args)
         
     # Input Sequence      
@@ -203,15 +208,27 @@ def main(args):
 
     print(f"\nMode: {args.mode}")
     print(f"Context Length = {context_length}")
-    if args.mode == "draft_tsp":
+    if args.mode == "draft_tsp" or args.mode == "taper":
         print(f"TSP Schedule = '{args.tsp_schedule}'")
+    elif args.mode == 'fastkv':
+        if args.max_capacity_prompt_percentage:
+            print(f"Context Capacity: {args.max_capacity_prompt_percentage:.1%}")
+        else:
+            print(f"Context Capacity: {args.max_capacity_prompt} tokens")
+        if args.tsp_len_percentage:
+            print(f"TSP Length: {args.tsp_len_percentage:.1%}")
+        else:
+            print(f"TSP Length: {args.tsp_len} tokens")
     elif args.mode == "speculative_prefill":
         if args.max_capacity_prompt_percentage:
             print(f"Max Prompt Capacity: {args.max_capacity_prompt_percentage:.1%}")
         else:
             print(f"Max Prompt Capacity: {args.max_capacity_prompt} tokens")
     elif args.mode != "fullkv":
-        print(f"Context Capacity = {args.max_capacity_prompt}")
+        if args.max_capacity_prompt_percentage:
+            print(f"Context Capacity: {args.max_capacity_prompt_percentage:.1%}")
+        else:
+            print(f"Context Capacity: {args.max_capacity_prompt} tokens")
     
     print(f"TTFT: {(mean_ttft):.5f} msec")
 
@@ -233,12 +250,10 @@ if __name__ == "__main__":
     parser.add_argument("--model", type=str, default="meta-llama/Meta-Llama-3.1-8B-Instruct", help="model name of model path")
     parser.add_argument("--seed", type=int, default=42, help="Seed")
 
-    # ==================== ADD DRAFT_TSP TO CHOICES AND ITS ARGS ====================
-    parser.add_argument("--mode", type=str, default="fastkv", choices=["fullkv", "fastkv", "snapkv", "gemfilter", "adakv", "headkv", "hfastkv", "draft_tsp", "speculative_prefill"])
+    parser.add_argument("--mode", type=str, default="fastkv", choices=["fullkv", "fastkv", "snapkv", "gemfilter", "adakv", "headkv", "hfastkv", "taper", "draft_tsp", "speculative_prefill"])
     parser.add_argument("--speculator_model_name", type=str, default="meta-llama/Llama-3.2-1B-Instruct", help="Speculator model for draft_tsp.")
     
     parser.add_argument("--look_ahead_k", type=int, default=8, help="Number of lookahead steps for Draft TSP.")
-    # =============================================================================
     
     # Common KV Compression Arguments
     parser.add_argument("--window_size", type=int, default=8)
@@ -250,8 +265,12 @@ if __name__ == "__main__":
     # FastKV
     parser.add_argument("--tsp_idx", type=int, default=15)
     parser.add_argument("--tsp_len", type=int, default=2048)
-    # Hierarchical FastKV / Draft TSP
-    parser.add_argument("--tsp_schedule", type=str, default="", help="Hierarchical TSP schedule for HFastKV/Draft_TSP, e.g., '15:2048'")
+    # ==================== ADDED ARGUMENT START ====================
+    parser.add_argument("--tsp_len_percentage", type=float, default=None, help="Use a percentage of the prompt length for TSP length (for FastKV).")
+    # ==================== ADDED ARGUMENT END ======================
+
+    # Hierarchical FastKV / Draft TSP / Taper
+    parser.add_argument("--tsp_schedule", type=str, default="", help="Hierarchical TSP schedule for HFastKV/Draft_TSP/Taper, e.g., '15:2048' or '7:0.8,15:0.5'")
 
     # GemFilter
     parser.add_argument("--filter_idx", type=int, default=13)
