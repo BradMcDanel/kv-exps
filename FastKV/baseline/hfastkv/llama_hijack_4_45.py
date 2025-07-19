@@ -165,7 +165,6 @@ def llama_model_forward(
         new_position_ids = getattr(decoder_layer, 'new_position_ids', None)
         if new_position_ids is not None:
             position_ids = new_position_ids
-            # *** THE FIX: Recompute rotary embeddings for the new, smaller set of tokens and positions ***
             position_embeddings = self.rotary_emb(layer_outputs[0], position_ids)
             
         hidden_states = layer_outputs[0]

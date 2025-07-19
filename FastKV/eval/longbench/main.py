@@ -132,6 +132,9 @@ def setup_model_and_tokenizer(args):
         elif args.mode == 'hfastkv':
             from baseline.hfastkv.monkeypatch import replace_llama, replace_mistral
             replace_llama(); replace_mistral()
+        elif args.mode == 'taper':
+            from baseline.taper.monkeypatch import replace_llama, replace_mistral
+            replace_llama(); replace_mistral()
         elif args.mode == 'snapkv':
             from baseline.snapkv.monkeypatch import replace_llama, replace_mistral, replace_phi3
             replace_llama(); replace_mistral(); replace_phi3()
@@ -156,17 +159,9 @@ def setup_model_and_tokenizer(args):
 
         if args.mode == 'fastkv':
             from baseline.fastkv.fastkv_utils import compress
-            # Handle potentially conflicting capacity arguments. Prioritize percentage.
-            if args.max_capacity_prompt_percentage is not None:
-                if args.max_capacity_prompt is not None:
-                    logging.info(f"Using `max_capacity_prompt_percentage={args.max_capacity_prompt_percentage}`. Ignoring `max_capacity_prompt={args.max_capacity_prompt}`.") 
-                args.max_capacity_prompt_percentage = args.max_capacity_prompt_percentage
-            else:
-                args.max_capacity_prompt_percentage = None
-            # Handle potentially conflicting TSP length arguments. Prioritize percentage.
-            if args.tsp_len_percentage is not None:
-                if args.tsp_len is not None:
-                    logging.info(f"Using `tsp_len_percentage={args.tsp_len_percentage}`. Ignoring `tsp_len={args.tsp_len}`.")
+            compress(model, args)
+        elif args.mode == 'taper':
+            from baseline.taper.taper_utils import compress
             compress(model, args)
         elif args.mode == 'hfastkv':
             from baseline.hfastkv.hfastkv_utils import compress
@@ -205,6 +200,10 @@ def generate_longbench(data, max_length, max_gen, prompt_format,
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if model is not None:
         device = model.device
+
+    if os.path.exists(out_path):
+        os.remove(out_path)
+        logging.info(f"Deleted existing output file: {out_path}")
 
     for i, json_obj in tqdm(enumerate(data), desc=f"Generating Responses for {args.mode}...", total=len(data)):
         try:
@@ -310,6 +309,11 @@ def main(args):
     max_gen = dataset2maxlen[dataset_name]
     max_length = model2maxlen[args.model]
     data_all = [data_sample for data_sample in data]
+    
+    # Apply limit if specified
+    if args.limit is not None:
+        data_all = data_all[:args.limit]
+        logging.info(f"Limited dataset to {len(data_all)} samples")
 
     generate_longbench(
         data=data_all, max_length=max_length, max_gen=max_gen, 
@@ -326,7 +330,10 @@ if __name__ == "__main__":
     parser.add_argument("--save_path", default="", type=str, help="Path to save the output")
 
     # KV Compression & Prefill Modes
-    parser.add_argument("--mode", type=str, default="fastkv", choices=["fullkv", "fastkv", "snapkv", "gemfilter", "adakv", "headkv", "speculative_prefill", "echo_cache", "hfastkv", "draft_tsp", "oracle", "uniform"])
+    parser.add_argument("--mode", type=str, default="fastkv", 
+                        choices=["fullkv", "fastkv", "snapkv", "gemfilter", "adakv", "headkv", 
+                                 "speculative_prefill", "echo_cache", "hfastkv", "draft_tsp", 
+                                 "oracle", "uniform", "taper"])
 
     parser.add_argument("--window_size", type=int, default=8)
     parser.add_argument("--max_capacity_prompt", type=int, default=512)
@@ -371,12 +378,14 @@ if __name__ == "__main__":
     parser.add_argument("--head_choice", type=str, default='reason', choices=['copy', 'reason'])
     parser.add_argument('--beta', type=float, default=1.2)
     parser.add_argument('--temp', type=float, default=1.0)
-    # Hierarchical Fast KV / Draft TSP
-    parser.add_argument("--tsp_schedule", type=str, default="", help="Hierarchical TSP schedule for HFastKV mode, e.g., '10:4096,15:2048'")
+    # TAPER
+    parser.add_argument("--tsp_schedule", type=str, default="", 
+                        help="Progressive TSP schedule. Format depends on mode: 'LAYER_IDX:KEEP_RATIO,...' e.g., '0:0.8,7:0.5'. ")
 
     # Evaluation
     parser.add_argument('--dataset', type=str, default='qasper', help="Dataset to evaluate on")
     parser.add_argument('--longbench_type', type=str, default='longbench', choices=['longbench', 'longbench-e'])
+    parser.add_argument('--limit', type=int, default=None, help="Limit number of samples to process (default: process all)")
 
     args = parser.parse_args()
     

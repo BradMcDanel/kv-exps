@@ -5,8 +5,13 @@ import torch.nn as nn
 import math
 import logging
 
+# Global variable to store original prompt length across all layers
+_prompt_len = None
+
 def compress(model, args): 
     layers = len(model.model.layers)
+    
+    logging.info(f"FastKV compress: layers={layers}, tsp_idx={args.tsp_idx}, max_capacity_prompt={args.max_capacity_prompt}, max_capacity_prompt_percentage={args.max_capacity_prompt_percentage}, tsp_len={args.tsp_len}, tsp_len_percentage={args.tsp_len_percentage}")
 
     for i in range(layers):
         model.model.layers[i].self_attn.kv_cluster.window_size = args.window_size
@@ -18,6 +23,7 @@ def compress(model, args):
         model.model.layers[i].self_attn.kv_cluster.tsp_len_percentage = args.tsp_len_percentage
         if i == args.tsp_idx:
             model.model.layers[i].self_attn.kv_cluster.tsp_layer = True
+            logging.info(f"FastKV: Set layer {i} as TSP layer")
         else:
             model.model.layers[i].self_attn.kv_cluster.tsp_layer = False
 
@@ -61,17 +67,28 @@ class FastKVCluster():
     def update_kv(self, key_states, query_states, value_states, attention_mask, num_key_value_groups, layer_idx):
         # check if prefix phase
         assert key_states.shape[-2] == query_states.shape[-2]
-        bsz, num_heads, q_len, head_dim = query_states.shape
+        bsz, _, q_len, head_dim = query_states.shape
+
+        # Set original prompt length globally on first call
+        # Reset for each new forward pass (when we hit layer 0)
+        global _prompt_len
+        if layer_idx == 0:
+            _prompt_len = q_len
+            logging.info(f"FastKV: Set global prompt length = {_prompt_len}")
+
+        # Use global original prompt length
+        self.original_prompt_len = _prompt_len
 
         if self.max_capacity_prompt_percentage is not None:
-            max_capacity_prompt = int(q_len * self.max_capacity_prompt_percentage)
+            max_capacity_prompt = int(self.original_prompt_len * self.max_capacity_prompt_percentage)
         else:
             max_capacity_prompt = self.max_capacity_prompt
 
         if self.tsp_len_percentage is not None:
-            tsp_length = int(q_len * self.tsp_len_percentage)
+            tsp_length = int(self.original_prompt_len * self.tsp_len_percentage)
         else:
             tsp_length = self.tsp_length
+
 
         if q_len < max_capacity_prompt:
             avg_indices = None
@@ -112,6 +129,7 @@ class FastKVCluster():
                 window_indices = torch.arange(q_len - self.window_size, q_len, device=tsp_indices.device).unsqueeze(0).repeat(bsz,1)
                 tsp_indices = torch.cat([tsp_indices, window_indices], dim=-1)
                 tsp_indices, _ = torch.sort(tsp_indices, dim=1)
+                logging.info(f"FastKV Layer {layer_idx}: TSP applied - selected {tsp_indices.shape[-1]} tokens")
             else:
                 tsp_indices = None
 
