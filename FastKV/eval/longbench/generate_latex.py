@@ -30,7 +30,8 @@ METHOD_DISPLAY_NAMES = {
     "taper": "CLAA (ours)"
 }
 
-KEEP_RATES_PERCENT = [1, 2, 4]
+# Changed to decimal format to match new folder naming
+KEEP_RATES_DECIMAL = [0.01, 0.02, 0.04]  # 1%, 2%, 4%
 
 DATASETS = [
     ("narrativeqa", "NrtvQA"),
@@ -78,6 +79,18 @@ def load_results(results_file):
         log_message(f"Warning: Could not load {results_file}: {e}")
         return {}
 
+def decimal_to_percent_display(decimal_rate):
+    """Convert decimal rate to percentage display string."""
+    if decimal_rate == 1.0:
+        return "100\\%"
+    else:
+        # Convert to percentage and format as integer if it's a whole number
+        percent = decimal_rate * 100
+        if percent == int(percent):
+            return f"{int(percent)}\\%"
+        else:
+            return f"{percent:.1f}\\%"
+
 # --- Core Logic ---
 
 def aggregate_results(base_path):
@@ -118,21 +131,24 @@ def aggregate_results(base_path):
         
         grouped_results[keep_rate].append(row)
 
+    # Process fullkv (100% keep rate)
     if "fullkv" in METHOD_ROOTS:
-        process_folder("fullkv", "fullkv", 100)
+        process_folder("fullkv", "fullkv", 1.0)  # Use 1.0 for 100%
         
-    for rate in KEEP_RATES_PERCENT:
+    # Process other methods with decimal rates
+    for rate in KEEP_RATES_DECIMAL:
         for method_root in METHOD_ROOTS:
             if method_root == "fullkv":
                 continue
             
             if method_root == "specprefill":
-                folder_name = f"{method_root}-{rate}p"
+                folder_name = f"{method_root}_{rate}p"
             else:
-                folder_name = f"{method_root}-l{TSP_LAYER}-{rate}p"
+                folder_name = f"{method_root}_l{TSP_LAYER}_{rate}p"
             
             process_folder(folder_name, method_root, rate)
 
+    # Sort results within each rate group
     for rate in grouped_results:
         grouped_results[rate].sort(key=lambda x: METHOD_ROOTS.index(x['method_root']))
         
@@ -172,7 +188,8 @@ def generate_latex_table(grouped_results):
     print(r"      \midrule")
     print(r"      \midrule")
 
-    sorted_keep_rates = sorted(grouped_results.keys(), key=lambda x: (x != 100, x))
+    # Sort keep rates: 100% first, then ascending order
+    sorted_keep_rates = sorted(grouped_results.keys(), key=lambda x: (x != 1.0, x))
     
     for i, rate in enumerate(sorted_keep_rates):
         results_for_rate = grouped_results[rate]
@@ -180,7 +197,7 @@ def generate_latex_table(grouped_results):
         valid_avgs = [res['avg'] for res in results_for_rate if res['avg'] is not None]
         max_avg = max(valid_avgs) if valid_avgs else None
         
-        rate_display = "100\\%" if rate == 100 else f"{rate * 10}\\%"
+        rate_display = decimal_to_percent_display(rate)
         print(rf"\multicolumn{{18}}{{c}}{{\textbf{{Keep Token Rate = {rate_display}}}}} \\")
         print(r"\midrule")
         
@@ -228,7 +245,7 @@ def main():
     log_message(f"Aggregating LongBench results from: {base_path}")
     log_message(f"Model: {MODEL_NAME}")
     log_message(f"Target methods: {METHOD_ROOTS}")
-    log_message(f"Target keep rates (%): {KEEP_RATES_PERCENT}")
+    log_message(f"Target keep rates (decimal): {KEEP_RATES_DECIMAL}")
     log_message("-" * 30)
 
     grouped_results = aggregate_results(base_path)
