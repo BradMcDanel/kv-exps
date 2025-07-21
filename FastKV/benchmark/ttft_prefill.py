@@ -2,20 +2,8 @@ import sys
 sys.path.append(".")
 
 import argparse
-import os
-import time
-import json
-import logging
-import pprint
-from tqdm import tqdm
-from pathlib import Path
-
 import torch
-import torch.nn as nn
-
-from accelerate import dispatch_model, load_checkpoint_in_model, infer_auto_device_map
 from transformers import AutoModelForCausalLM, AutoTokenizer, set_seed
-from datasets import load_dataset
 
 from utils import utils
 
@@ -76,6 +64,10 @@ def main(args):
         pass
     elif args.mode == 'speculative_prefill':
         pass
+    elif args.mode == 'oracle':
+        from baseline.oracle.monkeypatch import replace_llama, replace_mistral
+        replace_llama()
+        replace_mistral()
     else:
         raise ValueError(f"We does not support {args.mode} mode")
 
@@ -139,6 +131,13 @@ def main(args):
             compress(model, args)
         elif args.mode == 'adakv':
             from baseline.adakv.adaptive_snapkv.snapkv_utils import compress
+            compress(model, args)
+        elif args.mode == 'oracle':
+            from baseline.oracle.oracle_utils import compress, set_oracle_rankings
+            # For benchmarking, use random rankings since we don't have precomputed ones
+            import numpy as np
+            random_rankings = np.random.rand(args.seqlen).astype(np.float32)
+            set_oracle_rankings(random_rankings)
             compress(model, args)
         elif args.mode == 'headkv':
             from baseline.headkv.headkv_utils import compress
@@ -250,7 +249,7 @@ if __name__ == "__main__":
     parser.add_argument("--model", type=str, default="meta-llama/Meta-Llama-3.1-8B-Instruct", help="model name of model path")
     parser.add_argument("--seed", type=int, default=42, help="Seed")
 
-    parser.add_argument("--mode", type=str, default="fastkv", choices=["fullkv", "fastkv", "snapkv", "gemfilter", "adakv", "headkv", "hfastkv", "taper", "draft_tsp", "speculative_prefill"])
+    parser.add_argument("--mode", type=str, default="fastkv", choices=["fullkv", "fastkv", "snapkv", "gemfilter", "adakv", "headkv", "hfastkv", "taper", "draft_tsp", "speculative_prefill", "oracle"])
     parser.add_argument("--speculator_model_name", type=str, default="meta-llama/Llama-3.2-1B-Instruct", help="Speculator model for draft_tsp.")
     
     parser.add_argument("--look_ahead_k", type=int, default=8, help="Number of lookahead steps for Draft TSP.")

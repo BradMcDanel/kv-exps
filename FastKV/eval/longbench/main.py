@@ -12,7 +12,7 @@ from tqdm import tqdm
 from pathlib import Path
 
 import torch
-import numpy as np # <-- Added for oracle data loading
+import numpy as np 
 
 from transformers import AutoModelForCausalLM, AutoTokenizer, set_seed
 from datasets import load_dataset
@@ -103,15 +103,11 @@ def setup_model_and_tokenizer(args):
                 args=args, # Pass all args for simplicity
             )
     else:
-        # All other modes are monkey-patching modes, including 'oracle'
         if args.mode == 'fullkv':
             from baseline.fullkv.monkeypatch import replace_llama, replace_mistral
             replace_llama(); replace_mistral()
         elif args.mode == 'fastkv':
             from baseline.fastkv.monkeypatch import replace_llama, replace_mistral
-            replace_llama(); replace_mistral()
-        elif args.mode == 'oracle': # Oracle is now a patching mode
-            from baseline.oracle.main import replace_llama, replace_mistral
             replace_llama(); replace_mistral()
         elif args.mode == 'hfastkv':
             from baseline.hfastkv.monkeypatch import replace_llama, replace_mistral
@@ -128,6 +124,9 @@ def setup_model_and_tokenizer(args):
         elif args.mode == 'adakv':
             from baseline.adakv.adaptive_snapkv.monkeypatch import replace_llama_adaptive, replace_mistral_adaptive
             replace_llama_adaptive(); replace_mistral_adaptive()
+        elif args.mode == 'oracle':
+            from baseline.oracle.monkeypatch import replace_llama, replace_mistral
+            replace_llama(); replace_mistral()
         elif args.mode == 'headkv':
             from baseline.headkv.headkv.monkeypatch import replace_llama, replace_mistral
             replace_llama(args.method); replace_mistral(args.method)
@@ -144,9 +143,6 @@ def setup_model_and_tokenizer(args):
         if args.mode == 'fastkv':
             from baseline.fastkv.fastkv_utils import compress
             compress(model, args)
-        elif args.mode == 'oracle': # Configure the patched oracle model
-            from baseline.oracle.main import compress
-            compress(model, args)
         elif args.mode == 'taper':
             from baseline.taper.taper_utils import compress
             compress(model, args)
@@ -161,6 +157,9 @@ def setup_model_and_tokenizer(args):
             set_topk(model, args.max_capacity_prompt, mode='gemfilter')
         elif args.mode == 'adakv':
             from baseline.adakv.adaptive_snapkv.snapkv_utils import compress
+            compress(model, args)
+        elif args.mode == 'oracle':
+            from baseline.oracle.oracle_utils import compress
             compress(model, args)
         elif args.mode == 'headkv':
             from baseline.headkv.headkv.snapkv_utils import compress
@@ -197,6 +196,34 @@ def generate_longbench(data, max_length, max_gen, prompt_format,
 
     for i, json_obj in tqdm(enumerate(data), desc=f"Generating Responses for {args.mode}...", total=len(data)):
         try:
+            # Oracle mode: check for rankings and skip if missing
+            if args.mode == 'oracle':
+                import os
+                import numpy as np
+                from baseline.oracle.oracle_utils import set_oracle_rankings
+                
+                # Construct path to oracle rankings file
+                oracle_file = os.path.join(args.oracle_rankings_path, args.oracle_model_name, f"{dataset}.npz")
+                sample_key = f"sample_{i}"
+                
+                if not os.path.exists(oracle_file):
+                    print(f"Oracle rankings file not found: {oracle_file}. Skipping sample {i}.")
+                    continue
+                
+                # Load rankings for this sample
+                try:
+                    oracle_data = np.load(oracle_file)
+                    if sample_key not in oracle_data:
+                        print(f"Sample {sample_key} not found in {oracle_file}. Skipping sample {i}.")
+                        continue
+                    
+                    sample_data = oracle_data[sample_key].item()
+                    rankings = sample_data['ranking']
+                    set_oracle_rankings(rankings)
+                    
+                except Exception as e:
+                    print(f"Error loading oracle rankings for sample {i}: {e}. Skipping.")
+                    continue
             prompt = prompt_format.format(**json_obj)
             # Tokenize once to check length, then decode for truncation
             tokenized_prompt_ids = tokenizer.encode(prompt, add_special_tokens=False)
@@ -213,49 +240,20 @@ def generate_longbench(data, max_length, max_gen, prompt_format,
             
             pred = ""
             
-            # --- MODIFICATION START: Unified generation loop ---
             if pipeline is not None:
-                # This block now only handles true pipeline-based modes like speculative_prefill, uniform, etc.
-                # The old 'oracle' logic is removed from here.
                 if args.mode == "uniform":
                      pred, _ = pipeline.run(
                         input_ids=inputs.input_ids,
                         max_generation_length=max_gen,
                     )
-                else: # Default behavior for other pipelines
+                else:
                     pred, _ = pipeline.run(
                         input_ids=inputs.input_ids,
                         look_ahead_k=args.look_ahead_k, 
                         max_generation_length=max_gen,
                     )
             else:
-                # This block handles all monkey-patched models, including the new 'oracle' mode.
                 with torch.inference_mode():
-                    
-                    # If in oracle mode, load and attach the rankings before generating.
-                    if args.mode == "oracle":
-                        sample_key = f"sample_{i}"
-                        model_name_sanitized = args.model.replace('/', '_')
-                        file_path = os.path.join(args.oracle_rankings_path, model_name_sanitized, f"{dataset}.npz")
-                        
-                        oracle_rankings_tensor = None
-                        if os.path.exists(file_path):
-                            with np.load(file_path, allow_pickle=True) as npz_file:
-                                if sample_key in npz_file:
-                                    oracle_data = npz_file[sample_key].item()
-                                    oracle_ids = torch.from_numpy(oracle_data['input_ids']).to(device).unsqueeze(0)
-                                    if torch.equal(inputs.input_ids, oracle_ids):
-                                        oracle_rankings_tensor = torch.from_numpy(oracle_data['ranking']).to(device)
-                                    else:
-                                        logging.warning(f"ID mismatch for {sample_key}. Skipping oracle ranking.")
-                                else:
-                                    logging.warning(f"Key '{sample_key}' not in oracle file. Skipping oracle ranking.")
-                        else:
-                            logging.warning(f"Oracle file not found: {file_path}. Skipping oracle ranking.")
-                        
-                        # Attach to model; it's okay if it's None, the hijack will handle it gracefully.
-                        model.oracle_rankings = oracle_rankings_tensor
-
                     # Standard generation call for all patched models
                     context_length = inputs.input_ids.shape[-1]
                     if args.mode == 'gemfilter':
@@ -271,10 +269,6 @@ def generate_longbench(data, max_length, max_gen, prompt_format,
                                 )[0]
                         pred = tokenizer.decode(output[context_length:], skip_special_tokens=True)
 
-                    # IMPORTANT: Clean up the attached attribute after the run to avoid side effects
-                    if args.mode == "oracle" and hasattr(model, "oracle_rankings"):
-                        del model.oracle_rankings
-            # --- MODIFICATION END ---
 
             print(pred)
             
@@ -350,15 +344,11 @@ if __name__ == "__main__":
     parser.add_argument("--mode", type=str, default="fastkv", 
                         choices=["fullkv", "fastkv", "snapkv", "gemfilter", "adakv", "headkv", 
                                  "speculative_prefill", "echo_cache", "hfastkv", "draft_tsp", 
-                                 "oracle", "uniform", "taper"])
+                                 "uniform", "taper", "oracle"])
 
     parser.add_argument("--window_size", type=int, default=8)
     parser.add_argument("--max_capacity_prompt", type=int, default=512)
     parser.add_argument("--max_capacity_prompt_percentage", type=float, default=None, help="Use a percentage of the prompt length for max capacity.")
-
-    # Oracle
-    parser.add_argument("--oracle_rankings_path", type=str, default="analysis_results/oracles", help="Path to the root directory of oracle .npz files for oracle mode.")
-    parser.add_argument("--keep_percentage", type=float, default=0.05, help="Percentage of prompt tokens to keep for oracle mode.")
 
     # Uniform
     parser.add_argument("--uniform_first_k", type=int, default=64, help="Number of initial tokens to always keep for uniform mode.")
@@ -398,6 +388,11 @@ if __name__ == "__main__":
     # TAPER
     parser.add_argument("--tsp_schedule", type=str, default="", 
                         help="Progressive TSP schedule. Format depends on mode: 'LAYER_IDX:KEEP_RATIO,...' e.g., '0:0.8,7:0.5'. ")
+    # Oracle
+    parser.add_argument("--oracle_rankings_path", type=str, default="", 
+                        help="Path to directory containing oracle rankings (.npz files)")
+    parser.add_argument("--oracle_model_name", type=str, default="", 
+                        help="Model name for oracle rankings (e.g., meta-llama_Llama-3.1-8B-Instruct)")
 
     # Evaluation
     parser.add_argument('--dataset', type=str, default='qasper', help="Dataset to evaluate on")
