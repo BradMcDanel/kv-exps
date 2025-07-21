@@ -108,47 +108,33 @@ class OracleCluster():
             avg_indices = None
             return key_states, value_states, avg_indices
         else:
-            key_states_temp = repeat_kv(key_states, num_key_value_groups)
-            attn_weights = torch.matmul(query_states[..., -self.window_size:, :], key_states_temp.transpose(2, 3)) / math.sqrt(head_dim)
-            mask = torch.full((self.window_size, self.window_size), torch.finfo(attn_weights.dtype).min, device=attn_weights.device)
-            mask_cond = torch.arange(mask.size(-1), device=attn_weights.device)
-            mask.masked_fill_(mask_cond < (mask_cond + 1).view(mask.size(-1), 1), 0)
-            mask = mask.to(attn_weights.device)
-            attention_mask = mask[None, None, :, :]
-
-            attn_weights[:, :, -self.window_size:, -self.window_size:] += attention_mask
-
-            attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-            attn_weights_sum = attn_weights[:, :, -self.window_size:, : -self.window_size].sum(dim = -2)
-            if self.pooling == 'avgpool':
-                attn_cache = F.avg_pool1d(attn_weights_sum, kernel_size = self.kernel_size, padding=self.kernel_size//2, stride=1)
-            elif self.pooling == 'maxpool':
-                attn_cache = F.max_pool1d(attn_weights_sum, kernel_size = self.kernel_size, padding=self.kernel_size//2, stride=1)
-            else:
-                raise ValueError('Pooling method not supported')
-
-            attn_cache = attn_cache.view(bsz, -1, num_key_value_groups, q_len-self.window_size).sum(dim=-2)
-            indices = attn_cache.topk(max_capacity_prompt - self.window_size, dim=-1).indices
-            indices = indices.unsqueeze(-1).expand(-1, -1, -1, head_dim)
+            # Use oracle rankings for KV cache compression (instead of attention heuristic)
+            oracle_rankings = get_oracle_rankings()
+            if oracle_rankings is None:
+                raise ValueError(f"Oracle Layer {layer_idx}: Precomputed rankings are required for KV cache compression")
+            if len(oracle_rankings) < q_len:
+                raise ValueError(f"Oracle Layer {layer_idx}: Rankings too short ({len(oracle_rankings)} < {q_len}) for KV cache compression")
             
-            k_past_compress = key_states[:, :, :-self.window_size, :].gather(dim = 2, index = indices)
-            v_past_compress = value_states[:, :, :-self.window_size, :].gather(dim = 2, index = indices)
+            # Convert oracle rankings to tensor and select top tokens for KV cache compression
+            rankings_tensor = torch.tensor(oracle_rankings[:q_len], device=key_states.device, dtype=torch.float32)
+            cache_indices = rankings_tensor[:-self.window_size].topk(max_capacity_prompt - self.window_size, dim=-1).indices
+            
+            # Expand indices for gathering from KV tensors
+            cache_indices = cache_indices.unsqueeze(0).repeat(bsz, 1)  # Expand for batch
+            cache_indices = cache_indices.unsqueeze(1).unsqueeze(-1).expand(-1, key_states.shape[1], -1, head_dim)
+            
+            # Compress KV cache using oracle-selected indices
+            k_past_compress = key_states[:, :, :-self.window_size, :].gather(dim=2, index=cache_indices)
+            v_past_compress = value_states[:, :, :-self.window_size, :].gather(dim=2, index=cache_indices)
             k_cur = key_states[:, :, -self.window_size:, :]
             v_cur = value_states[:, :, -self.window_size:, :]
-            key_states = torch.cat([k_past_compress, k_cur], dim = 2)
-            value_states = torch.cat([v_past_compress, v_cur], dim = 2)
+            key_states = torch.cat([k_past_compress, k_cur], dim=2)
+            value_states = torch.cat([v_past_compress, v_cur], dim=2)
+            
+            logging.info(f"Oracle Layer {layer_idx}: KV cache compressed using oracle rankings - kept {key_states.shape[-2]} tokens")
 
             if self.tsp_layer and (q_len > tsp_length):
-                # Use precomputed oracle rankings (required)
-                oracle_rankings = get_oracle_rankings()
-                if oracle_rankings is None:
-                    raise ValueError(f"Oracle Layer {layer_idx}: Precomputed rankings are required but not provided")
-                if len(oracle_rankings) < q_len:
-                    raise ValueError(f"Oracle Layer {layer_idx}: Rankings too short ({len(oracle_rankings)} < {q_len})")
-                
-                # Convert rankings to indices by getting top-k positions
-                rankings_tensor = torch.tensor(oracle_rankings[:q_len], device=attn_cache.device, dtype=torch.float32)
-                # Select top tokens based on precomputed rankings (excluding window)
+                # Use same oracle rankings for TSP sequence pruning
                 tsp_indices = rankings_tensor[:-self.window_size].topk(tsp_length - self.window_size, dim=-1).indices
                 tsp_indices = tsp_indices.unsqueeze(0).repeat(bsz, 1)  # Expand for batch
                 window_indices = torch.arange(q_len - self.window_size, q_len, device=tsp_indices.device).unsqueeze(0).repeat(bsz,1)
