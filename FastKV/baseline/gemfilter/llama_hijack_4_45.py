@@ -29,11 +29,14 @@ class LlamaSelectAttention(LlamaAttention):
         self._flash_attn_uses_top_left_mask = not is_flash_attn_greater_or_equal_2_10()
         self.reset()
         self.topk = 1024
+        self.topk_percentage = None
+        self.original_prompt_len = None
         self.select_layer_idx = 13
         self.select_mode = False
 
     def reset(self):
         self.indecies = None
+        self.original_prompt_len = None
         return
 
     # Adapted from LlamaAttention.forward

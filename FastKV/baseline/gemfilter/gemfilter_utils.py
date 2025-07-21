@@ -26,11 +26,22 @@ def find_context(self, query_states, key_states, print_idx_dis=False):
     b, h, n, d = key_states.shape
     if self.indecies is None and self.layer_idx == self.select_layer_idx:
         assert b == 1
+        
+        # Store original prompt length for percentage calculation
+        if self.original_prompt_len is None:
+            self.original_prompt_len = n
+            
+        # Calculate topk based on percentage or fixed value
+        if self.topk_percentage is not None:
+            effective_topk = int(self.original_prompt_len * self.topk_percentage)
+        else:
+            effective_topk = self.topk
+            
         key_states_repeat = repeat_kv(
             key_states, self.num_key_value_groups)
         query_last_states = query_states[:, :, -1:, :]
         _, indices = standard_dis_index(key_states_repeat, query_last_states, min(
-            self.topk, n), pool=True, sum_over_heads=True)
+            effective_topk, n), pool=True, sum_over_heads=True)
         self.indecies = indices
         if print_idx_dis:
             print(self.layer_idx, torch.min(torch.abs(indices-62383)))
@@ -78,6 +89,28 @@ def set_select_layer(model, select_layer_idx):
         for i in range(len(decoder_layers)):
             decoder_layers[i].self_attn.select_layer_idx = select_layer_idx
     return select_layer_idx
+
+def set_topk_percentage(model, topk_percentage):
+    decoder_layers = model.model.layers
+    for i in range(len(decoder_layers)):
+        decoder_layers[i].self_attn.topk_percentage = topk_percentage
+    return
+
+def compress(model, args):
+    """Configure GemFilter compression parameters similar to other methods"""
+    layers = len(model.model.layers)
+    
+    # Get percentage parameter if available
+    topk_percentage = getattr(args, 'topk_percentage', None)
+    topk = getattr(args, 'topk', 1024)
+    select_layer_idx = getattr(args, 'select_layer_idx', 13)
+    
+    print(f"GemFilter compress: layers={layers}, topk={topk}, topk_percentage={topk_percentage}, select_layer_idx={select_layer_idx}")
+    
+    for i in range(layers):
+        model.model.layers[i].self_attn.topk = topk
+        model.model.layers[i].self_attn.topk_percentage = topk_percentage
+        model.model.layers[i].self_attn.select_layer_idx = select_layer_idx
 
 @torch.no_grad()
 def gemfilter_generate(model, tokenizer, pred_token_idx, past_key_values, max_gen_len):

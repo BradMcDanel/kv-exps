@@ -52,7 +52,6 @@ def main(args):
         replace_phi3()
     elif args.mode == 'gemfilter':
         from baseline.gemfilter.monkeypatch import replace_llama, replace_mistral
-        from baseline.gemfilter.gemfilter_utils import set_topk
         replace_llama()
         replace_mistral()
     elif args.mode == 'adakv':
@@ -146,6 +145,9 @@ def main(args):
             random_rankings = np.random.rand(args.seqlen).astype(np.float32)
             set_oracle_rankings(random_rankings)
             compress(model, args)
+        elif args.mode == 'gemfilter':
+            from baseline.gemfilter.gemfilter_utils import compress
+            compress(model, args)
         elif args.mode == 'headkv':
             from baseline.headkv.headkv_utils import compress
             compress(model, args)
@@ -168,9 +170,8 @@ def main(args):
                         _ = pipeline.run(input_ids=input_id, look_ahead_k=args.look_ahead_k, max_generation_length=1)
             elif args.mode == 'gemfilter':
                 from baseline.gemfilter.gemfilter_utils import gemfilter_generate_selection_prefill
-                set_topk(model, args.max_capacity_prompt, mode='gemfilter')
                 with torch.no_grad():
-                    _ = gemfilter_generate_selection_prefill(input_id, attn_mask, model, tokenizer, select_layer_idx=args.filter_idx)
+                    _ = gemfilter_generate_selection_prefill(input_id, attn_mask, model, tokenizer, select_layer_idx=args.select_layer_idx)
             else: # Standard single-model modes
                 with torch.no_grad():
                     _ = model(input_id, attention_mask=attn_mask)
@@ -196,8 +197,7 @@ def main(args):
                     _, run_metadata = pipeline.run(input_ids=input_id, look_ahead_k=args.look_ahead_k, max_generation_length=1)
             elif args.mode == 'gemfilter':
                 from baseline.gemfilter.gemfilter_utils import gemfilter_generate_selection_prefill
-                set_topk(model, args.max_capacity_prompt, mode='gemfilter')
-                _ = gemfilter_generate_selection_prefill(input_id, attn_mask, model, tokenizer, select_layer_idx=args.filter_idx)
+                _ = gemfilter_generate_selection_prefill(input_id, attn_mask, model, tokenizer, select_layer_idx=args.select_layer_idx)
             else: # Standard single-model modes
                 _ = model(input_id, attention_mask=attn_mask)
             
@@ -235,6 +235,12 @@ def main(args):
             print(f"Max Prompt Capacity: {args.max_capacity_prompt_percentage:.1%}")
         else:
             print(f"Max Prompt Capacity: {args.max_capacity_prompt} tokens")
+    elif args.mode == "gemfilter":
+        if args.topk_percentage:
+            print(f"Context Capacity: {args.topk_percentage:.1%}")
+        else:
+            print(f"Context Capacity: {args.topk} tokens")
+        print(f"Select Layer: {args.select_layer_idx}")
     elif args.mode != "fullkv":
         if args.max_capacity_prompt_percentage:
             print(f"Context Capacity: {args.max_capacity_prompt_percentage:.1%}")
@@ -284,7 +290,10 @@ if __name__ == "__main__":
     parser.add_argument("--tsp_schedule", type=str, default="", help="Hierarchical TSP schedule for HFastKV/Draft_TSP/Taper, e.g., '15:2048' or '7:0.8,15:0.5'")
 
     # GemFilter
-    parser.add_argument("--filter_idx", type=int, default=13)
+    parser.add_argument("--filter_idx", type=int, default=13)  # Keep for backward compatibility
+    parser.add_argument("--topk", type=int, default=1024, help="Fixed number of tokens to keep for GemFilter")
+    parser.add_argument("--topk_percentage", type=float, default=None, help="Use a percentage of the prompt length for GemFilter topk")
+    parser.add_argument("--select_layer_idx", type=int, default=13, help="Layer index for GemFilter selection")
     # AdaKV
     parser.add_argument("--skip", type=int, default=-1)
     parser.add_argument('--floor_alpha', type=float, default=0.2)

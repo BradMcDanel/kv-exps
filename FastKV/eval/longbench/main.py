@@ -161,8 +161,8 @@ def setup_model_and_tokenizer(args):
             from baseline.snapkv.snapkv_utils import compress
             compress(model, args)
         elif args.mode == 'gemfilter':
-            from baseline.gemfilter.gemfilter_utils import set_topk
-            set_topk(model, args.max_capacity_prompt, mode='gemfilter')
+            from baseline.gemfilter.gemfilter_utils import compress
+            compress(model, args)
         elif args.mode == 'adakv':
             from baseline.adakv.adaptive_snapkv.snapkv_utils import compress
             compress(model, args)
@@ -378,6 +378,9 @@ if __name__ == "__main__":
     parser.add_argument("--tsp_len_percentage", type=float, default=None, help="Use a percentage of the prompt length for TSP length.")
     # GemFilter
     parser.add_argument("--filter_idx", type=int, default=13)
+    parser.add_argument("--topk", type=int, default=1024, help="Fixed number of tokens to keep for GemFilter")
+    parser.add_argument("--topk_percentage", type=float, default=None, help="Use a percentage of the prompt length for GemFilter topk")
+    parser.add_argument("--select_layer_idx", type=int, default=13, help="Layer index for GemFilter selection")
     # AdaKV
     parser.add_argument("--skip", type=int, default=-1)
     parser.add_argument('--floor_alpha', type=float, default=0.2)
