@@ -1,330 +1,284 @@
-import os
-import argparse
-import json
-import time
-from typing import List, Dict, Tuple, Optional, Any
-
+# baseline/oracle/main.py
 import torch
-import numpy as np
-from datasets import load_dataset
-from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
+import torch.nn as nn
+import transformers
+import logging
+from typing import Optional, Tuple, Union, List
 from transformers.cache_utils import Cache, DynamicCache
+from transformers.modeling_flash_attention_utils import _flash_attention_forward
+from transformers.models.llama.modeling_llama import (
+    apply_rotary_pos_emb, BaseModelOutputWithPast, LlamaFlashAttention2, LLAMA_ATTENTION_CLASSES
+)
+from transformers.models.mistral.modeling_mistral import (
+    repeat_kv as mistral_repeat_kv, MistralFlashAttention2, MISTRAL_ATTENTION_CLASSES
+)
 
-class OraclePrefillPipeline:
+logger = logging.getLogger(__name__)
+
+# =====================================================================================
+# 1. ORACLE KV CACHE LOGIC
+# =====================================================================================
+
+class OracleKVCluster:
     """
-    Implements a pipeline that uses pre-computed oracle rankings to perform
-    a selective prefill on a base model. This simulates a "perfect" KV cache
-    compression scenario to measure its upper-bound performance.
+    A KV Cluster that prunes the cache based on pre-computed oracle rankings.
+    It does not calculate attention scores for pruning.
     """
-    def __init__(
-        self,
-        base_model_name: str,
-        tokenizer: AutoTokenizer,
-        oracle_rankings_path: str,
-        keep_percentage: float = 0.1,
-        detailed_timing: bool = True,
-        tsp_idx: Optional[int] = None,
-        max_capacity_prompt: Optional[int] = None,
-        max_capacity_prompt_percentage: Optional[float] = None,
-    ):
-        self.base_model_name = base_model_name
-        self.tokenizer = tokenizer
-        self.base_model = self._load_model(self.base_model_name)
-        self.base_config: AutoConfig = self.base_model.config
-        self.device = self.base_model.device
-        self.dtype = self.base_model.dtype
-        
-        self.oracle_rankings_path = oracle_rankings_path
-        self.keep_percentage = keep_percentage
-        self.detailed_timing = detailed_timing
-        self.tsp_idx = tsp_idx
-        self.max_capacity_prompt = max_capacity_prompt
+    def __init__(self, tsp_layer=False, max_capacity_prompt_percentage=None):
+        self.tsp_layer = tsp_layer
         self.max_capacity_prompt_percentage = max_capacity_prompt_percentage
-        
-        self._validate_config()
-        self.eos_token_ids = self._extract_eos_token_ids()
+        self.original_prompt_len = 0
 
-    def _validate_config(self):
-        if not (0.0 < self.keep_percentage <= 1.0):
-            raise ValueError("`keep_percentage` must be between 0.0 and 1.0.")
-        if not os.path.isdir(self.oracle_rankings_path):
-            raise FileNotFoundError(f"Oracle rankings path not found: {self.oracle_rankings_path}")
-
-    def _load_model(self, model_name: str) -> AutoModelForCausalLM:
-        print(f"Loading base model: {model_name}")
-        model = AutoModelForCausalLM.from_pretrained(
-            model_name, torch_dtype=torch.bfloat16, trust_remote_code=True, device_map="auto", attn_implementation="sdpa"
-        )
-        return model.eval()
-
-    def _extract_eos_token_ids(self) -> List[int]:
-        config_eos = self.base_config.eos_token_id
-        if isinstance(config_eos, int): return [config_eos]
-        if isinstance(config_eos, list): return list(config_eos)
-        if self.tokenizer.eos_token_id: return [self.tokenizer.eos_token_id]
-        raise ValueError("eos_token_id not defined in config or tokenizer.")
-
-    def _load_oracle_ranking(self, model_name: str, dataset_name: str, sample_key: str) -> Optional[Dict[str, np.ndarray]]:
-        """Loads the oracle data for a specific sample."""
-        model_name_sanitized = model_name.replace('/', '_')
-        file_path = os.path.join(self.oracle_rankings_path, model_name_sanitized, f"{dataset_name}.npz")
-        
-        if not os.path.exists(file_path):
-            print(f"Warning: Oracle ranking file not found at: {file_path}")
-            return None
-        
-        try:
-            with np.load(file_path, allow_pickle=True) as npz_file:
-                if sample_key in npz_file:
-                    # .item() extracts the object array (which is a dict)
-                    return npz_file[sample_key].item()
-                else:
-                    print(f"Warning: Sample key '{sample_key}' not found in {file_path}")
-                    return None
-        except Exception as e:
-            print(f"Error loading oracle data from {file_path}: {e}")
-            return None
-
-    @torch.no_grad()
-    def run(
-        self,
-        input_ids: torch.Tensor,
-        oracle_model_for_path: str, # Model name used to generate the oracle (e.g., meta-llama/Llama-3.1-8B-Instruct)
-        dataset_name: str,
-        sample_key: str,
-        max_generation_length: int,
-    ) -> Tuple[str, Dict[str, Any]]:
+    def update_kv(self, key_states, value_states, layer_idx, **kwargs):
         """
-        Runs the oracle-guided prefill and generation.
-
-        Args:
-            input_ids: The full prompt token IDs.
-            oracle_model_for_path: The model name used to create the oracle file path.
-            dataset_name: The name of the dataset for the sample.
-            sample_key: The key identifying the sample within the oracle .npz file.
-            max_generation_length: The maximum number of tokens to generate.
-        
-        Returns:
-            A tuple of the generated text and a dictionary of metadata.
+        Prunes the key and value states using oracle rankings passed via kwargs.
         """
-        run_metadata: Dict[str, Any] = {}
+        bsz, num_kv_heads, q_len, head_dim = key_states.shape
         
-        if self.detailed_timing:
-            start_time = time.time()
-            prefill_start_event = torch.cuda.Event(enable_timing=True)
-            prefill_end_event = torch.cuda.Event(enable_timing=True)
-            decode_start_event = torch.cuda.Event(enable_timing=True)
-            decode_end_event = torch.cuda.Event(enable_timing=True)
+        # On the first layer of a new pass, record the original prompt length
+        if layer_idx == 0:
+            self.original_prompt_len = q_len
+            logging.info(f"OracleKV: Set prompt length = {self.original_prompt_len}")
 
-        # --- Stage 1: Load Oracle and Select Tokens ---
-        prompt_length = input_ids.shape[1]
-        oracle_data = self._load_oracle_ranking(oracle_model_for_path, dataset_name, sample_key)
+        # Retrieve oracle rankings from the model object (passed via kwargs)
+        oracle_rankings = kwargs.get("oracle_rankings", None)
 
-        if oracle_data is None:
-            raise RuntimeError(f"Failed to load oracle data for {dataset_name}/{sample_key}")
-
-        # Sanity check
-        oracle_input_ids = torch.from_numpy(oracle_data['input_ids']).to(self.device).unsqueeze(0)
-        if not torch.equal(input_ids, oracle_input_ids):
-            raise ValueError("Input IDs from prompt do not match Input IDs from the oracle file!")
-
-        ranking_scores = torch.from_numpy(oracle_data['ranking']).to(self.device)
-        
-        # Use max_capacity_prompt parameters like FastKV, with keep_percentage as fallback
+        # Determine the number of tokens to keep
         if self.max_capacity_prompt_percentage is not None:
-            num_to_keep = int(prompt_length * self.max_capacity_prompt_percentage)
-        elif self.max_capacity_prompt is not None:
-            num_to_keep = self.max_capacity_prompt
+            num_to_keep = int(self.original_prompt_len * self.max_capacity_prompt_percentage)
         else:
-            num_to_keep = int(prompt_length * self.keep_percentage)
+            # Fallback to a default if not set, though it should be.
+            num_to_keep = int(self.original_prompt_len * 0.1) 
 
-        if num_to_keep >= prompt_length:
-            indices_to_keep = torch.arange(prompt_length, device=self.device, dtype=torch.long)
-        else:
-            _, top_k_indices = torch.topk(ranking_scores, k=num_to_keep, dim=-1)
-            indices_to_keep = torch.sort(top_k_indices).values
-        
-        selected_prompt_ids = input_ids[:, indices_to_keep]
-        
-        # This is the crucial step: use the original positions for RoPE.
-        selective_pos_ids = indices_to_keep.unsqueeze(0).to(torch.long)
-        
-        run_metadata["prompt_input_length"] = prompt_length
-        run_metadata["selective_prefill_kept_token_count"] = selected_prompt_ids.shape[1]
-        run_metadata["token_keep_rate"] = (selected_prompt_ids.shape[1] / prompt_length * 100.0) if prompt_length > 0 else 100.0
-        run_metadata["tsp_enabled"] = self.tsp_idx is not None
+        # If no oracle is provided or we are keeping everything, do nothing.
+        if oracle_rankings is None or num_to_keep >= q_len:
+            return key_states, value_states, None
 
-        # --- Stage 2: Base Model Selective Prefill ---
-        if self.detailed_timing: prefill_start_event.record()
+        # --- ORACLE LOGIC ---
+        # Instead of calculating attention, we directly use the provided oracle rankings.
+        _, top_k_indices = torch.topk(oracle_rankings, k=num_to_keep, dim=-1)
+        
+        # Sort indices to maintain positional order for RoPE
+        indices_to_keep = torch.sort(top_k_indices).values
+        
+        # Expand indices for gathering
+        indices_for_gather = indices_to_keep.unsqueeze(0).unsqueeze(-1).expand(bsz, num_kv_heads, -1, head_dim)
+        
+        # Gather the important K/V pairs
+        k_past_compress = key_states.gather(dim=2, index=indices_for_gather)
+        v_past_compress = value_states.gather(dim=2, index=indices_for_gather)
 
-        selective_cache_pos = torch.arange(selected_prompt_ids.shape[1], device=self.device)
-        base_out = self.base_model(
-            selected_prompt_ids,
-            position_ids=selective_pos_ids,
-            use_cache=True,
-            cache_position=selective_cache_pos
+        tsp_indices = None
+        if self.tsp_layer:
+            # The indices for pruning hidden states are the ones we just selected
+            tsp_indices = indices_to_keep.unsqueeze(0) # Add batch dim
+            logging.info(f"OracleKV Layer {layer_idx}: TSP applied - selected {tsp_indices.shape[-1]} tokens using oracle.")
+
+        return k_past_compress, v_past_compress, tsp_indices
+
+def init_oracle_kv(self):
+    """Initializes the cluster on an attention module."""
+    self.kv_cluster = OracleKVCluster()
+
+# =====================================================================================
+# 2. LLAMA MODEL HIJACKING
+# =====================================================================================
+
+class LlamaOracleKVAttention(LlamaFlashAttention2):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        init_oracle_kv(self)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.LongTensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_value: Optional[Cache] = None,
+        output_attentions: bool = False,
+        use_cache: bool = False,
+        cache_position: Optional[torch.LongTensor] = None,
+        **kwargs,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+        output_attentions = False
+        bsz, q_len, _ = hidden_states.size()
+
+        query_states = self.q_proj(hidden_states)
+        key_states = self.k_proj(hidden_states)
+        value_states = self.v_proj(hidden_states)
+
+        query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+        key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        
+        cos, sin = self.rotary_emb(value_states, position_ids)
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+
+        if past_key_value is not None:
+            cache_kwargs = {"sin": sin, "cos": cos}
+            if q_len > 1: # Prefill phase
+                key_states_compress, value_states_compress, self.tsp_idx = self.kv_cluster.update_kv(
+                    key_states, value_states, self.layer_idx, **kwargs)
+                past_key_value.update(key_states_compress, value_states_compress, self.layer_idx, cache_kwargs)
+                key_states, value_states = key_states_compress, value_states_compress
+            else: # Decoding phase
+                key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
+                self.tsp_idx = None
+        
+        query_states = query_states.transpose(1, 2)
+        key_states = key_states.transpose(1, 2)
+        value_states = value_states.transpose(1, 2)
+
+        attn_output = _flash_attention_forward(
+            query_states, key_states, value_states, attention_mask, q_len, is_causal=self.is_causal,
         )
-        
-        # TSP is just a layer designation - the token selection has already been done
-        # using oracle rankings instead of FastKV's attention-based selection
-        tsp_position_ids = selective_pos_ids
-        
-        # Get next token from the last position
-        base_model_next_token_ids = torch.argmax(base_out.logits[:, -1, :], dim=-1, keepdim=True)
-        base_model_cache_after_prefill = base_out.past_key_values
 
-        if self.detailed_timing:
-            prefill_end_event.record()
-            torch.cuda.synchronize()
-            run_metadata["base_prefill_time"] = prefill_start_event.elapsed_time(prefill_end_event) / 1000.0
-            run_metadata["ttft"] = run_metadata["base_prefill_time"]
-            decode_start_event.record()
+        attn_output = attn_output.reshape(bsz, q_len, self.hidden_size).contiguous()
+        attn_output = self.o_proj(attn_output)
+        return attn_output, None, past_key_value
 
+def llama_decoderlayer_forward(
+    self,
+    hidden_states: torch.Tensor,
+    attention_mask: Optional[torch.Tensor] = None,
+    position_ids: Optional[torch.LongTensor] = None,
+    past_key_value: Optional[Cache] = None,
+    output_attentions: Optional[bool] = False,
+    use_cache: Optional[bool] = False,
+    cache_position: Optional[torch.LongTensor] = None,
+    **kwargs,
+) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
+    residual = hidden_states
+    hidden_states = self.input_layernorm(hidden_states)
 
-        # --- Stage 3: Base Model Generation (Decoding) ---
-        gen_token_ids_list: List[int] = []
-        if base_model_next_token_ids is not None and base_model_cache_after_prefill is not None:
-            first_gen_token_id = base_model_next_token_ids.item()
-            gen_token_ids_list.append(first_gen_token_id)
+    hidden_states, self_attn_weights, present_key_value = self.self_attn(
+        hidden_states=hidden_states,
+        attention_mask=attention_mask,
+        position_ids=position_ids,
+        past_key_value=past_key_value,
+        output_attentions=output_attentions,
+        use_cache=use_cache,
+        cache_position=cache_position,
+        **kwargs,
+    )
+    hidden_states = residual + hidden_states
+
+    residual = hidden_states
+    hidden_states = self.post_attention_layernorm(hidden_states)
+    hidden_states = self.mlp(hidden_states)
+    hidden_states = residual + hidden_states
+    
+    tsp_idx = getattr(self.self_attn, 'tsp_idx', None)
+    if self.self_attn.kv_cluster.tsp_layer and tsp_idx is not None:
+        self.new_position_ids = torch.gather(position_ids, dim=1, index=tsp_idx)
+        tsp_idx_expanded = tsp_idx.unsqueeze(-1).expand(-1, -1, hidden_states.size(2))
+        hidden_states = torch.gather(hidden_states, dim=1, index=tsp_idx_expanded)
+    else:
+        self.new_position_ids = None
+    
+    outputs = (hidden_states,)
+    if use_cache: outputs += (present_key_value,)
+    return outputs
+
+def llama_model_forward(
+    self,
+    input_ids: torch.LongTensor = None,
+    attention_mask: Optional[torch.Tensor] = None,
+    position_ids: Optional[torch.LongTensor] = None,
+    past_key_values: Optional[Union[Cache, List[torch.FloatTensor]]] = None,
+    inputs_embeds: Optional[torch.FloatTensor] = None,
+    use_cache: Optional[bool] = None,
+    output_attentions: Optional[bool] = None,
+    output_hidden_states: Optional[bool] = None,
+    return_dict: Optional[bool] = None,
+    cache_position: Optional[torch.LongTensor] = None,
+) -> Union[Tuple, BaseModelOutputWithPast]:
+    # Retrieve oracle_rankings from the model object itself, where the runner script will place it.
+    layer_kwargs = {"oracle_rankings": getattr(self, "oracle_rankings", None)}
+
+    # Standard LlamaModel forward logic...
+    if inputs_embeds is None:
+        inputs_embeds = self.embed_tokens(input_ids)
+    if use_cache and not isinstance(past_key_values, Cache):
+        past_key_values = DynamicCache.from_legacy_cache(past_key_values)
+    if cache_position is None:
+        cache_position = torch.arange(
+            past_key_values.get_seq_length() if past_key_values is not None else 0,
+            inputs_embeds.shape[1], device=inputs_embeds.device
+        )
+    if position_ids is None:
+        position_ids = cache_position.unsqueeze(0)
+
+    causal_mask = self._update_causal_mask(attention_mask, inputs_embeds, cache_position, past_key_values, output_attentions)
+    hidden_states = inputs_embeds
+    
+    next_decoder_cache = None
+    for decoder_layer in self.layers:
+        layer_outputs = decoder_layer(
+            hidden_states,
+            attention_mask=causal_mask,
+            position_ids=position_ids,
+            past_key_value=past_key_values,
+            output_attentions=output_attentions,
+            use_cache=use_cache,
+            cache_position=cache_position,
+            **layer_kwargs,
+        )
+
+        new_position_ids = getattr(decoder_layer, 'new_position_ids', None)
+        if new_position_ids is not None:
+            position_ids = new_position_ids
             
-            current_decode_tokens = base_model_next_token_ids
-            current_decode_kv_cache = DynamicCache.from_legacy_cache(base_model_cache_after_prefill)
+        hidden_states = layer_outputs[0]
+        if use_cache:
+            next_decoder_cache = layer_outputs[1]
 
-            if first_gen_token_id not in self.eos_token_ids:
-                # The generation must continue from the position of the LAST token in the original sequence
-                # that we kept, not from the length of the compressed cache.
-                # Use TSP position IDs if available, otherwise use selective position IDs
-                pos_ids_to_use = tsp_position_ids if self.tsp_idx is not None else selective_pos_ids
-                start_pos_for_generation = (pos_ids_to_use[0, -1] + 1).item() if pos_ids_to_use.numel() > 0 else 0
-
-                for i in range(max_generation_length - 1):
-                    current_cache_len = current_decode_kv_cache.get_seq_length(0)
-                    
-                    # Position IDs for generation continue from the original sequence
-                    pos_ids = torch.tensor([[start_pos_for_generation + i]], device=self.device, dtype=torch.long)
-                    decode_cache_pos = torch.tensor([current_cache_len], device=self.device)
-                    
-                    decode_out = self.base_model(
-                        current_decode_tokens,
-                        position_ids=pos_ids,
-                        past_key_values=current_decode_kv_cache,
-                        use_cache=True,
-                        cache_position=decode_cache_pos
-                    )
-
-                    next_tokens = torch.argmax(decode_out.logits[:, -1, :], dim=-1, keepdim=True)
-                    gen_token_ids_list.append(next_tokens.item())
-                    current_decode_kv_cache = DynamicCache.from_legacy_cache(decode_out.past_key_values)
-                    current_decode_tokens = next_tokens
-
-                    if gen_token_ids_list[-1] in self.eos_token_ids:
-                        break
-
-        if self.detailed_timing:
-            decode_end_event.record()
-            torch.cuda.synchronize()
-            run_metadata["decode_time"] = decode_start_event.elapsed_time(decode_end_event) / 1000.0
-            run_metadata["total_time"] = time.time() - start_time
-
-        final_gen_text = self.tokenizer.decode(gen_token_ids_list, skip_special_tokens=True)
-        return final_gen_text, run_metadata
-
-
-def main():
-    parser = argparse.ArgumentParser(description="Run KV Cache compression using pre-computed Oracle rankings.",
-                                     formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    parser.add_argument("--base_model_name", type=str, default="meta-llama/Llama-3.1-8B-Instruct")
-    parser.add_argument("--oracle_rankings_path", type=str, default="analysis_results/oracles", help="Path to the root directory of oracle .npz files.")
-    parser.add_argument("--dataset_name", type=str, default="qasper", help="Name of the LongBench dataset to test.")
-    parser.add_argument("--sample_idx_in_file", type=int, default=0, help="The index of the sample to use from the dataset's oracle file.")
-    parser.add_argument("--keep_percentage", type=float, default=0.05, help="Percentage of prompt tokens to keep for prefill (e.g., 0.05 for 5%).")
-    parser.add_argument("--max_generation_length", type=int, default=128, help="Maximum number of tokens to generate.")
-    parser.add_argument("--max_prompt_len", type=int, default=8192, help="Maximum prompt length to consider.")
-    parser.add_argument("--tsp_idx", type=int, default=None, help="Layer index for TSP token selection. If None, TSP is disabled.")
+    hidden_states = self.norm(hidden_states)
     
-    args = parser.parse_args()
-    
-    tokenizer = AutoTokenizer.from_pretrained(args.base_model_name, trust_remote_code=True)
-    if tokenizer.pad_token is None and tokenizer.eos_token is not None:
-        tokenizer.pad_token = tokenizer.eos_token
-        
-    pipeline = OraclePrefillPipeline(
-        base_model_name=args.base_model_name,
-        tokenizer=tokenizer,
-        oracle_rankings_path=args.oracle_rankings_path,
-        keep_percentage=args.keep_percentage,
-        tsp_idx=args.tsp_idx,
+    # Cut-off hidden states for generation
+    if hidden_states.shape[1] > 1:
+        hidden_states = hidden_states[:, -1:, :]
+
+    return BaseModelOutputWithPast(
+        last_hidden_state=hidden_states,
+        past_key_values=next_decoder_cache,
+        hidden_states=None,
+        attentions=None,
     )
 
-    # --- Load Prompt and Find Sample Key ---
-    try:
-        # Construct path relative to this script's location
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        project_root = os.path.abspath(os.path.join(script_dir, '..', '..'))
-        prompt_config_path = os.path.join(project_root, 'eval', 'longbench', 'config', 'dataset2prompt.json')
-        
-        with open(prompt_config_path, "r") as f:
-            dataset2prompt = json.load(f)
-        
-        data = load_dataset('THUDM/LongBench', args.dataset_name, split='test', trust_remote_code=True)
-        
-        # Find the sample key corresponding to the desired index
-        oracle_file_path = os.path.join(args.oracle_rankings_path, args.base_model_name.replace('/', '_'), f"{args.dataset_name}.npz")
-        if not os.path.exists(oracle_file_path):
-            raise FileNotFoundError(f"Oracle file not found. Please generate it first: {oracle_file_path}")
-            
-        with np.load(oracle_file_path, allow_pickle=True) as f:
-            available_keys = sorted(f.files)
-        
-        if args.sample_idx_in_file >= len(available_keys):
-            raise IndexError(f"sample_idx_in_file {args.sample_idx_in_file} is out of bounds for {len(available_keys)} available samples.")
-        
-        target_sample_key = available_keys[args.sample_idx_in_file]
-        # The key is like 'sample_XX', so we extract the index XX
-        original_data_index = int(target_sample_key.split('_')[1])
-        sample = data[original_data_index]
+# =====================================================================================
+# 3. PUBLIC API FOR EVALUATION SCRIPTS
+# =====================================================================================
 
-        raw_prompt = dataset2prompt[args.dataset_name].format(**sample)
-        messages = [{"role": "user", "content": raw_prompt}]
-        templated_prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-
-    except (FileNotFoundError, IndexError, KeyError) as e:
-        print(f"Error loading data or prompt: {e}")
-        return
-
-    inputs = tokenizer(templated_prompt, return_tensors="pt", truncation=True, max_length=args.max_prompt_len).to(pipeline.device)
-
-    print(f"\n--- Running Oracle Prefill Pipeline ---")
-    print(f"Base Model: {args.base_model_name}")
-    print(f"Dataset: {args.dataset_name} | Sample Key: {target_sample_key}")
-    print(f"Keep Percentage: {args.keep_percentage:.1%}")
-    print(f"TSP Layer: {args.tsp_idx if args.tsp_idx is not None else 'Disabled'}")
-    print("-" * 43)
-
-    generated_text, run_metadata = pipeline.run(
-        input_ids=inputs.input_ids,
-        oracle_model_for_path=args.base_model_name,
-        dataset_name=args.dataset_name,
-        sample_key=target_sample_key,
-        max_generation_length=args.max_generation_length,
-    )
+def compress(model, args): 
+    """Configures the OracleKVCluster on each layer of the model."""
+    if not hasattr(model, 'model') or not hasattr(model.model, 'layers'):
+        raise TypeError("Model does not have the expected structure with 'model.layers'.")
+        
+    layers = model.model.layers
+    # Use keep_percentage for oracle mode, which is aliased from max_capacity_prompt_percentage
+    keep_pct = args.keep_percentage if hasattr(args, 'keep_percentage') else args.max_capacity_prompt_percentage
     
-    print(f"\n--- Generated Text ---")
-    print(generated_text)
-    print("-" * 22)
+    logging.info(f"OracleKV Configure: layers={len(layers)}, tsp_idx={args.tsp_idx}, keep_percentage={keep_pct}")
 
-    print("\n--- Performance Metrics ---")
-    print(f"Prompt Length (Original): {run_metadata.get('prompt_input_length', 'N/A')} tokens")
-    print(f"Kept for Prefill (Compressed): {run_metadata.get('selective_prefill_kept_token_count', 'N/A')} tokens")
-    print(f"Token Keep Rate: {run_metadata.get('token_keep_rate', 0):.2f}%")
-    print(f"TSP Enabled: {run_metadata.get('tsp_enabled', False)}")
-    if run_metadata.get('tsp_enabled', False):
-        print(f"TSP Applied Tokens: {run_metadata.get('tsp_applied_tokens', 'N/A')}")
-    print(f"Time to First Token (TTFT): {run_metadata.get('ttft', 0):.4f} seconds")
-    print(f"  - Base Model Prefill Time: {run_metadata.get('base_prefill_time', 0):.4f} s")
-    print(f"Decoding Time: {run_metadata.get('decode_time', 0):.4f} seconds")
-    print(f"Total Pipeline Time: {run_metadata.get('total_time', 0):.4f} seconds")
-    print("-" * 27)
+    for i, layer in enumerate(layers):
+        if not hasattr(layer, 'self_attn') or not hasattr(layer.self_attn, 'kv_cluster'):
+             raise TypeError(f"Layer {i} was not patched correctly. It's missing 'self_attn.kv_cluster'.")
+             
+        cluster = layer.self_attn.kv_cluster
+        cluster.max_capacity_prompt_percentage = keep_pct
+        cluster.tsp_layer = (i == args.tsp_idx)
+        if cluster.tsp_layer:
+            logging.info(f"OracleKV: Set layer {i} as TSP layer")
 
-if __name__ == "__main__":
-    main()
+def replace_llama():
+    """Applies the OracleKV monkey patches to the Llama model classes."""
+    logging.info("Applying OracleKV patch to Llama model classes.")
+    LLAMA_ATTENTION_CLASSES['flash_attention_2'] = LlamaOracleKVAttention
+    transformers.models.llama.modeling_llama.LlamaDecoderLayer.forward = llama_decoderlayer_forward
+    transformers.models.llama.modeling_llama.LlamaModel.forward = llama_model_forward
+
+def replace_mistral():
+    """Placeholder for Mistral support. Not yet implemented."""
+    logging.warning("OracleKV for Mistral is not implemented. Skipping patch.")
+    pass

@@ -1,4 +1,4 @@
-# main.py
+# main.py (longbench evaluation script)
 import sys
 sys.path.append(".")
 
@@ -12,6 +12,7 @@ from tqdm import tqdm
 from pathlib import Path
 
 import torch
+import numpy as np # <-- Added for oracle data loading
 
 from transformers import AutoModelForCausalLM, AutoTokenizer, set_seed
 from datasets import load_dataset
@@ -43,91 +44,74 @@ def setup_model_and_tokenizer(args):
     model = None
     pipeline = None
 
-    if args.mode == "speculative_prefill":
-        from baseline.speculative_prefill.main import SpeculativePrefillPipeline as Pipeline
-        logging.info("Initializing SpeculativePrefillPipeline with custom parameters...")
+    # --- MODIFICATION START: Re-structured mode handling ---
 
-        # Handle potentially conflicting capacity arguments. Prioritize percentage.
-        max_cap_prompt = args.max_capacity_prompt
-        max_cap_pct = args.max_capacity_prompt_percentage
-        if max_cap_pct is not None:
-            if max_cap_prompt is not None:
-                logging.info(f"Using `max_capacity_prompt_percentage={max_cap_pct}`. Ignoring `max_capacity_prompt={max_cap_prompt}`.")
-            max_cap_prompt = None # Nullify absolute value if percentage is given
-
-        pipeline = Pipeline(
-            base_model_name=args.model,
-            speculator_model_name=args.speculator_model_name,
-            tokenizer=tokenizer,
-            max_capacity_prompt=max_cap_prompt,
-            max_capacity_prompt_percentage=max_cap_pct,
-            pool_kernel_size=args.kernel_size if args.pooling != 'none' else None,
-            pool_type=args.pooling,
-            use_chunk_selection=args.use_chunk_selection, 
-            chunk_size=args.chunk_size,
-        )
-    elif args.mode == "oracle":
-        from baseline.oracle.main import OraclePrefillPipeline as Pipeline
-        logging.info("Initializing OraclePrefillPipeline...")
-        
-        # Handle potentially conflicting capacity arguments. Prioritize percentage.
-        max_cap_prompt = args.max_capacity_prompt
-        max_cap_pct = args.max_capacity_prompt_percentage
-        if max_cap_pct is not None:
-            if max_cap_prompt is not None:
-                logging.info(f"Using `max_capacity_prompt_percentage={max_cap_pct}`. Ignoring `max_capacity_prompt={max_cap_prompt}`.")
-            max_cap_prompt = None # Nullify absolute value if percentage is given
-        
-        pipeline = Pipeline(
-            base_model_name=args.model,
-            tokenizer=tokenizer,
-            oracle_rankings_path=args.oracle_rankings_path,
-            keep_percentage=args.keep_percentage,
-            tsp_idx=args.tsp_idx,
-            max_capacity_prompt=max_cap_prompt,
-            max_capacity_prompt_percentage=max_cap_pct,
-        )
-    elif args.mode == "uniform":
-        from baseline.uniform.main import UniformRandomPipeline as Pipeline
-        logging.info("Initializing UniformRandomPipeline...")
-        pipeline = Pipeline(
-            base_model_name=args.model,
-            tokenizer=tokenizer,
-            keep_percentage=args.keep_percentage,
-            first_k=args.uniform_first_k,
-            last_k=args.uniform_last_k,
-        )
-    elif args.mode == "echo_cache":
-        from baseline.echo_cache.main import EchoCachePipeline as Pipeline
-        logging.info(f"Initializing pipeline for {args.mode}...")
-        pipeline = Pipeline(
-            base_model_name=args.model,
-            speculator_model_name=args.speculator_model_name,
-            tokenizer=tokenizer,
-            max_capacity_prompt=args.max_capacity_prompt,
-            tsp_len=args.tsp_len,
-            cache_granularity=args.cache_granularity,
-            pool_kernel_size=args.kernel_size if args.pooling != 'none' else None,
-            pool_type=args.pooling,
-            use_chunk_selection=args.use_chunk_selection, 
-            chunk_size=args.chunk_size,
-        )
-    elif args.mode == "draft_tsp":
-        from baseline.draft_tsp.main import DraftTSPPipeline as Pipeline
-        logging.info(f"Initializing DraftTSPPipeline...")
-        pipeline = Pipeline(
-            base_model_name=args.model,
-            speculator_model_name=args.speculator_model_name,
-            tokenizer=tokenizer,
-            args=args, # Pass all args for simplicity
-        )
+    # Group true pipeline-based modes together
+    if args.mode in ["speculative_prefill", "uniform", "echo_cache", "draft_tsp"]:
+        if args.mode == "speculative_prefill":
+            from baseline.speculative_prefill.main import SpeculativePrefillPipeline as Pipeline
+            logging.info("Initializing SpeculativePrefillPipeline with custom parameters...")
+            max_cap_prompt = args.max_capacity_prompt
+            max_cap_pct = args.max_capacity_prompt_percentage
+            if max_cap_pct is not None:
+                if max_cap_prompt is not None:
+                    logging.info(f"Using `max_capacity_prompt_percentage={max_cap_pct}`. Ignoring `max_capacity_prompt={max_cap_prompt}`.")
+                max_cap_prompt = None
+            pipeline = Pipeline(
+                base_model_name=args.model,
+                speculator_model_name=args.speculator_model_name,
+                tokenizer=tokenizer,
+                max_capacity_prompt=max_cap_prompt,
+                max_capacity_prompt_percentage=max_cap_pct,
+                pool_kernel_size=args.kernel_size if args.pooling != 'none' else None,
+                pool_type=args.pooling,
+                use_chunk_selection=args.use_chunk_selection, 
+                chunk_size=args.chunk_size,
+            )
+        elif args.mode == "uniform":
+            from baseline.uniform.main import UniformRandomPipeline as Pipeline
+            logging.info("Initializing UniformRandomPipeline...")
+            pipeline = Pipeline(
+                base_model_name=args.model,
+                tokenizer=tokenizer,
+                keep_percentage=args.keep_percentage,
+                first_k=args.uniform_first_k,
+                last_k=args.uniform_last_k,
+            )
+        elif args.mode == "echo_cache":
+            from baseline.echo_cache.main import EchoCachePipeline as Pipeline
+            logging.info(f"Initializing pipeline for {args.mode}...")
+            pipeline = Pipeline(
+                base_model_name=args.model,
+                speculator_model_name=args.speculator_model_name,
+                tokenizer=tokenizer,
+                max_capacity_prompt=args.max_capacity_prompt,
+                tsp_len=args.tsp_len,
+                cache_granularity=args.cache_granularity,
+                pool_kernel_size=args.kernel_size if args.pooling != 'none' else None,
+                pool_type=args.pooling,
+                use_chunk_selection=args.use_chunk_selection, 
+                chunk_size=args.chunk_size,
+            )
+        elif args.mode == "draft_tsp":
+            from baseline.draft_tsp.main import DraftTSPPipeline as Pipeline
+            logging.info(f"Initializing DraftTSPPipeline...")
+            pipeline = Pipeline(
+                base_model_name=args.model,
+                speculator_model_name=args.speculator_model_name,
+                tokenizer=tokenizer,
+                args=args, # Pass all args for simplicity
+            )
     else:
-        # Standard modes require explicit model loading and configuration.
+        # All other modes are monkey-patching modes, including 'oracle'
         if args.mode == 'fullkv':
             from baseline.fullkv.monkeypatch import replace_llama, replace_mistral
             replace_llama(); replace_mistral()
         elif args.mode == 'fastkv':
             from baseline.fastkv.monkeypatch import replace_llama, replace_mistral
+            replace_llama(); replace_mistral()
+        elif args.mode == 'oracle': # Oracle is now a patching mode
+            from baseline.oracle.main import replace_llama, replace_mistral
             replace_llama(); replace_mistral()
         elif args.mode == 'hfastkv':
             from baseline.hfastkv.monkeypatch import replace_llama, replace_mistral
@@ -160,6 +144,9 @@ def setup_model_and_tokenizer(args):
         if args.mode == 'fastkv':
             from baseline.fastkv.fastkv_utils import compress
             compress(model, args)
+        elif args.mode == 'oracle': # Configure the patched oracle model
+            from baseline.oracle.main import compress
+            compress(model, args)
         elif args.mode == 'taper':
             from baseline.taper.taper_utils import compress
             compress(model, args)
@@ -179,6 +166,7 @@ def setup_model_and_tokenizer(args):
             from baseline.headkv.headkv.snapkv_utils import compress
             compress(model, args)
 
+    # --- MODIFICATION END ---
     return model, pipeline, tokenizer
 
 def build_chat(tokenizer, prompt, model_name):
@@ -200,6 +188,8 @@ def generate_longbench(data, max_length, max_gen, prompt_format,
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if model is not None:
         device = model.device
+    elif pipeline is not None:
+        device = pipeline.device
 
     if os.path.exists(out_path):
         os.remove(out_path)
@@ -222,17 +212,12 @@ def generate_longbench(data, max_length, max_gen, prompt_format,
             inputs = tokenizer(final_prompt, truncation=False, return_tensors="pt").to(device)
             
             pred = ""
+            
+            # --- MODIFICATION START: Unified generation loop ---
             if pipeline is not None:
-                if args.mode == "oracle":
-                    sample_key = f"sample_{i}"
-                    pred, _ = pipeline.run(
-                        input_ids=inputs.input_ids,
-                        oracle_model_for_path=args.model,
-                        dataset_name=dataset,
-                        sample_key=sample_key,
-                        max_generation_length=max_gen
-                    )
-                elif args.mode == "uniform":
+                # This block now only handles true pipeline-based modes like speculative_prefill, uniform, etc.
+                # The old 'oracle' logic is removed from here.
+                if args.mode == "uniform":
                      pred, _ = pipeline.run(
                         input_ids=inputs.input_ids,
                         max_generation_length=max_gen,
@@ -244,7 +229,34 @@ def generate_longbench(data, max_length, max_gen, prompt_format,
                         max_generation_length=max_gen,
                     )
             else:
+                # This block handles all monkey-patched models, including the new 'oracle' mode.
                 with torch.inference_mode():
+                    
+                    # If in oracle mode, load and attach the rankings before generating.
+                    if args.mode == "oracle":
+                        sample_key = f"sample_{i}"
+                        model_name_sanitized = args.model.replace('/', '_')
+                        file_path = os.path.join(args.oracle_rankings_path, model_name_sanitized, f"{dataset}.npz")
+                        
+                        oracle_rankings_tensor = None
+                        if os.path.exists(file_path):
+                            with np.load(file_path, allow_pickle=True) as npz_file:
+                                if sample_key in npz_file:
+                                    oracle_data = npz_file[sample_key].item()
+                                    oracle_ids = torch.from_numpy(oracle_data['input_ids']).to(device).unsqueeze(0)
+                                    if torch.equal(inputs.input_ids, oracle_ids):
+                                        oracle_rankings_tensor = torch.from_numpy(oracle_data['ranking']).to(device)
+                                    else:
+                                        logging.warning(f"ID mismatch for {sample_key}. Skipping oracle ranking.")
+                                else:
+                                    logging.warning(f"Key '{sample_key}' not in oracle file. Skipping oracle ranking.")
+                        else:
+                            logging.warning(f"Oracle file not found: {file_path}. Skipping oracle ranking.")
+                        
+                        # Attach to model; it's okay if it's None, the hijack will handle it gracefully.
+                        model.oracle_rankings = oracle_rankings_tensor
+
+                    # Standard generation call for all patched models
                     context_length = inputs.input_ids.shape[-1]
                     if args.mode == 'gemfilter':
                         from baseline.gemfilter.gemfilter_utils import gemfilter_generate_selection
@@ -258,6 +270,11 @@ def generate_longbench(data, max_length, max_gen, prompt_format,
                                 do_sample=False, temperature=1.0, top_p=1.0,
                                 )[0]
                         pred = tokenizer.decode(output[context_length:], skip_special_tokens=True)
+
+                    # IMPORTANT: Clean up the attached attribute after the run to avoid side effects
+                    if args.mode == "oracle" and hasattr(model, "oracle_rankings"):
+                        del model.oracle_rankings
+            # --- MODIFICATION END ---
 
             print(pred)
             
@@ -300,9 +317,9 @@ def main(args):
     
     dataset_name = args.dataset
     if args.longbench_type == "longbench-e":
-        data = load_dataset('THUDM/LongBench', f"{dataset_name}_e", split='test')
+        data = load_dataset('THUDM/LongBench', f"{dataset_name}_e", split='test', trust_remote_code=True)
     else:
-        data = load_dataset('THUDM/LongBench', dataset_name, split='test')
+        data = load_dataset('THUDM/LongBench', dataset_name, split='test', trust_remote_code=True)
     
     out_path = os.path.join(save_path, f"{dataset_name}.jsonl")
     prompt_format = dataset2prompt[dataset_name]
