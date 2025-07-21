@@ -18,7 +18,7 @@ from collections import defaultdict
 MODEL_NAME = "LLaMA-3.1-8B-Instruct"
 
 # Hardcoded TSP layer for methods that require it ***
-TSP_LAYER = 0
+TSP_LAYER = 15
 
 METHOD_ROOTS = ["fullkv", "oracle", "fastkv", "specprefill"]
 
@@ -26,10 +26,11 @@ METHOD_DISPLAY_NAMES = {
     "fullkv": "Full~KV",
     "fastkv": "FastKV",
     "specprefill": "SpecPrefill",
-    "oracle": "Oracle"
+    "oracle": "Oracle",
+    "taper": "CLAA (ours)"
 }
 
-KEEP_RATES_PERCENT = [1, 2, 3, 4]
+KEEP_RATES_PERCENT = [1, 2, 4]
 
 DATASETS = [
     ("narrativeqa", "NrtvQA"),
