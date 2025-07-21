@@ -117,6 +117,9 @@ def setup_model_and_tokenizer(args):
         elif args.mode == 'taper':
             from baseline.taper.monkeypatch import replace_llama, replace_mistral
             replace_llama(); replace_mistral()
+        elif args.mode == 'claa':
+            from baseline.claa.monkeypatch import replace_llama, replace_mistral
+            replace_llama(); replace_mistral()
         elif args.mode == 'snapkv':
             from baseline.snapkv.monkeypatch import replace_llama, replace_mistral, replace_phi3
             replace_llama(); replace_mistral(); replace_phi3()
@@ -147,6 +150,9 @@ def setup_model_and_tokenizer(args):
             compress(model, args)
         elif args.mode == 'taper':
             from baseline.taper.taper_utils import compress
+            compress(model, args)
+        elif args.mode == 'claa':
+            from baseline.claa.claa_utils import compress
             compress(model, args)
         elif args.mode == 'hfastkv':
             from baseline.hfastkv.hfastkv_utils import compress
@@ -343,7 +349,7 @@ if __name__ == "__main__":
     parser.add_argument("--mode", type=str, default="fastkv", 
                         choices=["fullkv", "fastkv", "snapkv", "gemfilter", "adakv", "headkv", 
                                  "speculative_prefill", "echo_cache", "hfastkv", "draft_tsp", 
-                                 "uniform", "taper", "oracle"])
+                                 "uniform", "taper", "claa", "oracle"])
 
     parser.add_argument("--window_size", type=int, default=8)
     parser.add_argument("--max_capacity_prompt", type=int, default=512)

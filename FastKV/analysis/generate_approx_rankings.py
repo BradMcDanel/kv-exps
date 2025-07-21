@@ -153,7 +153,93 @@ class GemFilterRankingGenerator(BaseRankingGenerator):
         return self.rankings
 
 
-# --- Strategy 3: Speculative (1:1 with Oracle) ---
+# --- Strategy 3: CLAA ---
+
+class CLAARankingGenerator(BaseRankingGenerator):
+    def __init__(self, model, tokenizer, args):
+        super().__init__(model, tokenizer, args)
+        self.rankings: Dict[int, torch.Tensor] = {}
+        self.collected_scores: List[torch.Tensor] = []
+
+    def _aggregate_and_select_indices(self, scores_list: List[torch.Tensor], seq_len: int) -> torch.Tensor:
+        if not scores_list:
+            return torch.arange(seq_len, device=self.device)
+        
+        aggregated_scores = torch.stack(scores_list, dim=1)
+        bsz, num_layers, num_heads, score_len = aggregated_scores.shape
+        
+        if self.args.pooling in ['avgpool', 'maxpool'] and self.args.kernel_size > 1:
+            reshaped_for_pooling = aggregated_scores.view(bsz * num_layers * num_heads, 1, score_len)
+            padding = (self.args.kernel_size - 1) // 2
+            pool_fn = F.avg_pool1d if self.args.pooling == 'avgpool' else F.max_pool1d
+            pooled_tensor = pool_fn(reshaped_for_pooling, kernel_size=self.args.kernel_size, stride=1, padding=padding)
+            processed_scores = pooled_tensor.view(bsz, num_layers, num_heads, score_len)
+        else:
+            processed_scores = aggregated_scores
+
+        max_scores_across_heads, _ = processed_scores.max(dim=2)
+        final_token_importance, _ = max_scores_across_heads.max(dim=1)
+        
+        return final_token_importance.squeeze(0)
+
+    def _patched_attention_forward(self, self_attn: LlamaAttention, hidden_states: torch.Tensor, attention_mask: Optional[torch.Tensor] = None, position_ids: Optional[torch.LongTensor] = None, past_key_value: Optional[Cache] = None, use_cache: bool = False, **kwargs):
+        bsz, q_len, _ = hidden_states.size()
+        if self_attn.layer_idx not in self.orig_fwds or q_len <= self.args.window_size:
+            original_forward = self.orig_fwds.get(self_attn.layer_idx, self_attn.__class__.forward)
+            return original_forward(self_attn, hidden_states=hidden_states, attention_mask=attention_mask, position_ids=position_ids, past_key_value=past_key_value, use_cache=use_cache, **kwargs)
+
+        cfg = self_attn.config
+        num_heads, head_dim = cfg.num_attention_heads, cfg.hidden_size // cfg.num_attention_heads
+        num_kv_heads, num_kv_groups = cfg.num_key_value_heads, cfg.num_attention_heads // cfg.num_key_value_heads
+
+        query_states = self_attn.q_proj(hidden_states).view(bsz, q_len, num_heads, head_dim).transpose(1, 2)
+        key_states = self_attn.k_proj(hidden_states).view(bsz, q_len, num_kv_heads, head_dim).transpose(1, 2)
+        value_states = self_attn.v_proj(hidden_states).view(bsz, q_len, num_kv_heads, head_dim).transpose(1, 2)
+        
+        cos, sin = self_attn.rotary_emb(value_states, position_ids=position_ids)
+        query_states, key_states = hf_apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+
+        with torch.no_grad():
+            key_states_for_scoring = hf_repeat_kv(key_states, num_kv_groups).detach()
+            scoring_queries = query_states[..., -self.args.window_size:, :].detach()
+            attn_logits = torch.matmul(scoring_queries, key_states_for_scoring[..., :-self.args.window_size, :].transpose(2, 3)) / math.sqrt(head_dim)
+            attn_probs = F.softmax(attn_logits, dim=-1, dtype=torch.float32).to(query_states.dtype)
+            scores_for_this_layer = attn_probs.sum(dim=-2)
+            self.collected_scores.append(scores_for_this_layer)
+            
+            # Generate ranking for current layer (up to this layer)
+            if self.collected_scores:
+                final_scores = self._aggregate_and_select_indices(self.collected_scores, q_len)
+                padded_scores = torch.zeros(q_len, device=final_scores.device, dtype=final_scores.dtype)
+                padded_scores[:-self.args.window_size] = final_scores
+                padded_scores[-self.args.window_size:] = final_scores.max() + 1e-5
+                self.rankings[self_attn.layer_idx] = padded_scores.clone()
+
+        attn_output = F.scaled_dot_product_attention(query_states, hf_repeat_kv(key_states, num_kv_groups), hf_repeat_kv(value_states, num_kv_groups), attn_mask=attention_mask, dropout_p=0.0, is_causal=(q_len > 1 and attention_mask is None))
+        attn_output = attn_output.transpose(1, 2).contiguous().reshape(bsz, q_len, cfg.hidden_size)
+        return self_attn.o_proj(attn_output), None, past_key_value
+
+    def _patch_model(self):
+        for i, layer in enumerate(self.model.model.layers):
+            if hasattr(layer, 'self_attn') and isinstance(layer.self_attn, LlamaAttention):
+                setattr(layer.self_attn, "layer_idx", i)
+                self.orig_fwds[i] = layer.self_attn.forward
+                layer.self_attn.forward = types.MethodType(self._patched_attention_forward, layer.self_attn)
+
+    @torch.no_grad()
+    def generate_rankings(self, inputs: Dict[str, torch.Tensor]) -> Dict:
+        self.rankings.clear()
+        self.collected_scores.clear()
+        self._patch_model()
+        
+        seq_len = inputs['input_ids'].shape[1]
+        self.model(input_ids=inputs['input_ids'], use_cache=False, position_ids=torch.arange(seq_len, device=self.device).unsqueeze(0))
+        
+        self._unpatch_model()
+        return self.rankings
+
+
+# --- Strategy 4: Speculative (1:1 with Oracle) ---
 
 def _patched_attention_forward_speculative(
     self_attn: LlamaAttention,
@@ -410,6 +496,7 @@ def main():
     generators = {
         'fastkv': FastKVRankingGenerator(model, tokenizer, args),
         'gemfilter': GemFilterRankingGenerator(model, tokenizer, args),
+        'claa': CLAARankingGenerator(model, tokenizer, args),
         'speculative': SpeculativeRankingGenerator(model, tokenizer, args)
     }
     print("Initialized all ranking generators.")

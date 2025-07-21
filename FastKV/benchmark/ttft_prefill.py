@@ -41,6 +41,10 @@ def main(args):
         from baseline.taper.monkeypatch import replace_llama, replace_mistral
         replace_llama()
         replace_mistral()
+    elif args.mode == 'claa':
+        from baseline.claa.monkeypatch import replace_llama, replace_mistral
+        replace_llama()
+        replace_mistral()
     elif args.mode == 'snapkv':
         from baseline.snapkv.monkeypatch import replace_llama, replace_mistral, replace_phi3
         replace_llama()
@@ -122,6 +126,9 @@ def main(args):
             compress(model, args)
         elif args.mode == 'taper':
             from baseline.taper.taper_utils import compress
+            compress(model, args)
+        elif args.mode == 'claa':
+            from baseline.claa.claa_utils import compress
             compress(model, args)
         elif args.mode == 'hfastkv':
             from baseline.hfastkv.hfastkv_utils import compress
@@ -209,6 +216,11 @@ def main(args):
     print(f"Context Length = {context_length}")
     if args.mode == "draft_tsp" or args.mode == "taper":
         print(f"TSP Schedule = '{args.tsp_schedule}'")
+    elif args.mode == "claa":
+        if args.tsp_len_percentage:
+            print(f"TSP Length: {args.tsp_len_percentage:.1%}")
+        else:
+            print(f"TSP Length: {args.tsp_len} tokens")
     elif args.mode == 'fastkv':
         if args.max_capacity_prompt_percentage:
             print(f"Context Capacity: {args.max_capacity_prompt_percentage:.1%}")
@@ -249,7 +261,7 @@ if __name__ == "__main__":
     parser.add_argument("--model", type=str, default="meta-llama/Meta-Llama-3.1-8B-Instruct", help="model name of model path")
     parser.add_argument("--seed", type=int, default=42, help="Seed")
 
-    parser.add_argument("--mode", type=str, default="fastkv", choices=["fullkv", "fastkv", "snapkv", "gemfilter", "adakv", "headkv", "hfastkv", "taper", "draft_tsp", "speculative_prefill", "oracle"])
+    parser.add_argument("--mode", type=str, default="fastkv", choices=["fullkv", "fastkv", "snapkv", "gemfilter", "adakv", "headkv", "hfastkv", "taper", "claa", "draft_tsp", "speculative_prefill", "oracle"])
     parser.add_argument("--speculator_model_name", type=str, default="meta-llama/Llama-3.2-1B-Instruct", help="Speculator model for draft_tsp.")
     
     parser.add_argument("--look_ahead_k", type=int, default=8, help="Number of lookahead steps for Draft TSP.")
