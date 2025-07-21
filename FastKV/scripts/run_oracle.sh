@@ -6,7 +6,7 @@ device=0
 keep_percentage=0.1
 oracle_rankings_path="analysis_results/oracles"
 path="oracle"
-tsp_idx=15  # Set to None or comment out to disable TSP
+tsp_idx=15
 
 for dataset in $dataset_list
 do

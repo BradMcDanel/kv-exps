@@ -10,6 +10,8 @@ import logging
 import pprint
 from tqdm import tqdm
 from pathlib import Path
+import os
+import numpy as np
 
 import torch
 import numpy as np 
@@ -196,14 +198,11 @@ def generate_longbench(data, max_length, max_gen, prompt_format,
 
     for i, json_obj in tqdm(enumerate(data), desc=f"Generating Responses for {args.mode}...", total=len(data)):
         try:
-            # Oracle mode: check for rankings and skip if missing
             if args.mode == 'oracle':
-                import os
-                import numpy as np
                 from baseline.oracle.oracle_utils import set_oracle_rankings
                 
                 # Construct path to oracle rankings file
-                oracle_file = os.path.join(args.oracle_rankings_path, args.oracle_model_name, f"{dataset}.npz")
+                oracle_file = os.path.join(args.oracle_rankings_path, args.oracle_model_name.replace("/", "_"), f"{dataset}.npz")
                 sample_key = f"sample_{i}"
                 
                 if not os.path.exists(oracle_file):
@@ -212,7 +211,7 @@ def generate_longbench(data, max_length, max_gen, prompt_format,
                 
                 # Load rankings for this sample
                 try:
-                    oracle_data = np.load(oracle_file)
+                    oracle_data = np.load(oracle_file, allow_pickle=True)
                     if sample_key not in oracle_data:
                         print(f"Sample {sample_key} not found in {oracle_file}. Skipping sample {i}.")
                         continue
