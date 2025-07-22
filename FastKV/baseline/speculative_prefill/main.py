@@ -200,7 +200,7 @@ class SpeculativePrefillPipeline:
         if bs != 1:
             raise NotImplementedError("Batch size > 1 is not supported.")
 
-        attention_probs = F.softmax(attention_scores, dim=-1, dtype=torch.float32).to(attention_scores.dtype)
+        attention_probs = F.softmax(attention_scores, dim=-1, dtype=torch.bfloat16).to(attention_scores.dtype)
 
         if self.pool_kernel_size and self.pool_type != 'none':
             reshaped_for_pooling = attention_probs.squeeze(0).flatten(0, 2)
