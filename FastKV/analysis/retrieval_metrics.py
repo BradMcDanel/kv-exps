@@ -32,7 +32,7 @@ def load_npz_data_for_dataset(base_path: str, model_name: str, dataset_name: str
 
 def deserialize_rankings_in_sample(sample_data: Dict[str, Any]):
     """Deserializes pickled ranking data within a sample dictionary in-place."""
-    for rank_type in ['fastkv_rankings', 'gemfilter_rankings', 'speculative_rankings']:
+    for rank_type in ['fastkv_rankings', 'gemfilter_rankings', 'claa_rankings', 'speculative_rankings']:
         if rank_type in sample_data and isinstance(sample_data[rank_type], bytes):
             sample_data[rank_type] = pickle.loads(sample_data[rank_type])
 
@@ -80,7 +80,7 @@ def get_mean_accuracies(
     common_keys = sorted(list(set(oracle_samples.keys()) & set(approx_8b.keys()) & set(approx_1b.keys())))
     if not common_keys: return {}
 
-    accs = {'fastkv': defaultdict(list), 'gemfilter': defaultdict(list), 'spec_prefill': []}
+    accs = {'fastkv': defaultdict(list), 'gemfilter': defaultdict(list), 'claa': defaultdict(list), 'spec_prefill': []}
     k_priority = [8, 32, 1]
 
     for sample_key in common_keys:
@@ -92,10 +92,12 @@ def get_mean_accuracies(
 
         fk_acc = calculate_oracle_overlap(approx_8b[sample_key].get('fastkv_rankings', {}), oracle_ranking, k_percentage)
         gf_acc = calculate_oracle_overlap(approx_8b[sample_key].get('gemfilter_rankings', {}), oracle_ranking, k_percentage)
+        claa_acc = calculate_oracle_overlap(approx_8b[sample_key].get('claa_rankings', {}), oracle_ranking, k_percentage)
         sp_acc = calculate_oracle_overlap(approx_1b[sample_key].get('speculative_rankings', {}), oracle_ranking, k_percentage)
 
         for k, v in fk_acc.items(): accs['fastkv'][k].append(v)
         for k, v in gf_acc.items(): accs['gemfilter'][k].append(v)
+        for k, v in claa_acc.items(): accs['claa'][k].append(v)
         
         chosen_k_acc = next((sp_acc[k_val] for k_val in k_priority if k_val in sp_acc), None)
         if chosen_k_acc is not None:
@@ -104,6 +106,7 @@ def get_mean_accuracies(
     mean_accs = {}
     if accs['fastkv']: mean_accs['fastkv'] = {k: np.mean(v) for k, v in accs['fastkv'].items()}
     if accs['gemfilter']: mean_accs['gemfilter'] = {k: np.mean(v) for k, v in accs['gemfilter'].items()}
+    if accs['claa']: mean_accs['claa'] = {k: np.mean(v) for k, v in accs['claa'].items()}
     if accs['spec_prefill']: mean_accs['spec_prefill'] = np.mean(accs['spec_prefill'])
     return mean_accs
 

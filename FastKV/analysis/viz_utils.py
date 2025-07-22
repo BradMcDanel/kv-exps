@@ -14,6 +14,7 @@ METHOD_COLORS = {
     'Oracle': '#2ca02c',                # Green
     'FastKV': '#d62728',                # Red
     'GemFilter': '#ff7f0e',             # Orange
+    'CLAA': '#1565c0',                  # Rich royal blue - OUR METHOD!
     'Speculative': '#5e2b8c',           # Dark purple
     'Speculative (k=1)': '#d6b3ff',     # Light purple
     'Speculative (k=8)': '#a066cc',     # Medium purple
