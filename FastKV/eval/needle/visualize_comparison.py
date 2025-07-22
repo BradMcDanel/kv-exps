@@ -50,8 +50,8 @@ def create_pivot_table(df):
     expected_lengths = [16384, 24576, 32768, 40960, 49152, 57344, 65536]
     length_labels = ["16k", "24k", "32k", "40k", "48k", "56k", "64k"]
     
-    # Expected depth percentages (0 to 100 in steps of 11)
-    expected_depths = list(range(0, 101, 11))
+    # Expected depth percentages (matching needle evaluation default: 10 intervals)
+    expected_depths = [0, 11, 22, 33, 44, 56, 67, 78, 89, 100]
     
     if df.empty:
         # Create empty pivot table with all expected dimensions
@@ -122,7 +122,7 @@ def main(args):
     cmap = LinearSegmentedColormap.from_list("custom_cmap", ["#F0496E", "#EBB839", "#0CD79F"])
     
     # Create figure with subplots
-    fig, axes = plt.subplots(1, 4, figsize=(20, 5))
+    fig, axes = plt.subplots(1, 4, figsize=(12, 4))
     
     # Track if we need to create colorbar
     need_colorbar = True
