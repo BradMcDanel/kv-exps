@@ -91,49 +91,49 @@ class FastKVCluster():
 
 
         if q_len < max_capacity_prompt:
-            avg_indices = None
-            return key_states, value_states, avg_indices
+            return key_states, value_states, None
+
+        key_states_temp = repeat_kv(key_states, num_key_value_groups)
+        attn_weights = torch.matmul(query_states[..., -self.window_size:, :], key_states_temp.transpose(2, 3)) / math.sqrt(head_dim)
+        mask = torch.full((self.window_size, self.window_size), torch.finfo(attn_weights.dtype).min, device=attn_weights.device)
+        mask_cond = torch.arange(mask.size(-1), device=attn_weights.device)
+        mask.masked_fill_(mask_cond < (mask_cond + 1).view(mask.size(-1), 1), 0)
+        mask = mask.to(attn_weights.device)
+        attention_mask = mask[None, None, :, :]
+
+        attn_weights[:, :, -self.window_size:, -self.window_size:] += attention_mask
+
+        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+        attn_weights_sum = attn_weights[:, :, -self.window_size:, : -self.window_size].sum(dim = -2)
+        if self.pooling == 'avgpool':
+            attn_cache = F.avg_pool1d(attn_weights_sum, kernel_size = self.kernel_size, padding=self.kernel_size//2, stride=1)
+        elif self.pooling == 'maxpool':
+            attn_cache = F.max_pool1d(attn_weights_sum, kernel_size = self.kernel_size, padding=self.kernel_size//2, stride=1)
         else:
-            key_states_temp = repeat_kv(key_states, num_key_value_groups)
-            attn_weights = torch.matmul(query_states[..., -self.window_size:, :], key_states_temp.transpose(2, 3)) / math.sqrt(head_dim)
-            mask = torch.full((self.window_size, self.window_size), torch.finfo(attn_weights.dtype).min, device=attn_weights.device)
-            mask_cond = torch.arange(mask.size(-1), device=attn_weights.device)
-            mask.masked_fill_(mask_cond < (mask_cond + 1).view(mask.size(-1), 1), 0)
-            mask = mask.to(attn_weights.device)
-            attention_mask = mask[None, None, :, :]
+            raise ValueError('Pooling method not supported')
 
-            attn_weights[:, :, -self.window_size:, -self.window_size:] += attention_mask
+        attn_cache = attn_cache.view(bsz, -1, num_key_value_groups, q_len-self.window_size).sum(dim=-2)
+        indices = attn_cache.topk(max_capacity_prompt - self.window_size, dim=-1).indices
+        indices = indices.unsqueeze(-1).expand(-1, -1, -1, head_dim)
+        
+        # KV compression
+        k_past_compress = key_states[:, :, :-self.window_size, :].gather(dim = 2, index = indices)
+        v_past_compress = value_states[:, :, :-self.window_size, :].gather(dim = 2, index = indices)
+        k_cur = key_states[:, :, -self.window_size:, :]
+        v_cur = value_states[:, :, -self.window_size:, :]
+        key_states = torch.cat([k_past_compress, k_cur], dim = 2)
+        value_states = torch.cat([v_past_compress, v_cur], dim = 2)
 
-            attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-            attn_weights_sum = attn_weights[:, :, -self.window_size:, : -self.window_size].sum(dim = -2)
-            if self.pooling == 'avgpool':
-                attn_cache = F.avg_pool1d(attn_weights_sum, kernel_size = self.kernel_size, padding=self.kernel_size//2, stride=1)
-            elif self.pooling == 'maxpool':
-                attn_cache = F.max_pool1d(attn_weights_sum, kernel_size = self.kernel_size, padding=self.kernel_size//2, stride=1)
-            else:
-                raise ValueError('Pooling method not supported')
+        if self.tsp_layer and (q_len > tsp_length):
+            tsp_indices = attn_cache.sum(dim=-2).topk(tsp_length - self.window_size, dim=-1).indices
+            window_indices = torch.arange(q_len - self.window_size, q_len, device=tsp_indices.device).unsqueeze(0).repeat(bsz,1)
+            tsp_indices = torch.cat([tsp_indices, window_indices], dim=-1)
+            tsp_indices, _ = torch.sort(tsp_indices, dim=1)
+            logging.info(f"FastKV Layer {layer_idx}: TSP applied - selected {tsp_indices.shape[-1]} tokens")
+        else:
+            tsp_indices = None
 
-            attn_cache = attn_cache.view(bsz, -1, num_key_value_groups, q_len-self.window_size).sum(dim=-2)
-            indices = attn_cache.topk(max_capacity_prompt - self.window_size, dim=-1).indices
-            indices = indices.unsqueeze(-1).expand(-1, -1, -1, head_dim)
-            
-            k_past_compress = key_states[:, :, :-self.window_size, :].gather(dim = 2, index = indices)
-            v_past_compress = value_states[:, :, :-self.window_size, :].gather(dim = 2, index = indices)
-            k_cur = key_states[:, :, -self.window_size:, :]
-            v_cur = value_states[:, :, -self.window_size:, :]
-            key_states = torch.cat([k_past_compress, k_cur], dim = 2)
-            value_states = torch.cat([v_past_compress, v_cur], dim = 2)
-
-            if self.tsp_layer and (q_len > tsp_length):
-                tsp_indices = attn_cache.sum(dim=-2).topk(tsp_length - self.window_size, dim=-1).indices
-                window_indices = torch.arange(q_len - self.window_size, q_len, device=tsp_indices.device).unsqueeze(0).repeat(bsz,1)
-                tsp_indices = torch.cat([tsp_indices, window_indices], dim=-1)
-                tsp_indices, _ = torch.sort(tsp_indices, dim=1)
-                logging.info(f"FastKV Layer {layer_idx}: TSP applied - selected {tsp_indices.shape[-1]} tokens")
-            else:
-                tsp_indices = None
-
-            return key_states, value_states, tsp_indices
+        return key_states, value_states, tsp_indices
 
 def init_fastkv(self):
     self.kv_cluster = FastKVCluster()

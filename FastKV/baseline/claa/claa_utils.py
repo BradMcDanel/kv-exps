@@ -8,6 +8,7 @@ import logging
 from typing import List
 
 _prompt_len = None
+_score_buffer = []
 
 def compress(model, args): 
     layers = len(model.model.layers)
@@ -56,44 +57,26 @@ class CLAACluster():
         self.tsp_len_percentage = tsp_len_percentage
         self.last_n_layers = last_n_layers
 
-    def _aggregate_and_select_indices(self, scores_list: List[torch.Tensor], num_to_keep: int) -> torch.Tensor:
-        if not scores_list:
-            raise ValueError("Cannot select indices from an empty list of scores.")
-        
-        # Use configurable number of last layers (default to all layers if not specified)
-        if self.last_n_layers is None:
-            selected_scores = scores_list  # Use all layers (original behavior)
-        elif self.last_n_layers == 1:
-            selected_scores = [scores_list[-1]]  # Use only last layer
-        else:
-            selected_scores = scores_list[-self.last_n_layers:] if len(scores_list) >= self.last_n_layers else scores_list
-        
-        aggregated_scores = torch.stack(selected_scores, dim=1)
-        bsz, num_layers, num_heads, score_len = aggregated_scores.shape
-        
-        if self.pooling in ['avgpool', 'maxpool'] and self.kernel_size > 1:
-            reshaped_for_pooling = aggregated_scores.view(bsz * num_layers * num_heads, 1, score_len)
-            padding = (self.kernel_size - 1) // 2
-            pool_fn = F.avg_pool1d if self.pooling == 'avgpool' else F.max_pool1d
-            pooled_tensor = pool_fn(reshaped_for_pooling, kernel_size=self.kernel_size, stride=1, padding=padding)
-            processed_scores = pooled_tensor.view(bsz, num_layers, num_heads, score_len)
-        else:
-            processed_scores = aggregated_scores
-        
-        max_scores_across_heads, _ = processed_scores.max(dim=2)
-        final_token_importance, _ = max_scores_across_heads.max(dim=1)
-        
-        num_to_keep = min(num_to_keep, final_token_importance.shape[-1])
-        _, top_indices = torch.topk(final_token_importance, k=num_to_keep, dim=-1)
-        return torch.sort(top_indices, dim=-1)[0]
+    def reset(self, window_size=8, max_capacity_prompt=512, kernel_size=7, pooling='avgpool', tsp_layer=False, tsp_length=2048, max_capacity_prompt_percentage=None, tsp_len_percentage=None, last_n_layers=None):
+        self.window_size = window_size
+        self.max_capacity_prompt = max_capacity_prompt
+        self.max_capacity_prompt_percentage = max_capacity_prompt_percentage
+        if self.max_capacity_prompt_percentage is None:
+            assert self.max_capacity_prompt - self.window_size > 0
+        self.kernel_size = kernel_size
+        self.pooling = pooling
+        self.tsp_layer = tsp_layer
+        self.tsp_length = tsp_length
+        self.tsp_len_percentage = tsp_len_percentage
+        self.last_n_layers = last_n_layers
 
     def update_kv(self, key_states, query_states, value_states, attention_mask, num_key_value_groups, layer_idx, **kwargs):
         bsz, _, q_len, head_dim = query_states.shape
-        _, num_kv_heads, _, _ = key_states.shape
         
-        global _prompt_len
+        global _prompt_len, _score_buffer
         if layer_idx == 0:
             _prompt_len = q_len
+            _score_buffer.clear()
             logging.info(f"CLAA: Set global prompt length = {_prompt_len}")
             
         self.original_prompt_len = _prompt_len
@@ -108,48 +91,66 @@ class CLAACluster():
         else:
             tsp_length = self.tsp_length
 
-        is_score_collection_needed = kwargs.get("is_score_collection_needed", True)
-        claa_collected_scores = kwargs["taper_collected_scores"]
-        
-        # Score collection (exactly like taper)
-        if is_score_collection_needed and q_len > self.window_size:
-            key_states_for_scores = repeat_kv(key_states, num_key_value_groups)
-            attn_logits = torch.matmul(query_states[..., -self.window_size:, :], key_states_for_scores[..., :-self.window_size, :].transpose(2, 3)) / math.sqrt(head_dim)
-            attn_probs = F.softmax(attn_logits, dim=-1, dtype=torch.float32).to(query_states.dtype)
-            scores_for_this_layer = attn_probs.sum(dim=-2)
-            claa_collected_scores.append(scores_for_this_layer)
-        
-        # TSP application (exactly like taper, but single layer)
-        if self.tsp_layer and q_len > max_capacity_prompt:
-            logging.info(f"CLAA Layer {layer_idx}: Applying TSP. Original seq len: {q_len}, Max capacity: {max_capacity_prompt}")
-            
-            # Use tsp_length instead of ratio
-            num_to_keep = max(tsp_length, max_capacity_prompt) - self.window_size
 
-            if num_to_keep <= 0 or not claa_collected_scores:
-                claa_collected_scores.clear()
-                return key_states, value_states, None
-            
-            indices_to_keep_past = self._aggregate_and_select_indices(claa_collected_scores, num_to_keep)
-            claa_collected_scores.clear()
-            
-            past_indices = indices_to_keep_past.unsqueeze(1).unsqueeze(-1).expand(bsz, num_kv_heads, num_to_keep, head_dim)
-            k_past_compress = key_states[:, :, :-self.window_size, :].gather(dim=2, index=past_indices)
-            v_past_compress = value_states[:, :, :-self.window_size, :].gather(dim=2, index=past_indices)
+        if q_len < max_capacity_prompt:
+            return key_states, value_states, None
+
+        key_states_temp = repeat_kv(key_states, num_key_value_groups)
+        attn_weights = torch.matmul(query_states[..., -self.window_size:, :], key_states_temp.transpose(2, 3)) / math.sqrt(head_dim)
+        mask = torch.full((self.window_size, self.window_size), torch.finfo(attn_weights.dtype).min, device=attn_weights.device)
+        mask_cond = torch.arange(mask.size(-1), device=attn_weights.device)
+        mask.masked_fill_(mask_cond < (mask_cond + 1).view(mask.size(-1), 1), 0)
+        mask = mask.to(attn_weights.device)
+        attention_mask = mask[None, None, :, :]
+
+        attn_weights[:, :, -self.window_size:, -self.window_size:] += attention_mask
+
+        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+        attn_weights_sum = attn_weights[:, :, -self.window_size:, : -self.window_size].sum(dim = -2)
+        if self.pooling == 'avgpool':
+            attn_cache = F.avg_pool1d(attn_weights_sum, kernel_size = self.kernel_size, padding=self.kernel_size//2, stride=1)
+        elif self.pooling == 'maxpool':
+            attn_cache = F.max_pool1d(attn_weights_sum, kernel_size = self.kernel_size, padding=self.kernel_size//2, stride=1)
+        else:
+            raise ValueError('Pooling method not supported')
+
+        attn_cache = attn_cache.view(bsz, -1, num_key_value_groups, q_len-self.window_size).sum(dim=-2)
+
+        # update rolling attn_cache score buffer
+        _score_buffer.append(attn_cache)
+        if len(_score_buffer) > self.last_n_layers:
+            _score_buffer.pop(0)
+
+        # KV compression
+        if len(_score_buffer) >= self.last_n_layers:
+            indices = attn_cache.topk(max_capacity_prompt - self.window_size, dim=-1).indices
+            indices = indices.unsqueeze(-1).expand(-1, -1, -1, head_dim)
+            k_past_compress = key_states[:, :, :-self.window_size, :].gather(dim = 2, index = indices)
+            v_past_compress = value_states[:, :, :-self.window_size, :].gather(dim = 2, index = indices)
             k_cur = key_states[:, :, -self.window_size:, :]
             v_cur = value_states[:, :, -self.window_size:, :]
-            key_states = torch.cat([k_past_compress, k_cur], dim=2)
-            value_states = torch.cat([v_past_compress, v_cur], dim=2)
+            key_states = torch.cat([k_past_compress, k_cur], dim = 2)
+            value_states = torch.cat([v_past_compress, v_cur], dim = 2)
 
-            window_indices = torch.arange(q_len - self.window_size, q_len, device=indices_to_keep_past.device)
-            window_indices = window_indices.unsqueeze(0).expand(bsz, -1)
-            tsp_indices = torch.cat([indices_to_keep_past, window_indices], dim=1)
-            tsp_indices = torch.sort(tsp_indices, dim=1)[0]
-            
-            logging.info(f"CLAA Layer {layer_idx}: Pruned. New K/V seq len: {key_states.shape[-2]}")
-            return key_states, value_states, tsp_indices
+        if self.tsp_layer and (q_len > tsp_length):
+            # CLAA
+            scores_tensor = torch.stack(_score_buffer, dim=1)
+            flattened_scores = scores_tensor.flatten(start_dim=1, end_dim=2)
+            final_token_importance, _ = flattened_scores.max(dim=1)
+            tsp_indices = final_token_importance.topk(tsp_length - self.window_size, dim=-1).indices
+
+            # FastKV (for comparison)
+            # tsp_indices = attn_cache.sum(dim=-2).topk(tsp_length - self.window_size, dim=-1).indices
+
+            window_indices = torch.arange(q_len - self.window_size, q_len, device=tsp_indices.device).unsqueeze(0).repeat(bsz,1)
+            tsp_indices = torch.cat([tsp_indices, window_indices], dim=-1)
+            tsp_indices, _ = torch.sort(tsp_indices, dim=1)
+            logging.info(f"CLAA Layer {layer_idx}: TSP applied - selected {tsp_indices.shape[-1]} tokens")
         else:
-            return key_states, value_states, None
+            tsp_indices = None
+
+        return key_states, value_states, tsp_indices
+
 
 def init_claa(self):
     self.kv_cluster = CLAACluster()
