@@ -55,9 +55,7 @@ def _patched_attention_forward_fastkv(
     cache_position: Optional[torch.LongTensor] = None,
     **kwargs,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Cache]]:
-    print(f"DEBUG FastKV: Entered patched attention forward, layer {getattr(self_attn, 'layer_idx', 'unknown')}")
     batch_size, query_length, _ = hidden_states.size()
-    print(f"DEBUG FastKV: batch_size={batch_size}, query_length={query_length}")
     num_heads = self_attn.config.num_attention_heads
     head_dim = self_attn.config.hidden_size // num_heads
     num_key_value_heads = self_attn.config.num_key_value_heads

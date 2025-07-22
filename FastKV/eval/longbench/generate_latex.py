@@ -28,7 +28,7 @@ METHOD_DISPLAY_NAMES = {
     "gemfilter": "GemFilter",
     "specprefill": "SpecPrefill",
     "oracle": "Oracle",
-    "claa": "CLAA (ours)"
+    "claa": "CLAA"
 }
 
 KEEP_RATES_DECIMAL = [0.1, 0.2, 0.4]
@@ -202,7 +202,11 @@ def generate_latex_table(grouped_results):
         print(r"\midrule")
         
         for res in results_for_rate:
-            method_cell = f"{res['method_name']:<9}"
+            # Add highlight color for CLAA
+            if res['method_root'] == 'claa':
+                method_cell = rf"\colorbox{{yellow!20}}{{{res['method_name']:<9}}}"
+            else:
+                method_cell = f"{res['method_name']:<9}"
             score_cells = []
             for key in DATASET_KEYS:
                 score = res['scores'].get(key)
@@ -212,7 +216,8 @@ def generate_latex_table(grouped_results):
             avg_score = res['avg']
             if avg_score is not None:
                 avg_str = f"{avg_score:.2f}"
-                if max_avg is not None and abs(avg_score - max_avg) < 1e-5:
+                # Bold the best score, but exclude oracle from being bolded
+                if max_avg is not None and abs(avg_score - max_avg) < 1e-5 and res['method_root'] != 'oracle':
                     avg_str = rf"\textbf{{{avg_str}}}"
             else:
                 avg_str = "   -"
