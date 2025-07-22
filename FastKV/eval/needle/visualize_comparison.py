@@ -46,32 +46,51 @@ def load_results(model, eval_path, expected_answer):
 
 def create_pivot_table(df):
     """Create pivot table for heatmap"""
-    if df.empty:
-        return pd.DataFrame()
+    # Define expected context lengths and their labels
+    expected_lengths = [16384, 24576, 32768, 40960, 49152, 57344, 65536]
+    length_labels = ["16k", "24k", "32k", "40k", "48k", "56k", "64k"]
     
+    # Expected depth percentages (0 to 100 in steps of 11)
+    expected_depths = list(range(0, 101, 11))
+    
+    if df.empty:
+        # Create empty pivot table with all expected dimensions
+        pivot_table = pd.DataFrame(index=expected_depths, columns=length_labels)
+        pivot_table.index.name = "Document Depth"
+        pivot_table.columns.name = "Context Length"
+        return pivot_table
+    
+    # Create pivot table from available data
     pivot_table = pd.pivot_table(df, values='Score', index=['Document Depth', 'Context Length'], aggfunc='mean').reset_index()
     pivot_table = pivot_table.pivot(index="Document Depth", columns="Context Length", values="Score")
     
-    # Map context lengths to standard "k" labels based on expected values
-    length_mapping = {
-        16384: "16k", 24576: "24k", 32768: "32k", 40960: "40k", 
-        49152: "48k", 57344: "56k", 65536: "64k"
-    }
+    # Map actual context lengths to standard labels
+    length_mapping = dict(zip(expected_lengths, length_labels))
     
-    # Format column labels
-    if not pivot_table.empty:
-        new_columns = []
-        for col in pivot_table.columns:
-            # Find closest standard length
-            closest_len = min(length_mapping.keys(), key=lambda x: abs(x - col))
-            if abs(closest_len - col) < 2000:  # Within 2k tolerance
-                new_columns.append(length_mapping[closest_len])
-            else:
-                # Fallback to k format
-                new_columns.append(f"{int(col/1024)}k")
-        pivot_table.columns = new_columns
+    # Rename columns to standard labels
+    column_mapping = {}
+    for col in pivot_table.columns:
+        # Find closest standard length
+        closest_len = min(expected_lengths, key=lambda x: abs(x - col))
+        if abs(closest_len - col) < 2000:  # Within 2k tolerance
+            column_mapping[col] = length_mapping[closest_len]
+        else:
+            column_mapping[col] = f"{int(col/1024)}k"
     
-    return pivot_table
+    pivot_table = pivot_table.rename(columns=column_mapping)
+    
+    # Create complete grid with all expected rows and columns
+    complete_pivot = pd.DataFrame(index=expected_depths, columns=length_labels)
+    complete_pivot.index.name = "Document Depth"
+    complete_pivot.columns.name = "Context Length"
+    
+    # Fill in available data
+    for depth in expected_depths:
+        for length_label in length_labels:
+            if depth in pivot_table.index and length_label in pivot_table.columns:
+                complete_pivot.loc[depth, length_label] = pivot_table.loc[depth, length_label]
+    
+    return complete_pivot
 
 def main(args):
     # Method configurations
