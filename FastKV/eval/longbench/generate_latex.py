@@ -231,6 +231,10 @@ def generate_latex_table(grouped_results):
             print(line1)
             print(line2)
             print(line3)
+            
+            # Add horizontal line after oracle rows
+            if res['method_root'] == 'oracle':
+                print(r"\hline")
 
         if i < len(sorted_keep_rates) - 1:
             print(r"\midrule")

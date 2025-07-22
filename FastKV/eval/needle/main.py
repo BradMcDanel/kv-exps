@@ -112,6 +112,9 @@ class LLMNeedleHaystackTester:
         else: 
             self.model_version = model_name
         
+        # Initialize pipeline attribute
+        self.pipeline = None
+        
         if context_lengths is None:
             if context_lengths_min is None or context_lengths_max is None or context_lengths_num_intervals is None:
                 raise ValueError("Either context_lengths_min, context_lengths_max, context_lengths_intervals need to be filled out OR the context_lengths_list needs to be supplied.")
@@ -160,6 +163,13 @@ class LLMNeedleHaystackTester:
             from baseline.headkv.headkv.monkeypatch import replace_llama, replace_mistral
             replace_llama(args.method)
             replace_mistral(args.method)
+        elif args.mode == 'speculative_prefill':
+            # Pipeline-based mode, no monkey patching needed
+            pass
+        elif args.mode == 'claa':
+            from baseline.claa.monkeypatch import replace_llama, replace_mistral
+            replace_llama()
+            replace_mistral()
         else:
             raise ValueError(f"We does not support {args.mode} mode") 
 
@@ -167,8 +177,24 @@ class LLMNeedleHaystackTester:
             # Load Model & Tokenizer
             logging.info(f'Load Model & Tokenizer...')
             self.enc = AutoTokenizer.from_pretrained(self.model_name, device_map='auto', trust_remote_code=True)
-            self.model_to_test = AutoModelForCausalLM.from_pretrained(self.model_name, device_map='auto', attn_implementation='flash_attention_2', torch_dtype=torch.float16)
-            self.model_to_test.eval()
+            if self.args.mode == 'speculative_prefill':
+                from baseline.speculative_prefill.main import SpeculativePrefillPipeline
+                logging.info("Initializing SpeculativePrefillPipeline for needle test...")
+                self.pipeline = SpeculativePrefillPipeline(
+                    base_model_name=self.model_name,
+                    speculator_model_name=getattr(self.args, 'speculator_model_name', 'meta-llama/Llama-3-8B-Instruct'),
+                    tokenizer=self.enc,
+                    max_capacity_prompt=getattr(self.args, 'max_capacity_prompt', 512),
+                    max_capacity_prompt_percentage=getattr(self.args, 'max_capacity_prompt_percentage', None),
+                    pool_kernel_size=getattr(self.args, 'kernel_size', 7) if getattr(self.args, 'pooling', 'avgpool') != 'none' else None,
+                    pool_type=getattr(self.args, 'pooling', 'avgpool'),
+                    use_chunk_selection=getattr(self.args, 'use_chunk_selection', False),
+                    chunk_size=getattr(self.args, 'chunk_size', 64),
+                )
+                self.model_to_test = None  # Pipeline handles the model
+            else:
+                self.model_to_test = AutoModelForCausalLM.from_pretrained(self.model_name, device_map='auto', attn_implementation='flash_attention_2', torch_dtype=torch.float16)
+                self.model_to_test.eval()
         else: 
             self.model_to_test = OpenAI(api_key=openai_api_key)
             if(self.model_provider == "OpenAI"):
@@ -253,38 +279,51 @@ class LLMNeedleHaystackTester:
             )
             response = response.choices[0].message.content
         else:
-            if self.args.mode == 'fastkv':
-                from baseline.fastkv.fastkv_utils import compress
-                compress(self.model_to_test, self.args)
-            elif self.args.mode == 'snapkv':
-                from baseline.snapkv.snapkv_utils import compress
-                compress(self.model_to_test, self.args)
-            elif self.args.mode == 'gemfilter':
-                from baseline.gemfilter.gemfilter_utils import gemfilter_generate_selection, set_topk
-                set_topk(self.model_to_test, self.args.max_capacity_prompt, mode='gemfilter') 
-            elif self.args.mode == 'adakv':
-                from baseline.adakv.adaptive_snapkv.snapkv_utils import compress
-                compress(self.model_to_test, self.args) 
-            elif self.args.mode == 'headkv':
-                from baseline.headkv.headkv.snapkv_utils import compress
-                compress(self.model_to_test, self.args)  
-                    
-            input = self.enc(prompt, return_tensors="pt").to(self.model_to_test.device)
-            context_length = input.input_ids.shape[-1]
-            with torch.no_grad():
-                if self.args.mode == 'gemfilter':
-                    response = gemfilter_generate_selection(input['input_ids'], input['attention_mask'], 
-                        self.model_to_test, self.enc, max_gen_len=50, select_layer_idx=self.args.filter_idx)
-                else:
-                    output = self.model_to_test.generate(
-                                                        **input,
-                                                        num_beams=1,
-                                                        do_sample=False,
-                                                        temperature=1.0,
-                                                        top_p=1.0,
-                                                        max_new_tokens=50,
-                                                        )[0]
-                    response = self.enc.decode(output[context_length:], skip_special_tokens=True).strip()
+            if self.args.mode == 'speculative_prefill':
+                input = self.enc(prompt, return_tensors="pt")
+                with torch.no_grad():
+                    pred, _ = self.pipeline.run(
+                        input_ids=input.input_ids,
+                        look_ahead_k=getattr(self.args, 'look_ahead_k', 1),
+                        max_generation_length=50,
+                    )
+                    response = pred
+            else:
+                if self.args.mode == 'fastkv':
+                    from baseline.fastkv.fastkv_utils import compress
+                    compress(self.model_to_test, self.args)
+                elif self.args.mode == 'snapkv':
+                    from baseline.snapkv.snapkv_utils import compress
+                    compress(self.model_to_test, self.args)
+                elif self.args.mode == 'gemfilter':
+                    from baseline.gemfilter.gemfilter_utils import gemfilter_generate_selection, set_topk
+                    set_topk(self.model_to_test, self.args.max_capacity_prompt, mode='gemfilter') 
+                elif self.args.mode == 'adakv':
+                    from baseline.adakv.adaptive_snapkv.snapkv_utils import compress
+                    compress(self.model_to_test, self.args) 
+                elif self.args.mode == 'headkv':
+                    from baseline.headkv.headkv.snapkv_utils import compress
+                    compress(self.model_to_test, self.args)
+                elif self.args.mode == 'claa':
+                    from baseline.claa.claa_utils import compress
+                    compress(self.model_to_test, self.args)
+                        
+                input = self.enc(prompt, return_tensors="pt").to(self.model_to_test.device)
+                context_length = input.input_ids.shape[-1]
+                with torch.no_grad():
+                    if self.args.mode == 'gemfilter':
+                        response = gemfilter_generate_selection(input['input_ids'], input['attention_mask'], 
+                            self.model_to_test, self.enc, max_gen_len=50, select_layer_idx=self.args.filter_idx)
+                    else:
+                        output = self.model_to_test.generate(
+                                                            **input,
+                                                            num_beams=1,
+                                                            do_sample=False,
+                                                            temperature=1.0,
+                                                            top_p=1.0,
+                                                            max_new_tokens=50,
+                                                            )[0]
+                        response = self.enc.decode(output[context_length:], skip_special_tokens=True).strip()
                 
         test_end_time = time.time()
         test_elapsed_time = test_end_time - test_start_time
@@ -520,7 +559,7 @@ if __name__ == "__main__":
     parser.add_argument("--save_path", default="", type=str, help="Path to save the output")
 
     # KV Compression
-    parser.add_argument("--mode", type=str, default="fastkv", choices=["fullkv", "fastkv", "snapkv", "gemfilter", "adakv", "headkv"])
+    parser.add_argument("--mode", type=str, default="fastkv", choices=["fullkv", "fastkv", "snapkv", "gemfilter", "adakv", "headkv", "speculative_prefill", "claa"])
     parser.add_argument("--window_size", type=int, default=8)
     parser.add_argument("--max_capacity_prompt", type=int, default=512)
     parser.add_argument("--kernel_size", type=int, default=7)
@@ -546,6 +585,16 @@ if __name__ == "__main__":
     parser.add_argument("--head_choice", type=str, default='reason', choices=['copy', 'reason'])
     parser.add_argument('--beta', type=float, default=1.2)
     parser.add_argument('--temp', type=float, default=1.0)
+    
+    # Speculative Prefill
+    parser.add_argument("--speculator_model_name", type=str, default="meta-llama/Llama-3-8B-Instruct", help="Speculator model for speculative prefill")
+    parser.add_argument("--look_ahead_k", type=int, default=1, help="Number of lookahead steps for Speculative Prefill")
+    parser.add_argument('--use_chunk_selection', action='store_true', help="Use chunk-based token selection")
+    parser.add_argument("--chunk_size", type=int, default=64, help="Chunk size for Speculative Prefill")
+    parser.add_argument("--max_capacity_prompt_percentage", type=float, default=None, help="Use a percentage of the prompt length for max capacity")
+    
+    # CLAA
+    parser.add_argument("--last_n_layers", type=int, default=None, help="Number of last layers to use for CLAA aggregation")
     
     # Evaluation
     parser.add_argument('-s', '--s_len', default=0, metavar='N', type=int)
