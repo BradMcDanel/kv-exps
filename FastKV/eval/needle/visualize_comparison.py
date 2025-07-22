@@ -52,14 +52,23 @@ def create_pivot_table(df):
     pivot_table = pd.pivot_table(df, values='Score', index=['Document Depth', 'Context Length'], aggfunc='mean').reset_index()
     pivot_table = pivot_table.pivot(index="Document Depth", columns="Context Length", values="Score")
     
-    # Format column labels to show as 16k, 24k, etc.
+    # Map context lengths to standard "k" labels based on expected values
+    length_mapping = {
+        16384: "16k", 24576: "24k", 32768: "32k", 40960: "40k", 
+        49152: "48k", 57344: "56k", 65536: "64k"
+    }
+    
+    # Format column labels
     if not pivot_table.empty:
         new_columns = []
         for col in pivot_table.columns:
-            if col >= 1024:
-                new_columns.append(f"{int(col/1024)}k")
+            # Find closest standard length
+            closest_len = min(length_mapping.keys(), key=lambda x: abs(x - col))
+            if abs(closest_len - col) < 2000:  # Within 2k tolerance
+                new_columns.append(length_mapping[closest_len])
             else:
-                new_columns.append(str(col))
+                # Fallback to k format
+                new_columns.append(f"{int(col/1024)}k")
         pivot_table.columns = new_columns
     
     return pivot_table
@@ -113,6 +122,9 @@ def main(args):
         if pivot_table.empty:
             continue
             
+        # Create a mask for missing data (NaN values)
+        mask = pivot_table.isna()
+        
         # Create heatmap
         im = sns.heatmap(
             pivot_table,
@@ -123,8 +135,21 @@ def main(args):
             cbar_kws={'label': 'Retrieval Score', 'shrink': 0.8} if idx == 3 else None,
             linewidths=0.3,
             linecolor='white',
-            square=True
+            square=True,
+            mask=False,  # Don't mask anything initially
+            annot=False
         )
+        
+        # Add gray squares with X for missing data (OOM cases)
+        for i in range(len(pivot_table.index)):
+            for j in range(len(pivot_table.columns)):
+                if mask.iloc[i, j]:  # If data is missing
+                    # Add gray rectangle
+                    axes[idx].add_patch(plt.Rectangle((j, i), 1, 1, fill=True, 
+                                                     facecolor='lightgray', edgecolor='white', linewidth=0.3))
+                    # Add X mark
+                    axes[idx].text(j + 0.5, i + 0.5, '✕', ha='center', va='center', 
+                                  fontsize=16, color='darkred', fontweight='bold')
         
         # Formatting
         avg_score = df["Score"].mean()
