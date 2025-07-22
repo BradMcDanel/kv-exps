@@ -25,6 +25,7 @@ METHOD_ROOTS = ["fullkv", "oracle", "gemfilter", "fastkv", "specprefill", "claa"
 METHOD_DISPLAY_NAMES = {
     "fullkv": "FullKV",
     "fastkv": "FastKV",
+    "gemfilter": "GemFilter",
     "specprefill": "SpecPrefill",
     "oracle": "Oracle",
     "claa": "CLAA (ours)"
