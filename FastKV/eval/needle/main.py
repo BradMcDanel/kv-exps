@@ -227,8 +227,12 @@ class LLMNeedleHaystackTester:
     def run_test(self, args):
         # Run through each iteration of context_lengths and depths
         tasks = []
+        max_model_length = 128000  # Conservative limit for most models
         for context_length in tqdm.tqdm(self.context_lengths, desc=f"Processing the each context length..."):
             if context_length < args.s_len or context_length > args.e_len: continue
+            if context_length > max_model_length:
+                logging.warning(f"Skipping context length {context_length} as it exceeds model limit {max_model_length}")
+                continue
             for depth_percent in self.document_depth_percents:
                 logging.info(f"Context Length: {context_length}, Depth Percent: {depth_percent}")
                 task = self.bound_evaluate_and_log(context_length, depth_percent)
@@ -287,9 +291,11 @@ class LLMNeedleHaystackTester:
         else:
             if self.args.mode == 'speculative_prefill':
                 input = self.enc(prompt, return_tensors="pt")
+                # Move input to pipeline device
+                input_ids = input.input_ids.to(self.pipeline.device)
                 with torch.no_grad():
                     pred, _ = self.pipeline.run(
-                        input_ids=input.input_ids,
+                        input_ids=input_ids,
                         look_ahead_k=getattr(self.args, 'look_ahead_k', 1),
                         max_generation_length=50,
                     )
@@ -471,12 +477,16 @@ class LLMNeedleHaystackTester:
 
     def read_context_files(self):
         context = ""
-        max_context_length = max(self.context_lengths)
+        max_model_length = 128000  # Conservative limit
+        max_context_length = min(max(self.context_lengths), max_model_length)
 
         while self.get_context_length_in_tokens(context) < max_context_length:
             for file in glob.glob(f"{self.haystack_dir}/*.txt"):
                 with open(file, 'r') as f:
                     context += f.read()
+                # Break if we've loaded enough context
+                if self.get_context_length_in_tokens(context) >= max_context_length:
+                    break
         return context
 
     def get_tokens_from_context(self, context):
@@ -527,12 +537,10 @@ def main(args):
  
     if args.save_path:
         args.save_path = os.path.join(f"outputs/{args.model}/needle", args.save_path)
-        Path(args.save_path).mkdir(parents=True, exist_ok=True)  
     else:
-        tm = time.localtime(time.time())
-        f_name = f"{tm.tm_year}_{tm.tm_mon}_{tm.tm_mday}_{tm.tm_hour}_{tm.tm_min}_{tm.tm_sec}"
-        args.save_path = os.path.join(f"outputs/{args.model}/needle", f_name)
-        Path(args.save_path).mkdir(parents=True, exist_ok=True)
+        # Use mode name as consistent path
+        args.save_path = os.path.join(f"outputs/{args.model}/needle", args.mode)
+    Path(args.save_path).mkdir(parents=True, exist_ok=True)
 
     utils.config_logging(os.path.join(args.save_path, f'process.log'))
     logging.info('Arguments: ')
