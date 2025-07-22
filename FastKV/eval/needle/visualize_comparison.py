@@ -92,7 +92,6 @@ def main(args):
     
     # Create figure with subplots
     fig, axes = plt.subplots(1, 4, figsize=(20, 5))
-    fig.suptitle('Needle-in-Haystack Performance Comparison', fontsize=16, fontweight='bold')
     
     # Track if we need to create colorbar
     need_colorbar = True
@@ -129,7 +128,7 @@ def main(args):
         
         # Formatting
         avg_score = df["Score"].mean()
-        axes[idx].set_title(f'{method_name}\nAvg: {avg_score:.3f}', fontweight='bold', pad=10)
+        axes[idx].set_title(f'{method_name}\nAverage Score: {avg_score:.3f}', fontweight='bold', pad=10)
         axes[idx].set_xlabel('Context Length', fontweight='bold')
         
         # Only show y-label on first plot
