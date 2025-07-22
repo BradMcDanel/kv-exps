@@ -149,33 +149,34 @@ class FastKVRankingGenerator(BaseRankingGenerator):
 
     @torch.no_grad()
     def generate_rankings(self, inputs: Dict[str, torch.Tensor]) -> Dict[int, torch.Tensor]:
-        self.tsp_scores = None
-        self._patch_model()
+        rankings = {}
+        input_ids = inputs['input_ids']
+        prompt_length = input_ids.shape[1]
         
-        try:
-            input_ids = inputs['input_ids']
-            prompt_length = input_ids.shape[1]
+        # Generate rankings for each layer separately
+        for layer_idx in range(self.config.num_hidden_layers):
+            self.tsp_scores = None
+            self.tsp_layer_idx = layer_idx
+            self._patch_model()
             
-            # Run forward pass to compute TSP scores
-            position_ids = torch.arange(prompt_length, device=self.device).unsqueeze(0)  # Add batch dimension
-            with torch.no_grad():
-                _ = self.model(input_ids=input_ids, position_ids=position_ids, use_cache=True)
-            
-            # Return the TSP scores if computed
-            if self.tsp_scores is not None:
-                # For FastKV, we simulate different layers being the TSP layer
-                rankings = {}
-                for layer_idx in range(self.config.num_hidden_layers):
-                    rankings[layer_idx] = self.tsp_scores.clone()
-                return rankings
-            else:
-                return {}
+            try:
+                # Run forward pass to compute TSP scores for this specific layer
+                position_ids = torch.arange(prompt_length, device=self.device).unsqueeze(0)
+                with torch.no_grad():
+                    _ = self.model(input_ids=input_ids, position_ids=position_ids, use_cache=True)
                 
-        finally:
-            self._unpatch_model()
-            # Clear GPU cache to free memory for next generator
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+                # Store the TSP scores for this layer
+                if self.tsp_scores is not None:
+                    rankings[layer_idx] = self.tsp_scores.clone()
+                    
+            finally:
+                self._unpatch_model()
+        
+        # Clear GPU cache to free memory for next generator
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        
+        return rankings
 
 # --- Strategy 2: GemFilter ---
 
@@ -278,35 +279,35 @@ class GemFilterRankingGenerator(BaseRankingGenerator):
 
     @torch.no_grad()
     def generate_rankings(self, inputs: Dict[str, torch.Tensor]) -> Dict[int, torch.Tensor]:
-        self.gemfilter_scores = None
-        self.original_prompt_len = None
-        self._patch_model()
+        rankings = {}
+        input_ids = inputs['input_ids']
+        prompt_length = input_ids.shape[1]
+        self.original_prompt_len = prompt_length
         
-        try:
-            input_ids = inputs['input_ids']
-            prompt_length = input_ids.shape[1]
-            self.original_prompt_len = prompt_length
+        # Generate rankings for each layer separately
+        for layer_idx in range(self.config.num_hidden_layers):
+            self.gemfilter_scores = None
+            self.select_layer_idx = layer_idx
+            self._patch_model()
             
-            # Run forward pass to compute GemFilter scores
-            position_ids = torch.arange(prompt_length, device=self.device).unsqueeze(0)  # Add batch dimension
-            with torch.no_grad():
-                _ = self.model(input_ids=input_ids, position_ids=position_ids, use_cache=True)
-            
-            # Return the GemFilter scores if computed
-            if self.gemfilter_scores is not None:
-                # For GemFilter, we simulate different layers being the select layer
-                rankings = {}
-                for layer_idx in range(self.config.num_hidden_layers):
-                    rankings[layer_idx] = self.gemfilter_scores.clone()
-                return rankings
-            else:
-                return {}
+            try:
+                # Run forward pass to compute GemFilter scores for this specific layer
+                position_ids = torch.arange(prompt_length, device=self.device).unsqueeze(0)
+                with torch.no_grad():
+                    _ = self.model(input_ids=input_ids, position_ids=position_ids, use_cache=True)
                 
-        finally:
-            self._unpatch_model()
-            # Clear GPU cache to free memory for next generator
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+                # Store the GemFilter scores for this layer
+                if self.gemfilter_scores is not None:
+                    rankings[layer_idx] = self.gemfilter_scores.clone()
+                    
+            finally:
+                self._unpatch_model()
+        
+        # Clear GPU cache to free memory for next generator
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        
+        return rankings
 
 
 # --- Strategy 3: CLAA ---
@@ -433,35 +434,44 @@ class CLAARankingGenerator(BaseRankingGenerator):
 
     @torch.no_grad()
     def generate_rankings(self, inputs: Dict[str, torch.Tensor]) -> Dict[int, torch.Tensor]:
-        self.claa_scores = None
-        self.score_buffer.clear()
-        self._patch_model()
+        rankings = {}
+        input_ids = inputs['input_ids']
+        prompt_length = input_ids.shape[1]
         
-        try:
-            input_ids = inputs['input_ids']
-            prompt_length = input_ids.shape[1]
-            
-            # Run forward pass to compute CLAA scores
-            position_ids = torch.arange(prompt_length, device=self.device).unsqueeze(0)  # Add batch dimension
-            with torch.no_grad():
-                _ = self.model(input_ids=input_ids, position_ids=position_ids, use_cache=True)
-            
-            # Return the CLAA scores if computed
-            if self.claa_scores is not None:
-                # For CLAA, we simulate different layers being the TSP layer
-                rankings = {}
-                for layer_idx in range(self.config.num_hidden_layers):
-                    rankings[layer_idx] = self.claa_scores.clone()
-                return rankings
-            else:
-                return {}
-                
-        finally:
-            self._unpatch_model()
-            # Clear GPU cache to free memory for next generator
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+        # For CLAA, we need to compute rankings for different TSP layers
+        # Each TSP layer uses the previous last_n_layers for its computation
+        for tsp_layer in range(self.last_n_layers - 1, self.config.num_hidden_layers):
+            self.claa_scores = None
             self.score_buffer.clear()
+            self.tsp_layer_idx = tsp_layer
+            self._patch_model()
+            
+            try:
+                # Run forward pass to compute CLAA scores for this TSP layer
+                position_ids = torch.arange(prompt_length, device=self.device).unsqueeze(0)
+                with torch.no_grad():
+                    _ = self.model(input_ids=input_ids, position_ids=position_ids, use_cache=True)
+                
+                # Store the CLAA scores for this TSP layer
+                if self.claa_scores is not None:
+                    rankings[tsp_layer] = self.claa_scores.clone()
+                    
+            finally:
+                self._unpatch_model()
+                self.score_buffer.clear()
+        
+        # For layers before we can compute CLAA (0 to last_n_layers-2), 
+        # use the first valid CLAA score as a fallback
+        if rankings:
+            first_valid_scores = next(iter(rankings.values()))
+            for layer_idx in range(min(self.last_n_layers - 1, self.config.num_hidden_layers)):
+                rankings[layer_idx] = first_valid_scores.clone()
+        
+        # Clear GPU cache to free memory for next generator
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        
+        return rankings
 
 # --- Strategy 4: Speculative ---
 
