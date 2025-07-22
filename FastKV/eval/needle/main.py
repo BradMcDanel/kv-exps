@@ -619,7 +619,7 @@ if __name__ == "__main__":
     parser.add_argument('-e', '--e_len', default=128000, metavar='N', type=int)
     parser.add_argument('--model_provider', type=str, default="LLaMA", help='which model to use')
     parser.add_argument("--context_length", nargs='+', type=int, 
-                        default=[8000, 16000, 24000, 32000, 40000, 48000, 56000, 64000, 72000, 80000, 88000, 96000, 104000, 112000, 120000, 128000])
+                        default=[16384, 24576, 32768, 40960, 49152, 57344, 65536])
     parser.add_argument("--needle", type=str, 
                         default="\nThe best thing to do in San Francisco is eat a sandwich and sit in Dolores Park on a sunny day.\n")
     parser.add_argument("--retrieval_question", type=str, 

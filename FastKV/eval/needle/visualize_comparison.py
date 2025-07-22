@@ -51,6 +51,17 @@ def create_pivot_table(df):
     
     pivot_table = pd.pivot_table(df, values='Score', index=['Document Depth', 'Context Length'], aggfunc='mean').reset_index()
     pivot_table = pivot_table.pivot(index="Document Depth", columns="Context Length", values="Score")
+    
+    # Format column labels to show as 16k, 24k, etc.
+    if not pivot_table.empty:
+        new_columns = []
+        for col in pivot_table.columns:
+            if col >= 1024:
+                new_columns.append(f"{int(col/1024)}k")
+            else:
+                new_columns.append(str(col))
+        pivot_table.columns = new_columns
+    
     return pivot_table
 
 def main(args):
