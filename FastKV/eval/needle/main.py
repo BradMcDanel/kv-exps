@@ -180,12 +180,18 @@ class LLMNeedleHaystackTester:
             if self.args.mode == 'speculative_prefill':
                 from baseline.speculative_prefill.main import SpeculativePrefillPipeline
                 logging.info("Initializing SpeculativePrefillPipeline for needle test...")
+                max_cap_prompt = getattr(self.args, 'max_capacity_prompt', 512)
+                max_cap_pct = getattr(self.args, 'max_capacity_prompt_percentage', None)
+                if max_cap_pct is not None:
+                    if max_cap_prompt is not None:
+                        logging.info(f"Using `max_capacity_prompt_percentage={max_cap_pct}`. Ignoring `max_capacity_prompt={max_cap_prompt}`.")
+                    max_cap_prompt = None
                 self.pipeline = SpeculativePrefillPipeline(
                     base_model_name=self.model_name,
                     speculator_model_name=getattr(self.args, 'speculator_model_name', 'meta-llama/Llama-3-8B-Instruct'),
                     tokenizer=self.enc,
-                    max_capacity_prompt=getattr(self.args, 'max_capacity_prompt', 512),
-                    max_capacity_prompt_percentage=getattr(self.args, 'max_capacity_prompt_percentage', None),
+                    max_capacity_prompt=max_cap_prompt,
+                    max_capacity_prompt_percentage=max_cap_pct,
                     pool_kernel_size=getattr(self.args, 'kernel_size', 7) if getattr(self.args, 'pooling', 'avgpool') != 'none' else None,
                     pool_type=getattr(self.args, 'pooling', 'avgpool'),
                     use_chunk_selection=getattr(self.args, 'use_chunk_selection', False),
@@ -596,7 +602,6 @@ if __name__ == "__main__":
     parser.add_argument("--look_ahead_k", type=int, default=1, help="Number of lookahead steps for Speculative Prefill")
     parser.add_argument('--use_chunk_selection', action='store_true', help="Use chunk-based token selection")
     parser.add_argument("--chunk_size", type=int, default=64, help="Chunk size for Speculative Prefill")
-    parser.add_argument("--max_capacity_prompt_percentage", type=float, default=None, help="Use a percentage of the prompt length for max capacity")
     
     # CLAA
     parser.add_argument("--last_n_layers", type=int, default=None, help="Number of last layers to use for CLAA aggregation")
