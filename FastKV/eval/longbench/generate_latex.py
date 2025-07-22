@@ -30,8 +30,7 @@ METHOD_DISPLAY_NAMES = {
     "claa": "CLAA (ours)"
 }
 
-# Changed to decimal format to match new folder naming
-KEEP_RATES_DECIMAL = [0.01, 0.02, 0.04]  # 1%, 2%, 4%
+KEEP_RATES_DECIMAL = [0.1, 0.2, 0.0]  #
 
 DATASETS = [
     ("narrativeqa", "NrtvQA"),
