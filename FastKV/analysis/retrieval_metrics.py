@@ -89,10 +89,20 @@ def get_mean_accuracies(
         deserialize_rankings_in_sample(approx_8b[sample_key])
         deserialize_rankings_in_sample(approx_1b[sample_key])
 
-        fk_acc = calculate_oracle_overlap(approx_8b[sample_key].get('fastkv_rankings', {}), oracle_ranking, k_percentage)
-        gf_acc = calculate_oracle_overlap(approx_8b[sample_key].get('gemfilter_rankings', {}), oracle_ranking, k_percentage)
-        claa_acc = calculate_oracle_overlap(approx_8b[sample_key].get('claa_rankings', {}), oracle_ranking, k_percentage)
-        sp_acc = calculate_oracle_overlap(approx_1b[sample_key].get('speculative_rankings', {}), oracle_ranking, k_percentage)
+        # Check if ALL ranking methods are present for this sample
+        has_fastkv = 'fastkv_rankings' in approx_8b[sample_key] and approx_8b[sample_key]['fastkv_rankings']
+        has_gemfilter = 'gemfilter_rankings' in approx_8b[sample_key] and approx_8b[sample_key]['gemfilter_rankings']
+        has_claa = 'claa_rankings' in approx_8b[sample_key] and approx_8b[sample_key]['claa_rankings']
+        has_speculative = 'speculative_rankings' in approx_1b[sample_key] and approx_1b[sample_key]['speculative_rankings']
+        
+        # Skip samples that don't have all ranking methods
+        if not (has_fastkv and has_gemfilter and has_claa and has_speculative):
+            continue
+
+        fk_acc = calculate_oracle_overlap(approx_8b[sample_key]['fastkv_rankings'], oracle_ranking, k_percentage)
+        gf_acc = calculate_oracle_overlap(approx_8b[sample_key]['gemfilter_rankings'], oracle_ranking, k_percentage)
+        claa_acc = calculate_oracle_overlap(approx_8b[sample_key]['claa_rankings'], oracle_ranking, k_percentage)
+        sp_acc = calculate_oracle_overlap(approx_1b[sample_key]['speculative_rankings'], oracle_ranking, k_percentage)
 
         for k, v in fk_acc.items(): accs['fastkv'][k].append(v)
         for k, v in gf_acc.items(): accs['gemfilter'][k].append(v)
