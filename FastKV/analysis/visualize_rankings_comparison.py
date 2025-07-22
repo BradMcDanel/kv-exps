@@ -129,7 +129,7 @@ def plot_paper_version(aggregated_accuracies: Dict, k_percentage: float, global_
                          fontsize=18, title_fontsize=20)
 
     fig.text(0.5, 0.04, 'Model Layer Index', ha='center', va='center', fontsize=34)
-    fig.text(0.06, 0.5, f'Top-{k_percentage:.0%} Token Overlap with Oracle', ha='center', va='center', rotation='vertical', fontsize=34)
+    fig.text(0.06, 0.5, 'Spearman Rank Correlation with Oracle', ha='center', va='center', rotation='vertical', fontsize=34)
     fig.suptitle(f'Evaluating the Ranking Fidelity of KV Pruning Heuristics', y=0.99, fontsize=32, weight='bold')
     
     plt.savefig(f"{output_prefix}.pdf", format='pdf', dpi=300, bbox_inches='tight')
@@ -161,7 +161,7 @@ def plot_appendix_version(all_mean_accuracies: Dict, k_percentage: float, global
     fig_legend_gs = gridspec.GridSpec(1, 1, top=0.08, bottom=0.01)
     create_appendix_legend(fig, fig_legend_gs[0])
     fig.text(0.5, 0.1, 'Model Layer Index', ha='center', va='center', fontsize=34)
-    fig.text(0.06, 0.5, f'Top-{k_percentage:.0%} Token Overlap with Oracle', ha='center', va='center', rotation='vertical', fontsize=34)
+    fig.text(0.06, 0.5, 'Spearman Rank Correlation with Oracle', ha='center', va='center', rotation='vertical', fontsize=34)
     fig.suptitle(f'Evaluating the Ranking Fidelity of KV Pruning Heuristics', y=0.97, fontsize=38, weight='bold')
     fig.subplots_adjust(left=0.12, top=0.93, bottom=0.15, right=0.98)
     plt.savefig(f"{output_prefix}.pdf", format='pdf', dpi=300, bbox_inches='tight')
@@ -173,7 +173,6 @@ def plot_appendix_version(all_mean_accuracies: Dict, k_percentage: float, global
 def main():
     """Main execution block."""
     parser = argparse.ArgumentParser(description="Visualize and compare ranking methods.")
-    parser.add_argument("--k_percentage", type=float, default=0.1, help="Percentage for top-k analysis.")
     parser.add_argument("--debug", action="store_true", help="Use dummy data for fast layout iteration.")
     args = parser.parse_args()
     output_dir = "figures"; os.makedirs(output_dir, exist_ok=True)
@@ -183,7 +182,7 @@ def main():
         results = load_all_data(MODELS_TO_LOAD, ALL_DATASETS_TO_PLOT)
     
     all_mean_accuracies = {
-        ds: get_mean_accuracies(ds, results, args.k_percentage)
+        ds: get_mean_accuracies(ds, results, 0.1)  # k_percentage no longer used in calculation
         for ds in tqdm(ALL_DATASETS_TO_PLOT, desc="Calculating Accuracies")
     }
     all_mean_accuracies = {k: v for k, v in all_mean_accuracies.items() if v}
@@ -192,10 +191,10 @@ def main():
     
     aggregated_accuracies = aggregate_accuracies_by_task(all_mean_accuracies, TASKS_AND_DATASETS)
     paper_max_acc = find_global_max_accuracy(aggregated_accuracies)
-    plot_paper_version(aggregated_accuracies, args.k_percentage, paper_max_acc, os.path.join(output_dir, "ranking_comparison"))
+    plot_paper_version(aggregated_accuracies, 0.1, paper_max_acc, os.path.join(output_dir, "ranking_comparison"))
 
     appendix_max_acc = find_global_max_accuracy(all_mean_accuracies)
-    plot_appendix_version(all_mean_accuracies, args.k_percentage, appendix_max_acc, os.path.join(output_dir, "ranking_comparison_appendix"))
+    plot_appendix_version(all_mean_accuracies, 0.1, appendix_max_acc, os.path.join(output_dir, "ranking_comparison_appendix"))
 
 if __name__ == "__main__":
     main()

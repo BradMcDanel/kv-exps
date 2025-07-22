@@ -20,14 +20,14 @@ MODEL_NAME = "LLaMA-3.1-8B-Instruct"
 # Hardcoded TSP layer for methods that require it ***
 TSP_LAYER = 15
 
-METHOD_ROOTS = ["fullkv", "oracle", "fastkv", "specprefill", "taper"]
+METHOD_ROOTS = ["fullkv", "oracle", "fastkv", "specprefill", "claa"]
 
 METHOD_DISPLAY_NAMES = {
     "fullkv": "Full~KV",
     "fastkv": "FastKV",
     "specprefill": "SpecPrefill",
     "oracle": "Oracle",
-    "taper": "CLAA (ours)"
+    "claa": "CLAA (ours)"
 }
 
 # Changed to decimal format to match new folder naming

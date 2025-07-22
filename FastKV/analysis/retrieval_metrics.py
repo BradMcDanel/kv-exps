@@ -55,20 +55,19 @@ def get_top_k_indices(scores: torch.Tensor, k: int, max_index: int) -> torch.Ten
 def calculate_oracle_overlap(
     approx_rankings: Dict, oracle_ranking: torch.Tensor, k_percentage: float
 ) -> Dict[Any, float]:
-    """Calculates the retrieval accuracy for approximate rankings against an oracle."""
+    """Calculates Spearman's rank correlation between approximate rankings and oracle."""
     if not approx_rankings: return {}
     prompt_len = len(oracle_ranking)
-    k = max(1, math.ceil(prompt_len * k_percentage))
-    _, top_k_oracle_indices = torch.topk(oracle_ranking, k=k)
-    oracle_set = set(top_k_oracle_indices.tolist())
-    accuracies = {}
+    oracle_np = oracle_ranking.numpy() if hasattr(oracle_ranking, 'numpy') else oracle_ranking
+    correlations = {}
     for key, scores_np in approx_rankings.items():
-        scores_tensor = torch.from_numpy(scores_np).float()[:prompt_len]
-        if scores_tensor.numel() < k: continue
-        _, top_k_approx_indices = torch.topk(scores_tensor, k=k)
-        approx_set = set(top_k_approx_indices.tolist())
-        accuracies[key] = len(oracle_set.intersection(approx_set)) / k
-    return accuracies
+        scores_truncated = scores_np[:prompt_len]
+        if len(scores_truncated) == 0: continue
+        min_len = min(len(oracle_np), len(scores_truncated))
+        if min_len < 2: continue  # Need at least 2 points for correlation
+        corr, _ = spearmanr(oracle_np[:min_len], scores_truncated[:min_len])
+        correlations[key] = corr if np.isfinite(corr) else 0.0
+    return correlations
 
 def get_mean_accuracies(
     dataset_name: str, all_results: Dict, k_percentage: float

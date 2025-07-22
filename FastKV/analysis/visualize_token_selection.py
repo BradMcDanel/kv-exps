@@ -202,6 +202,9 @@ def main():
     all_plot_data = {}
     print("Loading and processing data for the grid plot...")
     
+    # Define layer indices and spec candidates
+    fastkv_layer, gemfilter_layer, claa_layer, spec_k_candidates = 15, 15, 15, [8, 4, 1]
+    
     for task_name, dataset_id in tqdm(DATASETS_BY_TASK.items(), desc="Processing datasets"):
         oracle_data = load_npz_data_for_dataset(MODELS['oracle']['base_path'], MODELS['oracle']['sanitized_name'], dataset_id)
         approx_target_data = load_npz_data_for_dataset(MODELS['approx_target']['base_path'], MODELS['approx_target']['sanitized_name'], dataset_id)
@@ -209,6 +212,39 @@ def main():
         
         common_keys = sorted(list(set(oracle_data.keys()) & set(approx_target_data.keys()) & set(approx_draft_data.keys())))
         if not common_keys: continue
+        
+        # Filter to only include samples that have all required methods
+        valid_keys = []
+        for key in common_keys:
+            # Check oracle data
+            oracle_sample = oracle_data.get(key, {})
+            if 'ranking' not in oracle_sample:
+                continue
+                
+            # Check target model data (FastKV, GemFilter, CLAA)
+            target_sample = approx_target_data.get(key, {})
+            deserialize_rankings_in_sample(target_sample)  # Ensure data is deserialized
+            
+            has_fastkv = 'fastkv_rankings' in target_sample and fastkv_layer in target_sample.get('fastkv_rankings', {})
+            has_gemfilter = 'gemfilter_rankings' in target_sample and gemfilter_layer in target_sample.get('gemfilter_rankings', {})
+            has_claa = 'claa_rankings' in target_sample and claa_layer in target_sample.get('claa_rankings', {})
+            
+            # Check draft model data (Speculative)
+            draft_sample = approx_draft_data.get(key, {})
+            deserialize_rankings_in_sample(draft_sample)  # Ensure data is deserialized
+            
+            spec_rankings = draft_sample.get('speculative_rankings', {})
+            has_spec = any(k in spec_rankings for k in spec_k_candidates)
+            
+            # Only include samples that have all methods
+            if has_fastkv and has_gemfilter and has_claa and has_spec:
+                valid_keys.append(key)
+        
+        if not valid_keys:
+            print(f"  -> No samples found with all methods for '{dataset_id}'. Skipping.")
+            continue
+            
+        common_keys = valid_keys
         
         TARGET_TOKEN_COUNT = 2048
         best_sample_key, best_seq_len, min_distance = None, -1, float('inf')
@@ -230,7 +266,6 @@ def main():
         deserialize_rankings_in_sample(approx_target_sample)
         deserialize_rankings_in_sample(approx_draft_sample)
 
-        fastkv_layer, gemfilter_layer, claa_layer, spec_k_candidates = 15, 15, 15, [8, 4, 1]
         seq_len = best_seq_len
         k_absolute = int(seq_len * args.k_percentage)
         all_indices, accuracies_for_plot = {}, {}
