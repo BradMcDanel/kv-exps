@@ -562,15 +562,20 @@ if __name__ == "__main__":
     parser.add_argument("--mode", type=str, default="fastkv", choices=["fullkv", "fastkv", "snapkv", "gemfilter", "adakv", "headkv", "speculative_prefill", "claa"])
     parser.add_argument("--window_size", type=int, default=8)
     parser.add_argument("--max_capacity_prompt", type=int, default=512)
+    parser.add_argument("--max_capacity_prompt_percentage", type=float, default=None, help="Use a percentage of the prompt length for max capacity")
     parser.add_argument("--kernel_size", type=int, default=7)
     parser.add_argument("--pooling", type=str, default="avgpool")
     
     # FastKV
     parser.add_argument("--tsp_idx", type=int, default=15)
     parser.add_argument("--tsp_len", type=int, default=2048)
+    parser.add_argument("--tsp_len_percentage", type=float, default=None, help="Use a percentage of the prompt length for TSP length.")
 
     # GemFilter
-    parser.add_argument("--filter_idx", type=int, default=13)
+    parser.add_argument("--filter_idx", type=int, default=13)  # Keep for backward compatibility
+    parser.add_argument("--topk", type=int, default=1024, help="Fixed number of tokens to keep for GemFilter")
+    parser.add_argument("--topk_percentage", type=float, default=None, help="Use a percentage of the prompt length for GemFilter topk")
+    parser.add_argument("--select_layer_idx", type=int, default=13, help="Layer index for GemFilter selection")
     
     # AdaKV
     parser.add_argument("--skip", type=int, default=-1)
