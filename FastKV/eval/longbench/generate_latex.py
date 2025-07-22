@@ -31,7 +31,7 @@ METHOD_DISPLAY_NAMES = {
     "claa": "CLAA (ours)"
 }
 
-KEEP_RATES_DECIMAL = [0.1, 0.2, 0.0]  #
+KEEP_RATES_DECIMAL = [0.1, 0.2, 0.4]
 
 DATASETS = [
     ("narrativeqa", "NrtvQA"),
