@@ -11,16 +11,16 @@ FIXED_EXIT_LAYER = 15
 
 # Unified color scheme for all plots.
 METHOD_COLORS = {
-    'Oracle': '#2ca02c',                # Green
-    'FastKV': '#d62728',                # Red
-    'GemFilter': '#ff7f0e',             # Orange
-    'CLAA': '#1565c0',                  # Rich royal blue - OUR METHOD!
-    'Speculative': '#5e2b8c',           # Dark purple
-    'Speculative (k=1)': '#d6b3ff',     # Light purple
-    'Speculative (k=8)': '#a066cc',     # Medium purple
-    'Speculative (k=32)': '#5e2b8c',    # Dark purple
-    'Adaptive Exit': '#1f77b4',         # Standard blue
-    'Fixed Exit': '#d62728',            # Standard red (same as FastKV)
+    'Oracle': '#1565c0',
+    'FastKV': '#d62728',
+    'GemFilter': '#ff7f0e',
+    'CLAA': '#2ca02c',
+    'Speculative': '#5e2b8c',
+    'Speculative (k=1)': '#d6b3ff',
+    'Speculative (k=8)': '#a066cc',
+    'Speculative (k=32)': '#5e2b8c',
+    'Adaptive Exit': '#1f77b4',
+    'Fixed Exit': '#d62728',
 }
 
 def set_publication_style():

@@ -195,18 +195,16 @@ def generate_latex_table(grouped_results):
         results_for_rate = grouped_results[rate]
         
         valid_avgs = [res['avg'] for res in results_for_rate if res['avg'] is not None]
-        max_avg = max(valid_avgs) if valid_avgs else None
+        # Find the best non-oracle score for bolding (since oracle is always best but we don't want to bold it)
+        non_oracle_avgs = [res['avg'] for res in results_for_rate if res['avg'] is not None and res['method_root'] != 'oracle']
+        max_non_oracle_avg = max(non_oracle_avgs) if non_oracle_avgs else None
         
         rate_display = decimal_to_percent_display(rate)
         print(rf"\multicolumn{{18}}{{c}}{{\textbf{{Keep Token Rate = {rate_display}}}}} \\")
         print(r"\midrule")
         
         for res in results_for_rate:
-            # Add highlight color for CLAA
-            if res['method_root'] == 'claa':
-                method_cell = rf"\colorbox{{yellow!20}}{{{res['method_name']:<9}}}"
-            else:
-                method_cell = f"{res['method_name']:<9}"
+            method_cell = f"{res['method_name']:<9}"
             score_cells = []
             for key in DATASET_KEYS:
                 score = res['scores'].get(key)
@@ -216,14 +214,17 @@ def generate_latex_table(grouped_results):
             avg_score = res['avg']
             if avg_score is not None:
                 avg_str = f"{avg_score:.2f}"
-                # Bold the best score, but exclude oracle from being bolded
-                if max_avg is not None and abs(avg_score - max_avg) < 1e-5 and res['method_root'] != 'oracle':
+                # Bold the best non-oracle score
+                if max_non_oracle_avg is not None and abs(avg_score - max_non_oracle_avg) < 1e-5 and res['method_root'] != 'oracle':
                     avg_str = rf"\textbf{{{avg_str}}}"
             else:
                 avg_str = "   -"
             
 
-            line1 = f"{method_cell} & " + " & ".join(score_cells[0:6])
+            # Add row highlight color for CLAA using light green matching our color scheme
+            row_prefix = "" if res['method_root'] != 'claa' else r"\rowcolor[HTML]{E8F8E8} "
+            
+            line1 = row_prefix + f"{method_cell} & " + " & ".join(score_cells[0:6])
             line2 = "          & " + " & ".join(score_cells[6:12])
             line3 = "          & " + " & ".join(score_cells[12:16]) + f" & {avg_str} \\\\"
             
