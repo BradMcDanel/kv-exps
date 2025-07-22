@@ -396,6 +396,9 @@ if __name__ == "__main__":
     # TAPER
     parser.add_argument("--tsp_schedule", type=str, default="", 
                         help="Progressive TSP schedule. Format depends on mode: 'LAYER_IDX:KEEP_RATIO,...' e.g., '0:0.8,7:0.5'. ")
+    # CLAA
+    parser.add_argument("--last_n_layers", type=int, default=None,
+                        help="Number of last layers to use for CLAA aggregation. None uses all layers (default), 1 uses only last layer.")
     # Oracle
     parser.add_argument("--oracle_rankings_path", type=str, default="", 
                         help="Path to directory containing oracle rankings (.npz files)")

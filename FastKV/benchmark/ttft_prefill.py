@@ -221,6 +221,10 @@ def main(args):
             print(f"TSP Length: {args.tsp_len_percentage:.1%}")
         else:
             print(f"TSP Length: {args.tsp_len} tokens")
+        if args.last_n_layers is not None:
+            print(f"Last N Layers: {args.last_n_layers}")
+        else:
+            print(f"Last N Layers: all layers")
     elif args.mode == 'fastkv':
         if args.max_capacity_prompt_percentage:
             print(f"Context Capacity: {args.max_capacity_prompt_percentage:.1%}")
@@ -305,6 +309,9 @@ if __name__ == "__main__":
     parser.add_argument("--head_choice", type=str, default='reason', choices=['copy', 'reason'])
     parser.add_argument('--beta', type=float, default=1.2)
     parser.add_argument('--temp', type=float, default=1.0)
+    # CLAA
+    parser.add_argument("--last_n_layers", type=int, default=None,
+                        help="Number of last layers to use for CLAA aggregation. None uses all layers (default), 1 uses only last layer.")
 
     parser.add_argument("--detailed_timing", action="store_true", help="Enable detailed, per-part timing with CUDA synchronization.")
 

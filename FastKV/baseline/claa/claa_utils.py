@@ -27,6 +27,7 @@ def compress(model, args):
         model.model.layers[i].self_attn.kv_cluster.max_capacity_prompt_percentage = args.max_capacity_prompt_percentage
         model.model.layers[i].self_attn.kv_cluster.tsp_length = args.tsp_len
         model.model.layers[i].self_attn.kv_cluster.tsp_len_percentage = args.tsp_len_percentage
+        model.model.layers[i].self_attn.kv_cluster.last_n_layers = args.last_n_layers
         if i == args.tsp_idx:
             model.model.layers[i].self_attn.kv_cluster.tsp_layer = True
             logging.info(f"CLAA: Set layer {i} as TSP layer")
@@ -42,7 +43,7 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
 
 
 class CLAACluster():
-    def __init__(self, window_size=8, max_capacity_prompt=512, kernel_size=7, pooling='avgpool', tsp_layer=False, tsp_length=2048, max_capacity_prompt_percentage=None, tsp_len_percentage=None):
+    def __init__(self, window_size=8, max_capacity_prompt=512, kernel_size=7, pooling='avgpool', tsp_layer=False, tsp_length=2048, max_capacity_prompt_percentage=None, tsp_len_percentage=None, last_n_layers=None):
         self.window_size = window_size
         self.max_capacity_prompt = max_capacity_prompt
         self.max_capacity_prompt_percentage = max_capacity_prompt_percentage
@@ -53,12 +54,21 @@ class CLAACluster():
         self.tsp_layer = tsp_layer
         self.tsp_length = tsp_length
         self.tsp_len_percentage = tsp_len_percentage
+        self.last_n_layers = last_n_layers
 
     def _aggregate_and_select_indices(self, scores_list: List[torch.Tensor], num_to_keep: int) -> torch.Tensor:
         if not scores_list:
             raise ValueError("Cannot select indices from an empty list of scores.")
         
-        aggregated_scores = torch.stack(scores_list, dim=1)
+        # Use configurable number of last layers (default to all layers if not specified)
+        if self.last_n_layers is None:
+            selected_scores = scores_list  # Use all layers (original behavior)
+        elif self.last_n_layers == 1:
+            selected_scores = [scores_list[-1]]  # Use only last layer
+        else:
+            selected_scores = scores_list[-self.last_n_layers:] if len(scores_list) >= self.last_n_layers else scores_list
+        
+        aggregated_scores = torch.stack(selected_scores, dim=1)
         bsz, num_layers, num_heads, score_len = aggregated_scores.shape
         
         if self.pooling in ['avgpool', 'maxpool'] and self.kernel_size > 1:
