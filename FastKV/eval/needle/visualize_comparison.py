@@ -90,6 +90,9 @@ def create_pivot_table(df):
             if depth in pivot_table.index and length_label in pivot_table.columns:
                 complete_pivot.loc[depth, length_label] = pivot_table.loc[depth, length_label]
     
+    # Convert to float, ensuring NaN values are properly handled
+    complete_pivot = complete_pivot.astype(float)
+    
     return complete_pivot
 
 def main(args):
