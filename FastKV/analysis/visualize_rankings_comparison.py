@@ -81,7 +81,7 @@ def load_all_data(
 PLOT_STYLES = {
     'gemfilter':    {'color': METHOD_COLORS['GemFilter'], 'linestyle': '-', 'marker': 's', 'markersize': 4, 'label': 'GemFilter'},
     'fastkv':       {'color': METHOD_COLORS['FastKV'], 'linestyle': '-', 'marker': 'o', 'label': 'FastKV'},
-    'claa':         {'color': METHOD_COLORS['CLAA'], 'linestyle': '-', 'marker': '^', 'markersize': 6, 'label': 'CLAA (Ours)', 'linewidth': 4},
+    'claa':         {'color': METHOD_COLORS['CLAA'], 'linestyle': '-', 'marker': '^', 'markersize': 6, 'label': 'CLAA (Ours)'},
     'spec_prefill': {'color': METHOD_COLORS['Speculative'], 'linestyle': '--', 'label': 'Spec. Prefill'},
 }
 

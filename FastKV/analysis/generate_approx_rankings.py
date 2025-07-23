@@ -41,7 +41,7 @@ class BaseRankingGenerator:
                 layer.self_attn.forward = self.orig_fwds[i]
         self.orig_fwds.clear()
 
-# --- Strategy 1: FastKV ---
+# --- Strategy 1: FastKV (OPTIMIZED) ---
 
 def _patched_attention_forward_fastkv(
     self_attn: LlamaAttention,
@@ -79,22 +79,18 @@ def _patched_attention_forward_fastkv(
     key_states_for_sdpa = hf_repeat_kv(key_states_for_sdpa, num_key_value_groups)
     value_states_for_sdpa = hf_repeat_kv(value_states_for_sdpa, num_key_value_groups)
     
-    # Compute attention weights for FastKV TSP layer ranking
-    if generator_obj.tsp_layer_idx == self_attn.layer_idx and query_length > generator_obj.window_size:
-        # Compute attention scores similar to FastKV's update_kv method
+    # OPTIMIZATION: This now runs for every layer and stores the result in a shared dictionary.
+    if query_length > generator_obj.window_size:
         attn_weights = torch.matmul(query_states_rotated[..., -generator_obj.window_size:, :], key_states_for_sdpa.transpose(-1, -2)) / math.sqrt(head_dim)
         
-        # Apply causal mask for the window
         mask = torch.full((generator_obj.window_size, generator_obj.window_size), torch.finfo(attn_weights.dtype).min, device=attn_weights.device)
         mask_cond = torch.arange(mask.size(-1), device=attn_weights.device)
         mask.masked_fill_(mask_cond < (mask_cond + 1).view(mask.size(-1), 1), 0)
         attn_weights[:, :, -generator_obj.window_size:, -generator_obj.window_size:] += mask[None, None, :, :]
         
-        # Softmax and sum over query positions (last window_size tokens)
         attn_weights_softmax = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states_rotated.dtype)
         attn_weights_sum = attn_weights_softmax[:, :, -generator_obj.window_size:, :-generator_obj.window_size].sum(dim=-2)
         
-        # Apply pooling as in FastKV
         if generator_obj.pooling == 'avgpool':
             attn_cache = F.avg_pool1d(attn_weights_sum, kernel_size=generator_obj.kernel_size, padding=generator_obj.kernel_size//2, stride=1)
         elif generator_obj.pooling == 'maxpool':
@@ -102,12 +98,12 @@ def _patched_attention_forward_fastkv(
         else:
             attn_cache = attn_weights_sum
             
-        # Sum across heads to get final importance scores
-        if len(attn_cache.shape) == 3:  # [batch, heads, seq]
-            final_scores = attn_cache.sum(dim=1)  # Sum over heads
-            generator_obj.tsp_scores = final_scores.squeeze(0)  # Remove batch dimension
+        if len(attn_cache.shape) == 3:
+            final_scores = attn_cache.sum(dim=1)
+            # OPTIMIZATION: Store score in the central dict, keyed by layer index.
+            generator_obj.all_scores[self_attn.layer_idx] = final_scores.squeeze(0)
         else:
-            generator_obj.tsp_scores = attn_cache.squeeze(0)
+            generator_obj.all_scores[self_attn.layer_idx] = attn_cache.squeeze(0)
     
     attn_mask_input = attention_mask
     is_sdpa_causal = (query_length > 1) and (attn_mask_input is None)
@@ -132,51 +128,43 @@ class FastKVRankingGenerator(BaseRankingGenerator):
         self.window_size = args.window_size
         self.kernel_size = args.kernel_size
         self.pooling = args.pooling
-        self.tsp_layer_idx = 0  # Default to first layer, can be configurable
-        self.tsp_scores = None
+        # OPTIMIZATION: Central dictionary to hold scores from all layers.
+        self.all_scores: Dict[int, torch.Tensor] = {}
         
-    def _patch_model(self):
-        # Only patch the TSP layer
-        layer = self.model.model.layers[self.tsp_layer_idx]
-        if hasattr(layer, 'self_attn') and isinstance(layer.self_attn, LlamaAttention):
-            attn_module = layer.self_attn
-            if self.tsp_layer_idx not in self.orig_fwds:
-                self.orig_fwds[self.tsp_layer_idx] = attn_module.forward
-            setattr(attn_module, "layer_idx", self.tsp_layer_idx)
-            attn_module.forward = types.MethodType(partial(_patched_attention_forward_fastkv, generator_obj=self), attn_module)
+    def _patch_all_layers(self):
+        # OPTIMIZATION: Patch all layers at once before the forward pass.
+        for i, layer in enumerate(self.model.model.layers):
+            if hasattr(layer, 'self_attn') and isinstance(layer.self_attn, LlamaAttention):
+                attn_module = layer.self_attn
+                if i not in self.orig_fwds:
+                    self.orig_fwds[i] = attn_module.forward
+                setattr(attn_module, "layer_idx", i)
+                attn_module.forward = types.MethodType(partial(_patched_attention_forward_fastkv, generator_obj=self), attn_module)
 
     @torch.no_grad()
     def generate_rankings(self, inputs: Dict[str, torch.Tensor]) -> Dict[int, torch.Tensor]:
-        rankings = {}
+        # OPTIMIZATION: No longer loops over layers. Performs one pass.
+        self.all_scores.clear()
         input_ids = inputs['input_ids']
         prompt_length = input_ids.shape[1]
         
-        # Generate rankings for each layer separately
-        for layer_idx in range(self.config.num_hidden_layers):
-            self.tsp_scores = None
-            self.tsp_layer_idx = layer_idx
-            self._patch_model()
-            
-            try:
-                # Run forward pass to compute TSP scores for this specific layer
-                position_ids = torch.arange(prompt_length, device=self.device).unsqueeze(0)
-                with torch.no_grad():
-                    _ = self.model(input_ids=input_ids, position_ids=position_ids, use_cache=True)
-                
-                # Store the TSP scores for this layer
-                if self.tsp_scores is not None:
-                    rankings[layer_idx] = self.tsp_scores.clone()
-                    
-            finally:
-                self._unpatch_model()
+        self._patch_all_layers()
         
-        # Clear GPU cache to free memory for next generator
+        try:
+            # OPTIMIZATION: Run a single forward pass to compute scores for all layers.
+            position_ids = torch.arange(prompt_length, device=self.device).unsqueeze(0)
+            with torch.no_grad():
+                _ = self.model(input_ids=input_ids, position_ids=position_ids, use_cache=True)
+                
+        finally:
+            self._unpatch_model()
+        
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         
-        return rankings
+        return self.all_scores.copy()
 
-# --- Strategy 2: GemFilter ---
+# --- Strategy 2: GemFilter (OPTIMIZED) ---
 
 def _patched_attention_forward_gemfilter(
     self_attn: LlamaAttention,
@@ -214,29 +202,24 @@ def _patched_attention_forward_gemfilter(
     key_states_for_sdpa = hf_repeat_kv(key_states_for_sdpa, num_key_value_groups)
     value_states_for_sdpa = hf_repeat_kv(value_states_for_sdpa, num_key_value_groups)
     
-    # Compute GemFilter ranking scores
-    if generator_obj.select_layer_idx == self_attn.layer_idx and query_length >= 1:
-        # GemFilter uses the last query token to compute similarity with all keys
-        query_last_states = query_states_rotated[:, :, -1:, :]  # [batch, heads, 1, head_dim]
-        key_states_repeat = key_states_for_sdpa  # Already repeated
+    # OPTIMIZATION: This now runs for every layer and stores the result in a shared dictionary.
+    if query_length >= 1:
+        query_last_states = query_states_rotated[:, :, -1:, :]
+        key_states_repeat = key_states_for_sdpa
         
-        # Compute inner product (similarity) between last query and all keys
         inner_product = torch.matmul(query_last_states, key_states_repeat.transpose(-1, -2))
-        inner_product = inner_product[:, :, 0, :]  # Remove the singleton query dimension
+        inner_product = inner_product[:, :, 0, :]
         
-        # Sum over heads as in GemFilter's standard_dis_index
         inner_product_summed = torch.sum(inner_product, dim=1, keepdim=True)
         
-        # Apply pooling as in GemFilter (avgpool with kernel_size)
         pooled_scores = F.avg_pool1d(
             inner_product_summed, 
             kernel_size=generator_obj.kernel_size, 
             padding=generator_obj.kernel_size//2, 
             stride=1
         )
-        
-        # Store the importance scores (remove batch dimension)
-        generator_obj.gemfilter_scores = pooled_scores.squeeze(0).squeeze(0)
+        # OPTIMIZATION: Store score in the central dict, keyed by layer index.
+        generator_obj.all_scores[self_attn.layer_idx] = pooled_scores.squeeze(0).squeeze(0)
     
     attn_mask_input = attention_mask
     is_sdpa_causal = (query_length > 1) and (attn_mask_input is None)
@@ -258,57 +241,45 @@ def _patched_attention_forward_gemfilter(
 class GemFilterRankingGenerator(BaseRankingGenerator):
     def __init__(self, model: AutoModelForCausalLM, tokenizer: AutoTokenizer, args: argparse.Namespace):
         super().__init__(model, tokenizer, args)
-        self.topk = getattr(args, 'topk', 1024)
-        self.topk_percentage = getattr(args, 'topk_percentage', None)
-        self.select_layer_idx = getattr(args, 'select_layer_idx', 13)  # Default middle layer
         self.kernel_size = args.kernel_size
-        self.original_prompt_len = None
-        self.gemfilter_scores = None
+        # OPTIMIZATION: Central dictionary to hold scores from all layers.
+        self.all_scores: Dict[int, torch.Tensor] = {}
         
-    def _patch_model(self):
-        # Only patch the select layer
-        layer = self.model.model.layers[self.select_layer_idx]
-        if hasattr(layer, 'self_attn') and isinstance(layer.self_attn, LlamaAttention):
-            attn_module = layer.self_attn
-            if self.select_layer_idx not in self.orig_fwds:
-                self.orig_fwds[self.select_layer_idx] = attn_module.forward
-            setattr(attn_module, "layer_idx", self.select_layer_idx)
-            attn_module.forward = types.MethodType(partial(_patched_attention_forward_gemfilter, generator_obj=self), attn_module)
+    def _patch_all_layers(self):
+        # OPTIMIZATION: Patch all layers at once before the forward pass.
+        for i, layer in enumerate(self.model.model.layers):
+            if hasattr(layer, 'self_attn') and isinstance(layer.self_attn, LlamaAttention):
+                attn_module = layer.self_attn
+                if i not in self.orig_fwds:
+                    self.orig_fwds[i] = attn_module.forward
+                setattr(attn_module, "layer_idx", i)
+                attn_module.forward = types.MethodType(partial(_patched_attention_forward_gemfilter, generator_obj=self), attn_module)
 
     @torch.no_grad()
     def generate_rankings(self, inputs: Dict[str, torch.Tensor]) -> Dict[int, torch.Tensor]:
-        rankings = {}
+        # OPTIMIZATION: No longer loops over layers. Performs one pass.
+        self.all_scores.clear()
         input_ids = inputs['input_ids']
         prompt_length = input_ids.shape[1]
-        self.original_prompt_len = prompt_length
+
+        self._patch_all_layers()
         
-        # Generate rankings for each layer separately
-        for layer_idx in range(self.config.num_hidden_layers):
-            self.gemfilter_scores = None
-            self.select_layer_idx = layer_idx
-            self._patch_model()
-            
-            try:
-                # Run forward pass to compute GemFilter scores for this specific layer
-                position_ids = torch.arange(prompt_length, device=self.device).unsqueeze(0)
-                with torch.no_grad():
-                    _ = self.model(input_ids=input_ids, position_ids=position_ids, use_cache=True)
+        try:
+            # OPTIMIZATION: Run a single forward pass to compute scores for all layers.
+            position_ids = torch.arange(prompt_length, device=self.device).unsqueeze(0)
+            with torch.no_grad():
+                _ = self.model(input_ids=input_ids, position_ids=position_ids, use_cache=True)
                 
-                # Store the GemFilter scores for this layer
-                if self.gemfilter_scores is not None:
-                    rankings[layer_idx] = self.gemfilter_scores.clone()
-                    
-            finally:
-                self._unpatch_model()
+        finally:
+            self._unpatch_model()
         
-        # Clear GPU cache to free memory for next generator
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         
-        return rankings
+        return self.all_scores.copy()
 
 
-# --- Strategy 3: CLAA ---
+# --- Strategy 3: CLAA (OPTIMIZED) ---
 
 def _patched_attention_forward_claa(
     self_attn: LlamaAttention,
@@ -346,26 +317,18 @@ def _patched_attention_forward_claa(
     key_states_for_sdpa = hf_repeat_kv(key_states_for_sdpa, num_key_value_groups)
     value_states_for_sdpa = hf_repeat_kv(value_states_for_sdpa, num_key_value_groups)
     
-    # Compute CLAA scores - similar to FastKV but maintain rolling buffer
+    # OPTIMIZATION: This logic now correctly executes sequentially within a single forward pass.
     if query_length > generator_obj.window_size:
-        # Reset buffer at layer 0
-        if self_attn.layer_idx == 0:
-            generator_obj.score_buffer.clear()
-        
-        # Compute attention scores like FastKV
         attn_weights = torch.matmul(query_states_rotated[..., -generator_obj.window_size:, :], key_states_for_sdpa.transpose(-1, -2)) / math.sqrt(head_dim)
         
-        # Apply causal mask for the window
         mask = torch.full((generator_obj.window_size, generator_obj.window_size), torch.finfo(attn_weights.dtype).min, device=attn_weights.device)
         mask_cond = torch.arange(mask.size(-1), device=attn_weights.device)
         mask.masked_fill_(mask_cond < (mask_cond + 1).view(mask.size(-1), 1), 0)
         attn_weights[:, :, -generator_obj.window_size:, -generator_obj.window_size:] += mask[None, None, :, :]
         
-        # Softmax and sum over query positions (last window_size tokens)
         attn_weights_softmax = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states_rotated.dtype)
         attn_weights_sum = attn_weights_softmax[:, :, -generator_obj.window_size:, :-generator_obj.window_size].sum(dim=-2)
         
-        # Apply pooling as in CLAA
         if generator_obj.pooling == 'avgpool':
             attn_cache = F.avg_pool1d(attn_weights_sum, kernel_size=generator_obj.kernel_size, padding=generator_obj.kernel_size//2, stride=1)
         elif generator_obj.pooling == 'maxpool':
@@ -373,23 +336,20 @@ def _patched_attention_forward_claa(
         else:
             attn_cache = attn_weights_sum
             
-        # Sum across heads to get layer-level importance scores  
-        if len(attn_cache.shape) == 3:  # [batch, heads, seq]
-            attn_cache = attn_cache.sum(dim=1, keepdim=True)  # Sum over heads, keep dims for buffer
+        if len(attn_cache.shape) == 3:
+            attn_cache = attn_cache.sum(dim=1, keepdim=True)
         
-        # Update rolling score buffer
         generator_obj.score_buffer.append(attn_cache)
         if len(generator_obj.score_buffer) > generator_obj.last_n_layers:
             generator_obj.score_buffer.pop(0)
         
-        # Compute final CLAA scores if we have enough layers and this is the TSP layer
-        if (self_attn.layer_idx == generator_obj.tsp_layer_idx and 
-            len(generator_obj.score_buffer) >= generator_obj.last_n_layers):
-            # CLAA: Stack scores from last N layers and take max across layers and heads
-            scores_tensor = torch.stack(generator_obj.score_buffer, dim=1)  # [batch, n_layers, heads, seq_len]
-            flattened_scores = scores_tensor.flatten(start_dim=1, end_dim=2)  # [batch, n_layers*heads, seq_len]
-            final_token_importance, _ = flattened_scores.max(dim=1)  # [batch, seq_len]
-            generator_obj.claa_scores = final_token_importance.squeeze(0)  # Remove batch dimension
+        # If we have enough scores in the buffer, compute and store the final CLAA ranking for this layer.
+        if len(generator_obj.score_buffer) >= generator_obj.last_n_layers:
+            scores_tensor = torch.stack(generator_obj.score_buffer, dim=1)
+            flattened_scores = scores_tensor.flatten(start_dim=1, end_dim=2)
+            final_token_importance, _ = flattened_scores.max(dim=1)
+            # OPTIMIZATION: Store score in the central dict, keyed by layer index.
+            generator_obj.all_scores[self_attn.layer_idx] = final_token_importance.squeeze(0)
     
     attn_mask_input = attention_mask
     is_sdpa_causal = (query_length > 1) and (attn_mask_input is None)
@@ -414,15 +374,14 @@ class CLAARankingGenerator(BaseRankingGenerator):
         self.window_size = args.window_size
         self.kernel_size = args.kernel_size
         self.pooling = args.pooling
-        self.last_n_layers = 4  # Fixed as requested
-        self.tsp_layer_idx = self.last_n_layers - 1  # TSP layer should be after we have enough layers in buffer
-        self.score_buffer = []  # Rolling buffer for attention scores
-        self.claa_scores = None
+        self.last_n_layers = 4
+        self.score_buffer = []
+        # OPTIMIZATION: Central dictionary to hold scores from all layers.
+        self.all_scores: Dict[int, torch.Tensor] = {}
         
-    def _patch_model(self):
-        # Patch all layers up to and including TSP layer
-        for i in range(self.tsp_layer_idx + 1):
-            layer = self.model.model.layers[i]
+    def _patch_all_layers(self):
+        # OPTIMIZATION: Patch all layers at once before the forward pass.
+        for i, layer in enumerate(self.model.model.layers):
             if hasattr(layer, 'self_attn') and isinstance(layer.self_attn, LlamaAttention):
                 attn_module = layer.self_attn
                 if i not in self.orig_fwds:
@@ -432,46 +391,41 @@ class CLAARankingGenerator(BaseRankingGenerator):
 
     @torch.no_grad()
     def generate_rankings(self, inputs: Dict[str, torch.Tensor]) -> Dict[int, torch.Tensor]:
-        rankings = {}
+        # OPTIMIZATION: No longer loops. Performs one pass and post-processes.
+        self.all_scores.clear()
+        self.score_buffer.clear()
+        
         input_ids = inputs['input_ids']
         prompt_length = input_ids.shape[1]
         
-        # For CLAA, we need to compute rankings for different TSP layers
-        # Each TSP layer uses the previous last_n_layers for its computation
-        for tsp_layer in range(self.last_n_layers - 1, self.config.num_hidden_layers):
-            self.claa_scores = None
-            self.score_buffer.clear()
-            self.tsp_layer_idx = tsp_layer
-            self._patch_model()
-            
-            try:
-                # Run forward pass to compute CLAA scores for this TSP layer
-                position_ids = torch.arange(prompt_length, device=self.device).unsqueeze(0)
-                with torch.no_grad():
-                    _ = self.model(input_ids=input_ids, position_ids=position_ids, use_cache=True)
+        self._patch_all_layers()
+        
+        try:
+            # OPTIMIZATION: Run a single forward pass to compute scores for all valid layers.
+            position_ids = torch.arange(prompt_length, device=self.device).unsqueeze(0)
+            with torch.no_grad():
+                _ = self.model(input_ids=input_ids, position_ids=position_ids, use_cache=True)
                 
-                # Store the CLAA scores for this TSP layer
-                if self.claa_scores is not None:
-                    rankings[tsp_layer] = self.claa_scores.clone()
-                    
-            finally:
-                self._unpatch_model()
-                self.score_buffer.clear()
+        finally:
+            self._unpatch_model()
+            self.score_buffer.clear()
         
-        # For layers before we can compute CLAA (0 to last_n_layers-2), 
-        # use the first valid CLAA score as a fallback
-        if rankings:
-            first_valid_scores = next(iter(rankings.values()))
-            for layer_idx in range(min(self.last_n_layers - 1, self.config.num_hidden_layers)):
-                rankings[layer_idx] = first_valid_scores.clone()
+        # OPTIMIZATION: Post-process to add fallback for initial layers.
+        if self.all_scores:
+            first_valid_layer_idx = self.last_n_layers - 1
+            if first_valid_layer_idx in self.all_scores:
+                first_valid_scores = self.all_scores[first_valid_layer_idx]
+                for layer_idx in range(min(first_valid_layer_idx, self.config.num_hidden_layers)):
+                    if layer_idx not in self.all_scores:
+                         self.all_scores[layer_idx] = first_valid_scores.clone()
         
-        # Clear GPU cache to free memory for next generator
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         
-        return rankings
+        return self.all_scores.copy()
 
-# --- Strategy 4: Speculative ---
+
+# --- Strategy 4: Speculative (UNCHANGED) ---
 
 def _patched_attention_forward_speculative(
     self_attn: LlamaAttention,
@@ -594,50 +548,30 @@ class SpeculativeRankingGenerator(BaseRankingGenerator):
         return torch.stack(all_layer_scores, dim=1)
 
     def _token_importance_from_attn_scores(self, attn_scores: torch.Tensor):
-        # This function now mirrors the logic from the corrected oracle script.
         if attn_scores.numel() == 0:
             return
 
-        # Input shape: [batch_size, num_layers, num_heads, num_gen_tokens, prompt_len]
         bs, num_layers, num_heads, num_gen_tokens, prompt_len = attn_scores.shape
-
         if bs != 1:
             raise NotImplementedError("Batch size > 1 is not supported for speculative ranking.")
         
-        # Softmax over the prompt length dimension
         probs = F.softmax(attn_scores, dim=-1, dtype=torch.bfloat16)
-
-        # Permute to [B, N_gen, S_prompt, L, H] for easier aggregation
         probs = probs.permute(0, 3, 4, 1, 2)
-
-        # Step 1: Max-aggregation over Layers and Heads
         peak_importance, _ = torch.max(torch.max(probs, dim=-1)[0], dim=-1)
-        # Shape: [B, N_gen, S_prompt]
 
-        # Now, calculate rankings for each 'k'
         for k in self.lookahead_k_values:
             if k > num_gen_tokens:
                 continue
             
-            # Step 2: Mean-aggregation over the first 'k' generated tokens
             scores_for_k = peak_importance[:, :k, :]
             mean_importance = torch.mean(scores_for_k, dim=1)
-            # Shape: [B, S_prompt]
 
-            # Step 3 (Optional): 1D pooling on the final aggregated scores
             final_scores = mean_importance
             kernel_size = self.pool_kernel_size
             if kernel_size and prompt_len >= kernel_size:
-                scores_for_pooling = final_scores.unsqueeze(1) # Add channel dim
-                
+                scores_for_pooling = final_scores.unsqueeze(1)
                 pool_fn = F.avg_pool1d if self.pool_type == 'avgpool' else F.max_pool1d
-                
-                pooled_scores = pool_fn(
-                    scores_for_pooling,
-                    kernel_size=kernel_size,
-                    stride=1,
-                    padding=kernel_size // 2
-                )
+                pooled_scores = pool_fn(scores_for_pooling, kernel_size=kernel_size, stride=1, padding=kernel_size // 2)
                 final_scores = pooled_scores.squeeze(1)
             
             self.rankings[k] = final_scores.squeeze(0).to(self.model.dtype)
@@ -651,7 +585,6 @@ class SpeculativeRankingGenerator(BaseRankingGenerator):
             input_ids = inputs['input_ids']
             prompt_length = input_ids.shape[1]
             
-            # --- Stage 1: Prompt Prefill ---
             self.is_generating_speculatively = False
             prefill_pos = torch.arange(prompt_length, device=self.device)
             prefill_out = self.model(input_ids=input_ids, use_cache=True, cache_position=prefill_pos)
@@ -663,7 +596,6 @@ class SpeculativeRankingGenerator(BaseRankingGenerator):
             current_tokens = torch.argmax(prefill_out.logits[:, -1, :], dim=-1, keepdim=True)
             current_cache = prefill_cache
 
-            # --- Stage 2: Speculative Token Generation ---
             self.is_generating_speculatively = True
             for _ in range(self.max_k):
                 if current_tokens.item() in self.eos_token_ids: break
@@ -679,7 +611,6 @@ class SpeculativeRankingGenerator(BaseRankingGenerator):
                 
                 current_tokens = torch.argmax(decode_out.logits[:, -1, :], dim=-1, keepdim=True)
             
-            # --- Stage 3: Score Calculation ---
             raw_qk_scores = self._compute_raw_qk_scores(prompt_only_cache_tuple)
             self._token_importance_from_attn_scores(raw_qk_scores)
 
@@ -690,8 +621,7 @@ class SpeculativeRankingGenerator(BaseRankingGenerator):
         return self.rankings
 
 
-
-# --- Main Execution Logic ---
+# --- Main Execution Logic (UNCHANGED) ---
 
 def main():
     parser = argparse.ArgumentParser(description="Generate FastKV, GemFilter, and Speculative Prefill token rankings.")
@@ -744,7 +674,6 @@ def main():
         output_path = os.path.join(dataset_output_dir, f"{dataset_name}.npz")
 
         try:
-            # Added more specific exceptions for robustness
             if os.path.exists(output_path):
                 existing_data = dict(np.load(output_path, allow_pickle=True))
             else:
@@ -759,7 +688,6 @@ def main():
         for i, sample in enumerate(data):
             if processed_count >= args.num_samples: break
             sample_key = f'sample_{i}'
-            # Check if this specific sample and all its ranking types are already done.
             if sample_key in existing_data and all(f'{name}_rankings' in existing_data[sample_key].item() for name in generators):
                  print(f"Skipping already fully processed sample {i}.")
                  processed_count += 1
