@@ -101,7 +101,7 @@ def create_appendix_legend(fig, gs_spec):
     handle_keys = ['gemfilter', 'fastkv', 'spec_prefill', 'claa']
     handles = [plt.Line2D([0], [0], **{k:v for k,v in PLOT_STYLES[key].items() if k != 'label'}) for key in handle_keys]
     labels = [PLOT_STYLES[key]['label'] for key in handle_keys]
-    legend_ax.legend(handles, labels, loc='center', ncol=1, title='Pruning Heuristic', frameon=True, facecolor='white', framealpha=0.9, fontsize=24, title_fontsize=26)
+    legend_ax.legend(handles, labels, loc='center', ncol=1, frameon=True, facecolor='white', framealpha=0.9, fontsize=24, title_fontsize=26)
 
 def plot_paper_version(aggregated_accuracies: Dict, k_percentage: float, global_max_acc: float, output_prefix: str):
     """Creates the 2x3 grid with data averaged by task for the main paper."""
@@ -124,13 +124,13 @@ def plot_paper_version(aggregated_accuracies: Dict, k_percentage: float, global_
     handle_keys = ['gemfilter', 'fastkv', 'spec_prefill', 'claa']
     handles = [plt.Line2D([0], [0], **{k:v for k,v in PLOT_STYLES[key].items() if k != 'label'}) for key in handle_keys]
     labels = [PLOT_STYLES[key]['label'] for key in handle_keys]
-    axes.flat[-1].legend(handles, labels, loc='lower right', ncol=1, title='Pruning Heuristic',
+    axes.flat[-1].legend(handles, labels, loc='lower right', ncol=1,
                          frameon=True, facecolor='white', framealpha=0.9,
                          fontsize=18, title_fontsize=20)
 
     fig.text(0.5, 0.04, 'Model Layer Index', ha='center', va='center', fontsize=34)
-    fig.text(0.06, 0.5, 'Spearman Rank Correlation with Oracle', ha='center', va='center', rotation='vertical', fontsize=34)
-    fig.suptitle(f'Evaluating the Ranking Fidelity of KV Pruning Heuristics', y=0.99, fontsize=32, weight='bold')
+    fig.text(0.06, 0.5, 'Spearman Rank Correlation with Oracle', ha='center', va='center', rotation='vertical', fontsize=30)
+    fig.suptitle(f'Comparing Token Ranking Heuristics against Oracle', y=0.99, fontsize=32, weight='bold')
     
     plt.savefig(f"{output_prefix}.pdf", format='pdf', dpi=300, bbox_inches='tight')
     print(f"\nPaper version plot saved to: {output_prefix}.pdf")
