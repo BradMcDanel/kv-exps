@@ -177,7 +177,7 @@ def create_tradeoff_plots(df, output_dir):
     
     # Format left subplot (Accuracy)
     ax1.set_xlabel('Time to First Token (ms)')
-    ax1.set_ylabel('Average LongBench Accuracy (%)')
+    ax1.set_ylabel('LongBench Accuracy (%)')
     ax1.set_title('Accuracy vs TTFT', fontsize=24)
     ax1.grid(True, which='major', linestyle=':', linewidth=0.6)
     
