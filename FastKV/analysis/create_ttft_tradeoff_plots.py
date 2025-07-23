@@ -134,8 +134,8 @@ def create_tradeoff_plots(df, output_dir):
     print(f"Data summary:")
     print(df[['method_display', 'keep_rate_percent', 'ttft_ms', 'memory_gb']])
     
-    # Create 2-subplot figure
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(20, 8), dpi=300)
+    # Create 2-subplot figure - much shorter for minipage placement
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5), dpi=300)
     
     for method in df['method_display'].unique():
         method_data = df[df['method_display'] == method]
