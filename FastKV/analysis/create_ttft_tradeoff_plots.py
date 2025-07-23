@@ -213,7 +213,7 @@ def create_tradeoff_plots(df, output_dir):
                                             label=method, markeredgecolor='white', 
                                             markeredgewidth=1))
     
-    ax2.legend(handles=legend_elements, loc='lower right', fontsize=18, 
+    ax2.legend(handles=legend_elements, loc='center right', fontsize=18, 
               frameon=True, facecolor='white', framealpha=0.9)
     
     plt.tight_layout()
