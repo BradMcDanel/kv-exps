@@ -117,7 +117,7 @@ def plot_single_density(
         
         # Position body text slightly lower
         if body_text:
-            ax.text(x_pos, 0.90, body_text, transform=ax.transAxes, fontsize=20,
+            ax.text(x_pos, 0.87, body_text, transform=ax.transAxes, fontsize=20,
                     verticalalignment='top', horizontalalignment='center')
 
     ax.set_xlim(0, sequence_length)
