@@ -90,6 +90,9 @@ def plot_methods_on_ax(ax, accuracies: Dict):
     for method in ['gemfilter', 'fastkv', 'claa']:
         if method in accuracies and accuracies[method]:
             sorted_keys = sorted(accuracies[method].keys())
+            # For CLAA, remove first 3 layers (0, 1, 2) as they are invalid settings
+            if method == 'claa':
+                sorted_keys = [k for k in sorted_keys if k >= 3]
             ax.plot(sorted_keys, [accuracies[method][k] for k in sorted_keys], **PLOT_STYLES[method])
     if 'spec_prefill' in accuracies:
         ax.axhline(y=accuracies['spec_prefill'], **PLOT_STYLES['spec_prefill'])
