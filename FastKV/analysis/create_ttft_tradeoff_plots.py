@@ -181,27 +181,11 @@ def create_tradeoff_plots(df, output_dir):
     ax1.set_title('Accuracy vs TTFT', fontsize=24)
     ax1.grid(True, which='major', linestyle=':', linewidth=0.6)
     
-    # Format right subplot (Memory) with enhanced view for main cluster
+    # Format right subplot (Memory)
     ax2.set_xlabel('Time to First Token (ms)')
     ax2.set_ylabel('Peak Memory Usage (GB)')
     ax2.set_title('Memory vs TTFT', fontsize=24)
     ax2.grid(True, which='major', linestyle=':', linewidth=0.6)
-    
-    # Set y-axis limits to focus on main cluster (15-19 GB range)
-    # This will crop out the SpecPrefill outlier but show the detail where it matters
-    main_memory_data = df[df['method_display'] != 'SpecPrefill']['memory_gb']
-    if not main_memory_data.empty:
-        y_min = main_memory_data.min() - 0.5
-        y_max = main_memory_data.max() + 0.5
-        ax2.set_ylim(y_min, y_max)
-    
-    # Add annotation for SpecPrefill outlier if it exists
-    specprefill_data = df[df['method_display'] == 'SpecPrefill']
-    if not specprefill_data.empty:
-        # Add text annotation pointing to the outlier
-        ax2.text(0.02, 0.98, f"SpecPrefill: {specprefill_data['memory_gb'].min():.1f}-{specprefill_data['memory_gb'].max():.1f} GB", 
-                transform=ax2.transAxes, fontsize=12, verticalalignment='top',
-                bbox=dict(boxstyle='round,pad=0.3', facecolor='lightgray', alpha=0.7))
     
     # Create custom legend with lines through markers in specified order
     legend_order = ["FullKV", "Oracle", "GemFilter", "FastKV", "SpecPrefill", "CLAA"]
@@ -229,7 +213,7 @@ def create_tradeoff_plots(df, output_dir):
                                             label=method, markeredgecolor='white', 
                                             markeredgewidth=1))
     
-    ax2.legend(handles=legend_elements, loc='upper right', fontsize=18, 
+    ax2.legend(handles=legend_elements, loc='lower right', fontsize=18, 
               frameon=True, facecolor='white', framealpha=0.9)
     
     plt.tight_layout()
@@ -246,18 +230,18 @@ def generate_debug_data():
     import pandas as pd
     
     data = []
-    # FullKV baseline (100%)
+    # FullKV baseline (100%) - realistic values
     data.append({
         "method_display": "FullKV", "keep_rate": 1.0, "keep_rate_percent": 100,
-        "avg_accuracy": 49.32, "ttft_ms": 215.90, "memory_gb": 15.69
+        "avg_accuracy": 49.32, "ttft_ms": 900.0, "memory_gb": 18.5
     })
     
     # Other methods with multiple keep rates (realistic memory values)
     methods_data = {
-        "FastKV": [(0.1, 46.81, 126.87, 15.23), (0.2, 47.33, 140.5, 15.35), (0.4, 47.68, 158.2, 15.48)],
-        "GemFilter": [(0.1, 37.59, 130.22, 15.22), (0.2, 42.29, 145.8, 15.31), (0.4, 45.11, 163.7, 15.44)], 
-        "CLAA": [(0.1, 47.13, 126.75, 15.27), (0.2, 48.12, 141.2, 15.39), (0.4, 48.72, 159.8, 15.52)],
-        "Oracle": [(0.1, 47.83, 127.84, 15.23), (0.2, 48.39, 142.1, 15.36), (0.4, 48.88, 160.4, 15.50)],
+        "FastKV": [(0.1, 46.81, 126.87, 16.2), (0.2, 47.33, 140.5, 16.35), (0.4, 47.68, 158.2, 16.48)],
+        "GemFilter": [(0.1, 37.59, 130.22, 16.1), (0.2, 42.29, 145.8, 16.25), (0.4, 45.11, 163.7, 16.4)], 
+        "CLAA": [(0.1, 47.13, 126.75, 16.15), (0.2, 48.12, 141.2, 16.3), (0.4, 48.72, 159.8, 16.45)],
+        "Oracle": [(0.1, 47.83, 127.84, 16.0), (0.2, 48.39, 142.1, 16.2), (0.4, 48.88, 160.4, 16.35)],
         "SpecPrefill": [(0.1, 41.99, 135.5, 24.8), (0.2, 44.57, 152.3, 25.2), (0.4, 46.55, 171.2, 25.7)]  # Outlier memory usage
     }
     
