@@ -131,6 +131,8 @@ def create_tradeoff_plots(df, output_dir):
     os.makedirs(output_dir, exist_ok=True)
     
     print(f"\nGenerating combined tradeoff plot in {output_dir}...")
+    print(f"Data summary:")
+    print(df[['method_display', 'keep_rate_percent', 'ttft_ms', 'memory_gb']])
     
     # Create 2-subplot figure
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(20, 8), dpi=300)
