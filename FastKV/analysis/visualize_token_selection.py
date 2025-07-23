@@ -77,7 +77,8 @@ def plot_single_density(
     all_indices: Dict[str, torch.Tensor],
     sequence_length: int,
     plot_order_map: Dict,
-    accuracies: Dict[str, float]
+    accuracies: Dict[str, float],
+    is_left_plot: bool = False
 ):
     """Plots the density for one sample and its accuracies on a given axis."""
     x_grid = np.linspace(0, sequence_length, 1000)
@@ -97,15 +98,27 @@ def plot_single_density(
 
     if accuracies:
         text_lines = ["Oracle Overlap (Top-10%):"]
-        display_map = {'FastKV': 'FastKV', 'GemFilter': 'GemFilter', 'CLAA': 'CLAA (Ours)', 'Speculative Prefill': 'Spec. Prefill'}
+        display_map = {'FastKV': 'FastKV', 'GemFilter': 'GemFilter', 'Speculative Prefill': 'Spec. Prefill', 'CLAA': 'CLAA (Ours)'}
         for key, label in display_map.items():
             if key in accuracies:
                 text_lines.append(f"{label}: {accuracies[key]:.1%}")
-        text_string = "\n".join(text_lines)
         
-        ax.text(0.5, 0.97, text_string, transform=ax.transAxes, fontsize=20,
+        # Make the header larger (21 vs 20 for the rest)
+        header_text = text_lines[0]
+        body_text = "\n".join(text_lines[1:]) if len(text_lines) > 1 else ""
+        
+        # Adjust horizontal position for left plot (move left by 40%)
+        x_pos = 0.3 if is_left_plot else 0.5
+        
+        # Position header
+        ax.text(x_pos, 0.97, header_text, transform=ax.transAxes, fontsize=21,
                 verticalalignment='top', horizontalalignment='center',
                 bbox=dict(boxstyle='round,pad=0.5', fc='white', alpha=0.7))
+        
+        # Position body text slightly lower
+        if body_text:
+            ax.text(x_pos, 0.92, body_text, transform=ax.transAxes, fontsize=20,
+                    verticalalignment='top', horizontalalignment='center')
 
     ax.set_xlim(0, sequence_length)
     ax.set_yticklabels([])
@@ -148,7 +161,7 @@ def plot_density_grid(
         seq_len = data['seq_len']
         accuracies = data.get('accuracies', {})
 
-        plot_single_density(ax, data['indices'], seq_len, plot_order_map, accuracies)
+        plot_single_density(ax, data['indices'], seq_len, plot_order_map, accuracies, is_left_plot=(i == 0))
         
         # Set the dataset title without difficulty labels
         title_text = f"{dataset_name}\n({task_category})"
