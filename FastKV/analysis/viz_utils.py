@@ -15,6 +15,8 @@ METHOD_COLORS = {
     'FastKV': '#d62728',
     'GemFilter': '#ff7f0e',
     'CLAA': '#2ca02c',
+    'FullKV': '#000000',
+    'SpecPrefill': '#5e2b8c',
     'Speculative': '#5e2b8c',
     'Speculative (k=1)': '#d6b3ff',
     'Speculative (k=8)': '#a066cc',
