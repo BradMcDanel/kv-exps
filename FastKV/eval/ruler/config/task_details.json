@@ -118,8 +118,8 @@
       "num_chains": 1,
       "num_hops": 4
     },
-    "prompt_template": "You need to track the variable '{variable}' to get its final value.\n\n{context}\n\nWhat is the final value of variable '{variable}'?",
-    "answer_prefix": "The final value of variable '{variable}' is",
+    "prompt_template": "Memorize and track the chain(s) of variable assignment hidden in the following text.\n\n{context}\nQuestion: Find all variables that are assigned the value {query} in the text above.",
+    "answer_prefix": "Answer: According to the chain(s) of variable assignment in the text above, {num_v} variables are assigned the value {query}, they are: ",
     "max_gen": 30
   },
   "cwe": {
@@ -129,8 +129,8 @@
       "freq_ucw": 3,
       "num_cw": 10
     },
-    "prompt_template": "Please extract the common words that appear at least {freq_cw} times in the following text:\n\n{context}\n\nCommon words (appearing at least {freq_cw} times):",
-    "answer_prefix": "",
+    "prompt_template": "Below is a numbered list of words. In these words, some appear more often than others. Memorize the ones that appear most often.\n{context}\nQuestion: What are the 10 most common words in the above list?",
+    "answer_prefix": "Answer: The top 10 words that appear most often in the list are:",
     "max_gen": 120
   },
   "fwe": {
@@ -138,8 +138,8 @@
     "args": {
       "alpha": 2.0
     },
-    "prompt_template": "Please extract the most frequent words from the following text:\n\n{context}\n\nMost frequent words:",
-    "answer_prefix": "",
+    "prompt_template": "Read the following coded text and track the frequency of each coded word. Find the three most frequently appeared coded words. {context}\nQuestion: Do not provide any explanation. Please ignore the dots '....'. What are the three most frequently appeared words in the above coded text?",
+    "answer_prefix": "Answer: According to the coded text above, the three most frequently appeared words are:",
     "max_gen": 50
   },
   "qa_1": {
@@ -147,8 +147,8 @@
     "args": {
       "dataset": "squad"
     },
-    "prompt_template": "Answer the question based on the given documents.\n\n{context}\n\nQuestion: {input}\n\nAnswer:",
-    "answer_prefix": "",
+    "prompt_template": "Answer the question based on the given documents. Only give me the answer and do not output any other words.\n\nThe following are given documents.\n\n{context}\n\nAnswer the question based on the given documents. Only give me the answer and do not output any other words.\n\nQuestion: {query}",
+    "answer_prefix": "Answer:",
     "max_gen": 32
   },
   "qa_2": {
@@ -156,8 +156,8 @@
     "args": {
       "dataset": "hotpotqa"
     },
-    "prompt_template": "Answer the question based on the given documents.\n\n{context}\n\nQuestion: {input}\n\nAnswer:",
-    "answer_prefix": "",
+    "prompt_template": "Answer the question based on the given documents. Only give me the answer and do not output any other words.\n\nThe following are given documents.\n\n{context}\n\nAnswer the question based on the given documents. Only give me the answer and do not output any other words.\n\nQuestion: {query}",
+    "answer_prefix": "Answer:",
     "max_gen": 32
   }
 }

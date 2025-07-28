@@ -461,7 +461,7 @@ def main():
 
     # Evaluation - RULER specific
     parser.add_argument("--task", type=str, default="niah_single_1", help="RULER task to evaluate.")
-    parser.add_argument("--num_samples", type=int, default=10, help="Number of samples to generate per task length.")
+    parser.add_argument("--num_samples", type=int, default=500, help="Number of samples to generate per task length.")
     parser.add_argument("--seq_length", type=int, default=2048, help="Sequence length to evaluate.")
     
     # Additional arguments for compatibility
