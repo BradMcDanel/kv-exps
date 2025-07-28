@@ -10,12 +10,12 @@ task_list="niah_single_1 niah_single_2 niah_single_3 niah_multikey_1 niah_multik
 model="meta-llama/Llama-3.1-8B-Instruct"
 device=0
 seq_length=4096
-num_samples=10
+num_samples=1
 
 # CLAA specific parameters
-window_size=8
-max_capacity_prompt_percentage=0.125
-last_n_layers=4  # Number of last layers for CLAA aggregation
+max_capacity_prompt_percentage=0.1
+last_n_layers=4
+tsp_idx=15
 
 echo "Starting RULER evaluation with CLAA:"
 echo "Model: $model"
@@ -40,7 +40,6 @@ do
         --save_path $path \
         --num_samples $num_samples \
         --seq_length $seq_length \
-        --window_size $window_size \
         --max_capacity_prompt_percentage $max_capacity_prompt_percentage \
         --last_n_layers $last_n_layers
     
