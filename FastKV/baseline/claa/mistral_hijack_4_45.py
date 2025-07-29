@@ -15,6 +15,7 @@ from baseline.claa.claa_utils import init_claa
 
 logger = logging.get_logger(__name__)
 
+
 class MistralCLAAAttention(MistralFlashAttention2):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -29,8 +30,6 @@ class MistralCLAAAttention(MistralFlashAttention2):
         output_attentions: bool = False,
         use_cache: bool = False,
         cache_position: Optional[torch.LongTensor] = None,
-        is_score_collection_needed: bool = True,
-        **kwargs,
     ):
         output_attentions = False
         bsz, q_len, _ = hidden_states.size()
@@ -49,13 +48,15 @@ class MistralCLAAAttention(MistralFlashAttention2):
         if past_key_value is not None:
             cache_kwargs = {"sin": sin, "cos": cos}
             if q_len > 1:
-                key_states, value_states, self.tsp_idx = self.kv_cluster.update_kv(
-                    key_states, query_states, value_states, attention_mask, self.num_key_value_groups, self.layer_idx, is_score_collection_needed=is_score_collection_needed, **kwargs)
-                past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
+                # THE FIX: Use new variables for compressed states, exactly like Llama.
+                key_states_compress, value_states_compress, self.tsp_idx = self.kv_cluster.update_kv(
+                    key_states, query_states, value_states, attention_mask, self.num_key_value_groups, self.layer_idx)
+                past_key_value.update(key_states_compress, value_states_compress, self.layer_idx, cache_kwargs)
             else:
                 key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
                 self.tsp_idx = None
 
+        # The rest of the function now correctly uses the original, uncompressed states for the current pass.
         key_states = repeat_kv(key_states, self.num_key_value_groups)
         value_states = repeat_kv(value_states, self.num_key_value_groups)
         
@@ -80,6 +81,7 @@ class MistralCLAAAttention(MistralFlashAttention2):
 
         return attn_output, None, past_key_value
 
+
 def mistral_decoderlayer_forward(
         self,
         hidden_states: torch.Tensor,
@@ -89,7 +91,6 @@ def mistral_decoderlayer_forward(
         output_attentions: Optional[bool] = False,
         use_cache: Optional[bool] = False,
         cache_position: Optional[torch.LongTensor] = None,
-        is_score_collection_needed: bool = True,
         **kwargs,
     ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
     residual = hidden_states
@@ -103,7 +104,6 @@ def mistral_decoderlayer_forward(
         output_attentions=output_attentions,
         use_cache=use_cache,
         cache_position=cache_position,
-        is_score_collection_needed=is_score_collection_needed,
         **kwargs,
     )
     hidden_states = residual + hidden_states
@@ -128,6 +128,7 @@ def mistral_decoderlayer_forward(
         outputs += (present_key_value,)
     return outputs
 
+
 def mistral_model_forward(
         self,
         input_ids: torch.LongTensor = None,
@@ -141,7 +142,6 @@ def mistral_model_forward(
         return_dict: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
     ) -> Union[Tuple, BaseModelOutputWithPast]:
-    # ... (Standard setup code from original forward) ...
     output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
     output_hidden_states = (
         output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -155,7 +155,8 @@ def mistral_model_forward(
     if inputs_embeds is None:
         inputs_embeds = self.embed_tokens(input_ids)
 
-    past_key_values = DynamicCache.from_legacy_cache(past_key_values) if use_cache and not isinstance(past_key_values, Cache) else past_key_values
+    if use_cache and not isinstance(past_key_values, Cache):
+        past_key_values = DynamicCache.from_legacy_cache(past_key_values)
     
     if cache_position is None:
         past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
@@ -170,15 +171,9 @@ def mistral_model_forward(
     all_self_attns = () if output_attentions else None
     next_decoder_cache = None
 
-    # [Taper] Taper-specific state passed through layers
-    layer_kwargs = {"taper_collected_scores": []}
-
-    for i, decoder_layer in enumerate(self.layers):
+    for decoder_layer in self.layers:
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
-
-        # [Taper] Determine if score collection is necessary for this layer.
-        is_score_collection_needed = (i <= getattr(self, "last_tsp_layer_idx", -1))
 
         layer_outputs = decoder_layer(
             hidden_states,
@@ -188,8 +183,6 @@ def mistral_model_forward(
             output_attentions=output_attentions,
             use_cache=use_cache,
             cache_position=cache_position,
-            is_score_collection_needed=is_score_collection_needed,
-            **layer_kwargs,
         )
 
         hidden_states = layer_outputs[0]
@@ -207,7 +200,6 @@ def mistral_model_forward(
     if output_hidden_states:
         all_hidden_states += (hidden_states,)
 
-    # [Taper] Cut-off hidden states for generation
     if hidden_states.shape[1] > 1:
         hidden_states = hidden_states[:, -1:, :]
 
