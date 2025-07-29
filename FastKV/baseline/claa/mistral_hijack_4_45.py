@@ -75,7 +75,7 @@ class MistralCLAAAttention(MistralFlashAttention2):
             is_causal=self.is_causal,
         )
 
-        attn_output = attn_output.reshape(bsz, q_len, self.hidden_size).contiguous()
+        attn_output = attn_output.reshape(bsz, q_len, -1).contiguous()
         attn_output = self.o_proj(attn_output)
 
         return attn_output, None, past_key_value
@@ -163,7 +163,7 @@ def mistral_model_forward(
     if position_ids is None:
         position_ids = cache_position.unsqueeze(0)
 
-    causal_mask = self._update_causal_mask(attention_mask, inputs_embeds, cache_position, past_key_values, output_attentions)
+    causal_mask = self._update_causal_mask(attention_mask, inputs_embeds, cache_position, past_key_values, use_cache, output_attentions)
     hidden_states = inputs_embeds
 
     all_hidden_states = () if output_hidden_states else None
