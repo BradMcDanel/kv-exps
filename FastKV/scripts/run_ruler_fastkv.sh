@@ -13,10 +13,9 @@ seq_length=4096
 num_samples=10
 
 # FastKV specific parameters
-window_size=8
-max_capacity_prompt_percentage=0.125  # Use percentage variant
+max_capacity_prompt_percentage=0.4
 tsp_idx=15
-tsp_len_percentage=0.5  # Use percentage variant
+tsp_len_percentage=0.4
 
 echo "Starting RULER evaluation with FastKV:"
 echo "Model: $model"
@@ -42,7 +41,6 @@ do
         --save_path $path \
         --num_samples $num_samples \
         --seq_length $seq_length \
-        --window_size $window_size \
         --max_capacity_prompt_percentage $max_capacity_prompt_percentage \
         --tsp_idx $tsp_idx \
         --tsp_len_percentage $tsp_len_percentage

@@ -4,7 +4,8 @@
 # Based on the structure of run_longbench.sh
 
 # All RULER tasks
-task_list="niah_single_1 niah_single_2 niah_single_3 niah_multikey_1 niah_multikey_2 niah_multikey_3 niah_multivalue niah_multiquery vt cwe fwe qa_1 qa_2"
+# task_list="niah_single_1 niah_single_2 niah_single_3 niah_multikey_1 niah_multikey_2 niah_multikey_3 niah_multivalue niah_multiquery vt cwe fwe qa_1 qa_2"
+task_list="vt"
 
 # Model configuration
 model="meta-llama/Llama-3.1-8B-Instruct"

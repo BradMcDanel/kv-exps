@@ -13,14 +13,10 @@ seq_length=4096
 num_samples=10
 
 # Speculative Prefill specific parameters
-speculator_model_name="meta-llama/Llama-3-8B-Instruct"
-max_capacity_prompt_percentage=0.125
-look_ahead_k=1
+speculator_model_name="meta-llama/Llama-3.2-1B-Instruct"
+max_capacity_prompt_percentage=0.4
+look_ahead_k=8
 kernel_size=7
-pooling="avgpool"
-cache_granularity="head"
-use_chunk_selection="--use_chunk_selection"
-chunk_size=64
 
 echo "Starting RULER evaluation with Speculative Prefill:"
 echo "Model: $model"
@@ -31,9 +27,6 @@ echo "Samples per task: $num_samples"
 echo "Max Capacity Prompt Percentage: $max_capacity_prompt_percentage"
 echo "Look Ahead K: $look_ahead_k"
 echo "Kernel Size: $kernel_size"
-echo "Pooling: $pooling"
-echo "Cache Granularity: $cache_granularity"
-echo "Chunk Size: $chunk_size"
 echo "=================================="
 
 # Speculative Prefill evaluation
@@ -52,11 +45,7 @@ do
         --speculator_model_name $speculator_model_name \
         --max_capacity_prompt_percentage $max_capacity_prompt_percentage \
         --look_ahead_k $look_ahead_k \
-        --kernel_size $kernel_size \
-        --pooling $pooling \
-        --cache_granularity $cache_granularity \
-        $use_chunk_selection \
-        --chunk_size $chunk_size
+        --kernel_size $kernel_size 
     
     echo "Evaluating task: $task"
     CUDA_VISIBLE_DEVICES=$device python -m eval.ruler.eval.evaluate \

@@ -13,9 +13,8 @@ seq_length=4096
 num_samples=10
 
 # GemFilter specific parameters
-filter_idx=13
-topk=1024
-topk_percentage=0.25
+filter_idx=15
+topk_percentage=0.4
 
 echo "Starting RULER evaluation with GemFilter:"
 echo "Model: $model"
@@ -41,7 +40,6 @@ do
         --num_samples $num_samples \
         --seq_length $seq_length \
         --filter_idx $filter_idx \
-        --topk $topk \
         --topk_percentage $topk_percentage
     
     echo "Evaluating task: $task"

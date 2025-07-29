@@ -10,10 +10,10 @@ task_list="niah_single_1 niah_single_2 niah_single_3 niah_multikey_1 niah_multik
 model="meta-llama/Llama-3.1-8B-Instruct"
 device=0
 seq_length=4096
-num_samples=1
+num_samples=10
 
 # CLAA specific parameters
-max_capacity_prompt_percentage=0.1
+max_capacity_prompt_percentage=0.4
 last_n_layers=4
 tsp_idx=15
 

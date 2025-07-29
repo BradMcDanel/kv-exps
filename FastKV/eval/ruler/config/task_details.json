@@ -119,7 +119,7 @@
       "num_hops": 4
     },
     "prompt_template": "Memorize and track the chain(s) of variable assignment hidden in the following text.\n\n{context}\nQuestion: Find all variables that are assigned the value {query} in the text above.",
-    "answer_prefix": "Answer: According to the chain(s) of variable assignment in the text above, {num_v} variables are assigned the value {query}, they are: ",
+    "answer_prefix": "Answer: According to the chain(s) of variable assignment in the text above, {num_v} variables are assigned the value {query}, they are:",
     "max_gen": 30
   },
   "cwe": {

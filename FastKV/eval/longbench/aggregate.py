@@ -44,30 +44,26 @@ def load_results(results_file):
         print(f"Warning: Could not load {results_file}: {e}")
         return {}
 
-def parse_method_and_budget(folder_name):
+def parse_method_name(folder_name):
     """
-    Parse method name and KV budget from folder name.
+    Parse method name from folder name.
     
     Args:
         folder_name: Name of the folder (e.g., 'fastkv_256', 'fullkv')
     
     Returns:
-        tuple: (method_name, kv_budget)
+        str: method_name
     """
-    # Special case for fullkv - always uses "Full" budget
-    if folder_name == "fullkv":
-        return "fullkv", "Full"
-    
-    # Check if folder name ends with _number
-    parts = folder_name.split('_')
-    if len(parts) > 1 and parts[-1].isdigit():
-        method_name = '_'.join(parts[:-1])
-        kv_budget = int(parts[-1])
+    # Clean up folder name to get method name
+    if folder_name.startswith("fullkv"):
+        return "fullkv"
+    elif folder_name.startswith("fastkv"):
+        return "fastkv"
+    elif folder_name.startswith("claa"):
+        return "claa"
     else:
-        method_name = folder_name
-        kv_budget = 512  # Default budget
-    
-    return method_name, kv_budget
+        # For other methods, use the folder name as-is
+        return folder_name
 
 def aggregate_longbench_results(base_path="outputs/meta-llama/Llama-3.1-8B-Instruct/longbench"):
     """
@@ -105,13 +101,12 @@ def aggregate_longbench_results(base_path="outputs/meta-llama/Llama-3.1-8B-Instr
         # Load results for this method
         method_results = load_results(results_file)
         
-        # Parse method name and KV budget
-        method_name, kv_budget = parse_method_and_budget(folder_name)
+        # Parse method name
+        method_name = parse_method_name(folder_name)
         
         # Create row for this method
         row = {
-            "Method": method_name,
-            "KVBudget": kv_budget
+            "Method": method_name
         }
         
         # Add results for each dataset (in specified order)
@@ -134,20 +129,14 @@ def aggregate_longbench_results(base_path="outputs/meta-llama/Llama-3.1-8B-Instr
         
         results.append(row)
     
-    # Sort results: fullkv first, then by KVBudget (ascending), then by Method
+    # Sort results: fullkv first, then alphabetically by method name
     def sort_key(result):
         method = result["Method"]
-        budget = result["KVBudget"]
         
         if method == "fullkv":
-            return (0, 0, method)  # fullkv always first
+            return (0, method)  # fullkv always first
         else:
-            # For numeric budgets, sort by budget then method
-            # For non-numeric budgets, sort by string value
-            if isinstance(budget, int):
-                return (1, budget, method)
-            else:
-                return (1, float('inf'), method)  # Non-numeric budgets go last
+            return (1, method)  # Then alphabetically
     
     results.sort(key=sort_key)
     
@@ -162,8 +151,8 @@ def save_to_csv(results, base_path, output_filename="longbench_results.csv"):
     # Create output file path in the base_path directory
     output_file = os.path.join(base_path, output_filename)
     
-    # CSV headers: Method + KVBudget + all dataset display names + average
-    headers = ["Method", "KVBudget"] + DATASET_NAMES + ["Avg"]
+    # CSV headers: Method + all dataset display names + average
+    headers = ["Method"] + DATASET_NAMES + ["Avg"]
     
     try:
         with open(output_file, 'w', newline='') as csvfile:
@@ -186,13 +175,11 @@ def print_summary_table(results):
     
     # Calculate column widths
     method_width = max(8, max(len(str(r["Method"])) for r in results))  # Min 8 for "Method"
-    budget_width = 8  # Fixed width for KVBudget
     score_width = 8   # Fixed width for scores
     
     # Build header row
     header_parts = []
     header_parts.append(f"{'Method':<{method_width}}")
-    header_parts.append(f"{'KVBudget':<{budget_width}}")
     
     for dataset_name in DATASET_NAMES:
         header_parts.append(f"{dataset_name:<{score_width}}")
@@ -208,9 +195,6 @@ def print_summary_table(results):
         
         # Method name
         row_parts.append(f"{result['Method']:<{method_width}}")
-        
-        # KV Budget
-        row_parts.append(f"{result['KVBudget']:<{budget_width}}")
         
         # Dataset scores
         for dataset_name in DATASET_NAMES:
