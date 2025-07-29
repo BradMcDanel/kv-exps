@@ -10,8 +10,13 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, set_seed, AutoConf
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.models.llama.modeling_llama import (
     LlamaAttention,
-    apply_rotary_pos_emb as hf_apply_rotary_pos_emb,
-    repeat_kv as hf_repeat_kv,
+    apply_rotary_pos_emb as llama_apply_rotary_pos_emb,
+    repeat_kv as llama_repeat_kv,
+)
+from transformers.models.mistral.modeling_mistral import (
+    MistralAttention,
+    apply_rotary_pos_emb as mistral_apply_rotary_pos_emb,
+    repeat_kv as mistral_repeat_kv,
 )
 import math
 import types
@@ -19,7 +24,7 @@ from functools import partial
 import numpy as np
 
 def _patched_attention_forward_oracle(
-    self_attn: LlamaAttention,
+    self_attn,  # Union[LlamaAttention, MistralAttention]
     oracle_generator: 'OracleGenerator',
     hidden_states: torch.Tensor,
     attention_mask: Optional[torch.Tensor] = None,
@@ -47,8 +52,13 @@ def _patched_attention_forward_oracle(
     key_states_before_rope = key_projection.view(batch_size, query_length, num_key_value_heads, head_dim).transpose(1, 2)
     value_states_for_cache = value_projection.view(batch_size, query_length, num_key_value_heads, head_dim).transpose(1, 2)
     
+    # Use appropriate functions based on model type
+    is_mistral = isinstance(self_attn, MistralAttention)
+    apply_rotary_pos_emb_fn = mistral_apply_rotary_pos_emb if is_mistral else llama_apply_rotary_pos_emb
+    repeat_kv_fn = mistral_repeat_kv if is_mistral else llama_repeat_kv
+    
     cos, sin = self_attn.rotary_emb(value_states_for_cache, position_ids=position_ids)
-    query_states_rotated, key_states_rotated = hf_apply_rotary_pos_emb(query_states, key_states_before_rope, cos, sin, position_ids)
+    query_states_rotated, key_states_rotated = apply_rotary_pos_emb_fn(query_states, key_states_before_rope, cos, sin, position_ids)
 
     if not oracle_generator.is_generating_oracle_answer:
         if query_length > 1:
@@ -61,8 +71,8 @@ def _patched_attention_forward_oracle(
     key_states_for_sdpa, value_states_for_sdpa = past_key_value.update(
         key_states_rotated, value_states_for_cache, self_attn.layer_idx, {"cache_position": cache_position}
     )
-    key_states_for_sdpa = hf_repeat_kv(key_states_for_sdpa, num_key_value_groups)
-    value_states_for_sdpa = hf_repeat_kv(value_states_for_sdpa, num_key_value_groups)
+    key_states_for_sdpa = repeat_kv_fn(key_states_for_sdpa, num_key_value_groups)
+    value_states_for_sdpa = repeat_kv_fn(value_states_for_sdpa, num_key_value_groups)
     
     attn_mask_input = attention_mask
     is_sdpa_causal = (query_length > 1) and (attn_mask_input is None)
@@ -88,6 +98,9 @@ class OracleGenerator:
         self.device = self.model.device
         self.dtype = self.model.dtype
         self.eos_token_ids = self._extract_eos_token_ids()
+        
+        # Detect model type
+        self.is_mistral = 'mistral' in self.config.model_type.lower() if hasattr(self.config, 'model_type') else False
         
         self.pool_kernel_size = pool_kernel_size
         self.pool_type = pool_type.lower()
@@ -121,7 +134,7 @@ class OracleGenerator:
         self.captured_qs = [[] for _ in range(num_layers)]
         num_patched_layers = 0
         for i, layer in enumerate(self.model.model.layers):
-            if hasattr(layer, 'self_attn') and isinstance(layer.self_attn, LlamaAttention):
+            if hasattr(layer, 'self_attn') and isinstance(layer.self_attn, (LlamaAttention, MistralAttention)):
                 attn_module = layer.self_attn
                 if i not in self.orig_fwds: self.orig_fwds[i] = attn_module.forward
                 setattr(attn_module, "layer_idx", i)
@@ -189,7 +202,9 @@ class OracleGenerator:
         for layer_idx in range(num_layers):
             if not self.captured_qs[layer_idx] or prompt_only_cache_tuple[layer_idx][0].numel() == 0: continue
             key_prompt_layer = prompt_only_cache_tuple[layer_idx][0].detach()
-            key_prompt_layer_repeated = hf_repeat_kv(key_prompt_layer, num_kv_groups)
+            # Use appropriate repeat_kv function based on model type
+            repeat_kv_fn = mistral_repeat_kv if oracle_generator.is_mistral else llama_repeat_kv
+            key_prompt_layer_repeated = repeat_kv_fn(key_prompt_layer, num_kv_groups)
             all_q_for_layer = torch.cat(self.captured_qs[layer_idx], dim=2)
             attn_logits = torch.matmul(all_q_for_layer, key_prompt_layer_repeated.transpose(-1, -2)) / math.sqrt(head_dim)
             all_layer_scores.append(attn_logits)
