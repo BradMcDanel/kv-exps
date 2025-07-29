@@ -73,16 +73,8 @@ def parse_method_name(folder_name):
     Returns:
         str: method_name
     """
-    # Clean up folder name to get method name
-    if folder_name.startswith("fullkv"):
-        return "fullkv"
-    elif folder_name.startswith("fastkv"):
-        return "fastkv"
-    elif folder_name.startswith("claa"):
-        return "claa"
-    else:
-        # For other methods, use the folder name as-is
-        return folder_name
+    # Return the folder name as-is to preserve full path information
+    return folder_name
 
 def calculate_category_averages(row, task_results):
     """Calculate average scores for each category."""
