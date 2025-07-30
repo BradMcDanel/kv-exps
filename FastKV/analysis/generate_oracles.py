@@ -38,10 +38,12 @@ def _patched_attention_forward_oracle(
     # This forward patch is used for both the initial prompt processing (prefill)
     # and the subsequent token generation (decode).
     batch_size, query_length, _ = hidden_states.size()
-    num_heads = self_attn.config.num_attention_heads
-    head_dim = self_attn.config.hidden_size // num_heads
-    num_key_value_heads = self_attn.config.num_key_value_heads
-    hidden_size = self_attn.config.hidden_size
+    
+    # Get dimensions from the actual attention module like FastKV does
+    num_heads = self_attn.num_heads  
+    head_dim = self_attn.head_dim
+    num_key_value_heads = self_attn.num_key_value_heads
+    hidden_size = num_heads * head_dim  # Calculate from actual dimensions
     num_key_value_groups = num_heads // num_key_value_heads
     
     query_projection = self_attn.q_proj(hidden_states)
@@ -203,7 +205,7 @@ class OracleGenerator:
             if not self.captured_qs[layer_idx] or prompt_only_cache_tuple[layer_idx][0].numel() == 0: continue
             key_prompt_layer = prompt_only_cache_tuple[layer_idx][0].detach()
             # Use appropriate repeat_kv function based on model type
-            repeat_kv_fn = mistral_repeat_kv if oracle_generator.is_mistral else llama_repeat_kv
+            repeat_kv_fn = mistral_repeat_kv if self.is_mistral else llama_repeat_kv
             key_prompt_layer_repeated = repeat_kv_fn(key_prompt_layer, num_kv_groups)
             all_q_for_layer = torch.cat(self.captured_qs[layer_idx], dim=2)
             attn_logits = torch.matmul(all_q_for_layer, key_prompt_layer_repeated.transpose(-1, -2)) / math.sqrt(head_dim)
@@ -361,8 +363,10 @@ def main():
             
             try:
                 oracle_ranking_tensor = generator.generate(inputs, max_gen)
-            except:
-                print(f"  -> Error: Failed to generate oracle ranking for sample {i}. Skipping.")
+            except Exception as e:
+                print(f"  -> Error: Failed to generate oracle ranking for sample {i}. Error: {e}")
+                import traceback
+                traceback.print_exc()
                 continue
             
             if oracle_ranking_tensor is not None and oracle_ranking_tensor.numel() > 0:
