@@ -9,7 +9,6 @@ from typing import List
 
 _prompt_len = None
 _score_buffer = []
-MIN_LAYER_FOR_COMPRESSION = 3
 
 def aggregate_rankings(
     all_rankings: list[torch.Tensor],
@@ -175,34 +174,26 @@ class CLAACluster():
             raise ValueError('Pooling method not supported')
 
         attn_cache = attn_cache.view(bsz, -1, num_key_value_groups, q_len-self.window_size).sum(dim=-2)
+        value_magnitudes = torch.linalg.vector_norm(value_states[:, :, :-self.window_size, :], ord=2, dim=-1, keepdim=False)
+        vmas_scores = attn_cache * value_magnitudes
+
 
         # update rolling attn_cache score buffer
         _score_buffer.append(attn_cache)
         if len(_score_buffer) > self.last_n_layers:
             _score_buffer.pop(0)
 
-        # KV compression
-        # if len(_score_buffer) >= self.last_n_layers:
-        if layer_idx > MIN_LAYER_FOR_COMPRESSION:
-            indices = attn_cache.topk(max_capacity_prompt - self.window_size, dim=-1).indices
-            indices = indices.unsqueeze(-1).expand(-1, -1, -1, head_dim)
-            k_past_compress = key_states[:, :, :-self.window_size, :].gather(dim = 2, index = indices)
-            v_past_compress = value_states[:, :, :-self.window_size, :].gather(dim = 2, index = indices)
-            k_cur = key_states[:, :, -self.window_size:, :]
-            v_cur = value_states[:, :, -self.window_size:, :]
-            key_states = torch.cat([k_past_compress, k_cur], dim = 2)
-            value_states = torch.cat([v_past_compress, v_cur], dim = 2)
+        indices = attn_cache.topk(max_capacity_prompt - self.window_size, dim=-1).indices
+        indices = indices.unsqueeze(-1).expand(-1, -1, -1, head_dim)
+        k_past_compress = key_states[:, :, :-self.window_size, :].gather(dim = 2, index = indices)
+        v_past_compress = value_states[:, :, :-self.window_size, :].gather(dim = 2, index = indices)
+        k_cur = key_states[:, :, -self.window_size:, :]
+        v_cur = value_states[:, :, -self.window_size:, :]
+        key_states = torch.cat([k_past_compress, k_cur], dim = 2)
+        value_states = torch.cat([v_past_compress, v_cur], dim = 2)
 
         if self.tsp_layer and (q_len > tsp_length):
-            all_rankings = []
-            for score_tensor in _score_buffer:
-                score = score_tensor.sum(dim=-2)
-                ranking = torch.argsort(score, dim=-1, descending=True)
-                all_rankings.append(ranking)
-
-
-            tsp_indices = aggregate_rankings(all_rankings, k=tsp_length-self.window_size, weighting_factor=1.3)
-
+            tsp_indices = vmas_scores.sum(dim=-2).topk(tsp_length - self.window_size, dim=-1).indices
             window_indices = torch.arange(q_len - self.window_size, q_len, device=tsp_indices.device).unsqueeze(0).repeat(bsz,1)
             tsp_indices = torch.cat([tsp_indices, window_indices], dim=-1)
             tsp_indices, _ = torch.sort(tsp_indices, dim=1)
