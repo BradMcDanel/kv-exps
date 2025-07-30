@@ -48,7 +48,6 @@ class MistralCLAAAttention(MistralFlashAttention2):
         if past_key_value is not None:
             cache_kwargs = {"sin": sin, "cos": cos}
             if q_len > 1:
-                # THE FIX: Use new variables for compressed states, exactly like Llama.
                 key_states_compress, value_states_compress, self.tsp_idx = self.kv_cluster.update_kv(
                     key_states, query_states, value_states, attention_mask, self.num_key_value_groups, self.layer_idx)
                 past_key_value.update(key_states_compress, value_states_compress, self.layer_idx, cache_kwargs)
@@ -80,7 +79,6 @@ class MistralCLAAAttention(MistralFlashAttention2):
         attn_output = self.o_proj(attn_output)
 
         return attn_output, None, past_key_value
-
 
 def mistral_decoderlayer_forward(
         self,
