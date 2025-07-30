@@ -87,7 +87,7 @@ def compress(model, args):
         model.model.layers[i].self_attn.kv_cluster.max_capacity_prompt_percentage = args.max_capacity_prompt_percentage
         model.model.layers[i].self_attn.kv_cluster.tsp_length = args.tsp_len
         model.model.layers[i].self_attn.kv_cluster.tsp_len_percentage = args.tsp_len_percentage
-        model.model.layers[i].self_attn.kv_cluster.last_n_layers = args.last_n_layers
+        model.model.layers[i].self_attn.kv_cluster.alpha = args.alpha
         if i == args.tsp_idx:
             model.model.layers[i].self_attn.kv_cluster.tsp_layer = True
             logging.info(f"CLAA: Set layer {i} as TSP layer")
@@ -103,7 +103,7 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
 
 
 class CLAACluster():
-    def __init__(self, window_size=8, max_capacity_prompt=512, kernel_size=7, pooling='avgpool', tsp_layer=False, tsp_length=2048, max_capacity_prompt_percentage=None, tsp_len_percentage=None, last_n_layers=None):
+    def __init__(self, window_size=8, max_capacity_prompt=512, kernel_size=7, pooling='avgpool', tsp_layer=False, tsp_length=2048, max_capacity_prompt_percentage=None, tsp_len_percentage=None, alpha=1.0):
         self.window_size = window_size
         self.max_capacity_prompt = max_capacity_prompt
         self.max_capacity_prompt_percentage = max_capacity_prompt_percentage
@@ -114,9 +114,9 @@ class CLAACluster():
         self.tsp_layer = tsp_layer
         self.tsp_length = tsp_length
         self.tsp_len_percentage = tsp_len_percentage
-        self.last_n_layers = last_n_layers
+        self.alpha = alpha
 
-    def reset(self, window_size=8, max_capacity_prompt=512, kernel_size=7, pooling='avgpool', tsp_layer=False, tsp_length=2048, max_capacity_prompt_percentage=None, tsp_len_percentage=None, last_n_layers=None):
+    def reset(self, window_size=8, max_capacity_prompt=512, kernel_size=7, pooling='avgpool', tsp_layer=False, tsp_length=2048, max_capacity_prompt_percentage=None, tsp_len_percentage=None, alpha=1.0):
         self.window_size = window_size
         self.max_capacity_prompt = max_capacity_prompt
         self.max_capacity_prompt_percentage = max_capacity_prompt_percentage
@@ -127,7 +127,7 @@ class CLAACluster():
         self.tsp_layer = tsp_layer
         self.tsp_length = tsp_length
         self.tsp_len_percentage = tsp_len_percentage
-        self.last_n_layers = last_n_layers
+        self.alpha = alpha
 
     def update_kv(self, key_states, query_states, value_states, attention_mask, num_key_value_groups, layer_idx, **kwargs):
         bsz, _, q_len, head_dim = query_states.shape
@@ -175,13 +175,11 @@ class CLAACluster():
 
         attn_cache = attn_cache.view(bsz, -1, num_key_value_groups, q_len-self.window_size).sum(dim=-2)
         value_magnitudes = torch.linalg.vector_norm(value_states[:, :, :-self.window_size, :], ord=2, dim=-1, keepdim=False)
+        value_magnitudes = value_magnitudes.pow(self.alpha)
         vmas_scores = attn_cache * value_magnitudes
 
-
-        # update rolling attn_cache score buffer
+        # Store attention cache scores for potential aggregation
         _score_buffer.append(attn_cache)
-        if len(_score_buffer) > self.last_n_layers:
-            _score_buffer.pop(0)
 
         indices = attn_cache.topk(max_capacity_prompt - self.window_size, dim=-1).indices
         indices = indices.unsqueeze(-1).expand(-1, -1, -1, head_dim)
