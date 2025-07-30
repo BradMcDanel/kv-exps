@@ -10,6 +10,65 @@ from typing import List
 _prompt_len = None
 _score_buffer = []
 
+def aggregate_rankings(
+    all_rankings: list[torch.Tensor],
+    k: int,
+    weighting_factor: float = 2.0
+) -> torch.Tensor:
+    """
+    Aggregates multiple rankings into a single top-k list using a weighted
+    rank sum method, prioritizing later rankings in the list.
+
+    Args:
+        all_rankings: A list of ranking tensors. Each tensor is of shape
+                      [batch_size, num_items] and contains the sorted indices
+                      of items (from best to worst).
+        k: The number of top indices to return.
+        weighting_factor: Later rankings are weighted `weighting_factor` times
+                          more than the one before.
+
+    Returns:
+        A tensor of shape [batch_size, k] with the final top-k indices.
+    """
+    if not all_rankings:
+        return torch.tensor([], dtype=torch.long)
+
+    num_layers = len(all_rankings)
+    bsz, num_items = all_rankings[0].shape
+    device = all_rankings[0].device
+
+    # Create weights that increase geometrically for later layers
+    # e.g., for 3 layers, weights are [1, 2, 4] before normalization
+    weights = torch.pow(weighting_factor, torch.arange(num_layers, device=device))
+
+    # This will hold the final aggregated score for each item (lower is better)
+    final_scores = torch.zeros(bsz, num_items, device=device)
+    
+    # This tensor represents the rank values [0, 1, 2, ..., N-1]
+    # We will use it to assign a score to each item based on its position.
+    rank_values = torch.arange(num_items, device=device, dtype=torch.float32).expand(bsz, -1)
+
+    for i, ranking_tensor in enumerate(all_rankings):
+        # `ranking_tensor` tells us which item is at which rank.
+        # We need the inverse: what is the rank of a given item?
+        # We use `scatter_` to efficiently create this inverse mapping.
+        ranks = torch.empty_like(ranking_tensor, dtype=torch.float32)
+        
+        # This operation says: for each item in `ranking_tensor`, place the
+        # corresponding `rank_values` into the `ranks` tensor at that item's index.
+        ranks.scatter_(dim=-1, index=ranking_tensor, src=rank_values)
+        # Now, `ranks[b, j]` gives the rank of item `j` in batch `b` for this layer.
+
+        # Add the weighted rank to the final scores
+        final_scores += weights[i] * ranks
+
+    # Sort the aggregated scores in ascending order (lower score is better)
+    # and take the top k indices.
+    top_k_indices = torch.topk(final_scores, k=k, dim=-1, largest=False).indices
+    
+    return top_k_indices
+
+
 def compress(model, args): 
     layers = len(model.model.layers)
     
@@ -122,25 +181,25 @@ class CLAACluster():
             _score_buffer.pop(0)
 
         # KV compression
-        if len(_score_buffer) >= self.last_n_layers:
-            indices = attn_cache.topk(max_capacity_prompt - self.window_size, dim=-1).indices
-            indices = indices.unsqueeze(-1).expand(-1, -1, -1, head_dim)
-            k_past_compress = key_states[:, :, :-self.window_size, :].gather(dim = 2, index = indices)
-            v_past_compress = value_states[:, :, :-self.window_size, :].gather(dim = 2, index = indices)
-            k_cur = key_states[:, :, -self.window_size:, :]
-            v_cur = value_states[:, :, -self.window_size:, :]
-            key_states = torch.cat([k_past_compress, k_cur], dim = 2)
-            value_states = torch.cat([v_past_compress, v_cur], dim = 2)
+        # if len(_score_buffer) >= self.last_n_layers:
+        indices = attn_cache.topk(max_capacity_prompt - self.window_size, dim=-1).indices
+        indices = indices.unsqueeze(-1).expand(-1, -1, -1, head_dim)
+        k_past_compress = key_states[:, :, :-self.window_size, :].gather(dim = 2, index = indices)
+        v_past_compress = value_states[:, :, :-self.window_size, :].gather(dim = 2, index = indices)
+        k_cur = key_states[:, :, -self.window_size:, :]
+        v_cur = value_states[:, :, -self.window_size:, :]
+        key_states = torch.cat([k_past_compress, k_cur], dim = 2)
+        value_states = torch.cat([v_past_compress, v_cur], dim = 2)
 
         if self.tsp_layer and (q_len > tsp_length):
-            # CLAA
-            scores_tensor = torch.stack(_score_buffer, dim=1)
-            flattened_scores = scores_tensor.flatten(start_dim=1, end_dim=2)
-            final_token_importance, _ = flattened_scores.max(dim=1)
-            tsp_indices = final_token_importance.topk(tsp_length - self.window_size, dim=-1).indices
+            all_rankings = []
+            for score_tensor in _score_buffer:
+                score = score_tensor.sum(dim=-2)
+                ranking = torch.argsort(score, dim=-1, descending=True)
+                all_rankings.append(ranking)
 
-            # FastKV (for comparison)
-            # tsp_indices = attn_cache.sum(dim=-2).topk(tsp_length - self.window_size, dim=-1).indices
+
+            tsp_indices = aggregate_rankings(all_rankings, k=tsp_length-self.window_size, weighting_factor=1.3)
 
             window_indices = torch.arange(q_len - self.window_size, q_len, device=tsp_indices.device).unsqueeze(0).repeat(bsz,1)
             tsp_indices = torch.cat([tsp_indices, window_indices], dim=-1)
