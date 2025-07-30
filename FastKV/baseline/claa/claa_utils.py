@@ -9,6 +9,7 @@ from typing import List
 
 _prompt_len = None
 _score_buffer = []
+MIN_LAYER_FOR_COMPRESSION = 3
 
 def aggregate_rankings(
     all_rankings: list[torch.Tensor],
@@ -182,14 +183,15 @@ class CLAACluster():
 
         # KV compression
         # if len(_score_buffer) >= self.last_n_layers:
-        indices = attn_cache.topk(max_capacity_prompt - self.window_size, dim=-1).indices
-        indices = indices.unsqueeze(-1).expand(-1, -1, -1, head_dim)
-        k_past_compress = key_states[:, :, :-self.window_size, :].gather(dim = 2, index = indices)
-        v_past_compress = value_states[:, :, :-self.window_size, :].gather(dim = 2, index = indices)
-        k_cur = key_states[:, :, -self.window_size:, :]
-        v_cur = value_states[:, :, -self.window_size:, :]
-        key_states = torch.cat([k_past_compress, k_cur], dim = 2)
-        value_states = torch.cat([v_past_compress, v_cur], dim = 2)
+        if layer_idx > MIN_LAYER_FOR_COMPRESSION:
+            indices = attn_cache.topk(max_capacity_prompt - self.window_size, dim=-1).indices
+            indices = indices.unsqueeze(-1).expand(-1, -1, -1, head_dim)
+            k_past_compress = key_states[:, :, :-self.window_size, :].gather(dim = 2, index = indices)
+            v_past_compress = value_states[:, :, :-self.window_size, :].gather(dim = 2, index = indices)
+            k_cur = key_states[:, :, -self.window_size:, :]
+            v_cur = value_states[:, :, -self.window_size:, :]
+            key_states = torch.cat([k_past_compress, k_cur], dim = 2)
+            value_states = torch.cat([v_past_compress, v_cur], dim = 2)
 
         if self.tsp_layer and (q_len > tsp_length):
             all_rankings = []
