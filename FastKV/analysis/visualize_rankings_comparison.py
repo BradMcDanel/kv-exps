@@ -51,8 +51,7 @@ def generate_dummy_data() -> Dict[str, Any]:
         all_data['8B'][ds_name] = {
             'sample_0': {
                 'fastkv_rankings': {i: np.random.rand(4096) * 0.05 + 0.08 for i in range(32)},
-                'gemfilter_rankings': {i: np.random.rand(4096) * 0.06 + 0.07 for i in range(32)},
-                'claa_rankings': {i: np.random.rand(4096) * 0.04 + 0.09 for i in range(32)}
+                'gemfilter_rankings': {i: np.random.rand(4096) * 0.06 + 0.07 for i in range(32)}
             }
         }
         all_data['1B'][ds_name] = {
@@ -81,18 +80,14 @@ def load_all_data(
 PLOT_STYLES = {
     'gemfilter':    {'color': METHOD_COLORS['GemFilter'], 'linestyle': '-', 'marker': 's', 'markersize': 4, 'label': 'GemFilter'},
     'fastkv':       {'color': METHOD_COLORS['FastKV'], 'linestyle': '-', 'marker': 'o', 'label': 'FastKV'},
-    'claa':         {'color': METHOD_COLORS['CLAA'], 'linestyle': '-', 'marker': '^', 'markersize': 6, 'label': 'CLAA (Ours)'},
     'spec_prefill': {'color': METHOD_COLORS['Speculative'], 'linestyle': '--', 'label': 'Spec. Prefill'},
 }
 
 def plot_methods_on_ax(ax, accuracies: Dict):
     """Helper function to plot all ranking methods on a given Matplotlib axis."""
-    for method in ['gemfilter', 'fastkv', 'claa']:
+    for method in ['gemfilter', 'fastkv']:
         if method in accuracies and accuracies[method]:
             sorted_keys = sorted(accuracies[method].keys())
-            # For CLAA, remove first 3 layers (0, 1, 2) as they are invalid settings
-            if method == 'claa':
-                sorted_keys = [k for k in sorted_keys if k >= 3]
             ax.plot(sorted_keys, [accuracies[method][k] for k in sorted_keys], **PLOT_STYLES[method])
     if 'spec_prefill' in accuracies:
         ax.axhline(y=accuracies['spec_prefill'], **PLOT_STYLES['spec_prefill'])
@@ -101,7 +96,7 @@ def create_appendix_legend(fig, gs_spec):
     """Creates a shared legend for the appendix figure."""
     legend_ax = fig.add_subplot(gs_spec)
     legend_ax.axis('off')
-    handle_keys = ['gemfilter', 'fastkv', 'spec_prefill', 'claa']
+    handle_keys = ['gemfilter', 'fastkv', 'spec_prefill']
     handles = [plt.Line2D([0], [0], **{k:v for k,v in PLOT_STYLES[key].items() if k != 'label'}) for key in handle_keys]
     labels = [PLOT_STYLES[key]['label'] for key in handle_keys]
     legend_ax.legend(handles, labels, loc='center', ncol=1, frameon=True, facecolor='white', framealpha=0.9, fontsize=24, title_fontsize=26)
@@ -124,7 +119,7 @@ def plot_paper_version(aggregated_accuracies: Dict, k_percentage: float, global_
         ax.set_xticks([0, 8, 16, 24, 31])
         ax.grid(True, which='major', linestyle=':', linewidth=0.6)
 
-    handle_keys = ['gemfilter', 'fastkv', 'spec_prefill', 'claa']
+    handle_keys = ['gemfilter', 'fastkv', 'spec_prefill']
     handles = [plt.Line2D([0], [0], **{k:v for k,v in PLOT_STYLES[key].items() if k != 'label'}) for key in handle_keys]
     labels = [PLOT_STYLES[key]['label'] for key in handle_keys]
     axes.flat[-1].legend(handles, labels, loc='lower right', ncol=1,
