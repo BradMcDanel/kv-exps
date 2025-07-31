@@ -15,8 +15,6 @@ import torch
 import pandas as pd
 from scipy.stats import spearmanr
 
-
-
 # --- DATA LOADING AND PROCESSING UTILITIES ---
 
 def load_npz_data_for_dataset(base_path: str, model_name: str, dataset_name: str) -> Dict[str, Any]:
@@ -339,6 +337,7 @@ def compute_adaptive_exit_metrics_for_dataset(
         'avg_fixed_accuracy': np.mean(fixed_accuracies),
     }
 
+
 def get_per_sample_accuracies_long_form(dataset_name: str, all_results: dict) -> pd.DataFrame:
     """
     Calculates per-sample Spearman correlations and returns them in a long-form DataFrame.
@@ -353,40 +352,54 @@ def get_per_sample_accuracies_long_form(dataset_name: str, all_results: dict) ->
 
     records = []
     
-    for sample_key, oracle_sample in oracle_data.items():
-        oracle_ranking = oracle_sample.get('ranking')
-        if oracle_ranking is None: continue
+    # Get the intersection of sample keys available for all models
+    common_keys = set(oracle_data.keys()) & set(approx_8b_data.keys()) & set(approx_1b_data.keys())
+    
+    for sample_key in common_keys:
+        oracle_sample = oracle_data[sample_key]
+        approx_sample_8b = approx_8b_data[sample_key]
+        approx_sample_1b = approx_1b_data[sample_key]
 
-        approx_sample_8b = approx_8b_data.get(sample_key, {})
-        approx_sample_1b = approx_1b_data.get(sample_key, {})
+        # Use the existing helper function to deserialize data in-place
+        deserialize_rankings_in_sample(approx_sample_8b)
+        deserialize_rankings_in_sample(approx_sample_1b)
+        
+        oracle_ranking = oracle_sample.get('ranking')
+        if oracle_ranking is None: 
+            continue
 
         # Process GemFilter and FastKV
         for method_key in ['gemfilter_rankings', 'fastkv_rankings']:
             method_name = method_key.split('_')[0].capitalize()
-            if method_key in approx_sample_8b:
-                for layer, approx_ranking in approx_sample_8b[method_key].items():
+            rankings_dict = approx_sample_8b.get(method_key)
+            
+            if rankings_dict:
+                for layer, approx_ranking in rankings_dict.items():
                     if oracle_ranking.shape == approx_ranking.shape:
                         corr, _ = spearmanr(oracle_ranking, approx_ranking)
                         records.append({
                             'dataset': dataset_name,
                             'sample': sample_key,
                             'method': method_name,
-                            'layer': layer,
-                            'correlation': corr
+                            'layer': int(layer),
+                            'correlation': corr if not np.isnan(corr) else 0.0
                         })
 
         # Process Speculative Prefill
-        if 'speculative_rankings' in approx_sample_1b:
-            # For SpecPrefill, the value is constant across layers, so we add it for each layer
-            # to make plotting easier with seaborn.
-            spec_corr, _ = spearmanr(oracle_ranking, approx_sample_1b['speculative_rankings'])
-            for layer in range(32): # Assuming 32 layers for Llama 8B
-                 records.append({
-                    'dataset': dataset_name,
-                    'sample': sample_key,
-                    'method': 'SpecPrefill',
-                    'layer': layer,
-                    'correlation': spec_corr
-                })
+        spec_rankings_dict = approx_sample_1b.get('speculative_rankings')
+        if spec_rankings_dict:
+            # We will use the k=8 result to be consistent with other analyses
+            spec_ranking = spec_rankings_dict.get(8) 
+            if spec_ranking is not None and oracle_ranking.shape == spec_ranking.shape:
+                spec_corr, _ = spearmanr(oracle_ranking, spec_ranking)
+                if not np.isnan(spec_corr):
+                    for layer in range(32): # Duplicate the constant value for all layers for plotting
+                         records.append({
+                            'dataset': dataset_name,
+                            'sample': sample_key,
+                            'method': 'SpecPrefill',
+                            'layer': layer,
+                            'correlation': spec_corr
+                        })
 
     return pd.DataFrame(records)
