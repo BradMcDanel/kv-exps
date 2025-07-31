@@ -337,7 +337,6 @@ def compute_adaptive_exit_metrics_for_dataset(
         'avg_fixed_accuracy': np.mean(fixed_accuracies),
     }
 
-
 def get_per_sample_accuracies_long_form(dataset_name: str, all_results: dict) -> pd.DataFrame:
     """
     Calculates per-sample Spearman correlations and returns them in a long-form DataFrame.
@@ -368,9 +367,18 @@ def get_per_sample_accuracies_long_form(dataset_name: str, all_results: dict) ->
         if oracle_ranking is None: 
             continue
 
+        # --- START OF FIX ---
+        # Define an explicit map for method names to avoid capitalization issues
+        method_name_map = {
+            'gemfilter_rankings': 'GemFilter',
+            'fastkv_rankings': 'FastKV'
+        }
+        # --- END OF FIX ---
+
         # Process GemFilter and FastKV
         for method_key in ['gemfilter_rankings', 'fastkv_rankings']:
-            method_name = method_key.split('_')[0].capitalize()
+            # Use the map to get the correct, capitalized name
+            method_name = method_name_map[method_key]
             rankings_dict = approx_sample_8b.get(method_key)
             
             if rankings_dict:
@@ -403,3 +411,4 @@ def get_per_sample_accuracies_long_form(dataset_name: str, all_results: dict) ->
                         })
 
     return pd.DataFrame(records)
+
