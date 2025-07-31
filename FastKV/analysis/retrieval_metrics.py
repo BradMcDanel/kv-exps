@@ -341,6 +341,7 @@ def get_per_sample_accuracies_long_form(dataset_name: str, all_results: dict) ->
     """
     Calculates per-sample Spearman correlations and returns them in a long-form DataFrame.
     This format is ideal for plotting with seaborn to show variance.
+    This version is robust to minor length mismatches in rankings.
     """
     oracle_data = all_results.get('oracle', {}).get(dataset_name, {})
     approx_8b_data = all_results.get('8B', {}).get(dataset_name, {})
@@ -359,7 +360,6 @@ def get_per_sample_accuracies_long_form(dataset_name: str, all_results: dict) ->
         approx_sample_8b = approx_8b_data[sample_key]
         approx_sample_1b = approx_1b_data[sample_key]
 
-        # Use the existing helper function to deserialize data in-place
         deserialize_rankings_in_sample(approx_sample_8b)
         deserialize_rankings_in_sample(approx_sample_1b)
         
@@ -367,48 +367,48 @@ def get_per_sample_accuracies_long_form(dataset_name: str, all_results: dict) ->
         if oracle_ranking is None: 
             continue
 
-        # --- START OF FIX ---
-        # Define an explicit map for method names to avoid capitalization issues
         method_name_map = {
             'gemfilter_rankings': 'GemFilter',
             'fastkv_rankings': 'FastKV'
         }
-        # --- END OF FIX ---
 
         # Process GemFilter and FastKV
         for method_key in ['gemfilter_rankings', 'fastkv_rankings']:
-            # Use the map to get the correct, capitalized name
-            method_name = method_name_map[method_key]
+            method_name = method_name_map.get(method_key)
             rankings_dict = approx_sample_8b.get(method_key)
             
             if rankings_dict:
                 for layer, approx_ranking in rankings_dict.items():
-                    if oracle_ranking.shape == approx_ranking.shape:
-                        corr, _ = spearmanr(oracle_ranking, approx_ranking)
-                        records.append({
-                            'dataset': dataset_name,
-                            'sample': sample_key,
-                            'method': method_name,
-                            'layer': int(layer),
-                            'correlation': corr if not np.isnan(corr) else 0.0
-                        })
+                    min_len = min(len(oracle_ranking), len(approx_ranking))
+                    if min_len < 2:  # Need at least 2 points for correlation
+                        continue
+                    
+                    corr, _ = spearmanr(oracle_ranking[:min_len], approx_ranking[:min_len])
+                    
+                    records.append({
+                        'dataset': dataset_name,
+                        'sample': sample_key,
+                        'method': method_name,
+                        'layer': int(layer),
+                        'correlation': corr if not np.isnan(corr) else 0.0
+                    })
 
         # Process Speculative Prefill
         spec_rankings_dict = approx_sample_1b.get('speculative_rankings')
         if spec_rankings_dict:
-            # We will use the k=8 result to be consistent with other analyses
             spec_ranking = spec_rankings_dict.get(8) 
-            if spec_ranking is not None and oracle_ranking.shape == spec_ranking.shape:
-                spec_corr, _ = spearmanr(oracle_ranking, spec_ranking)
-                if not np.isnan(spec_corr):
-                    for layer in range(32): # Duplicate the constant value for all layers for plotting
-                         records.append({
-                            'dataset': dataset_name,
-                            'sample': sample_key,
-                            'method': 'SpecPrefill',
-                            'layer': layer,
-                            'correlation': spec_corr
-                        })
+            if spec_ranking is not None:
+                min_len = min(len(oracle_ranking), len(spec_ranking))
+                if min_len >= 2:
+                    spec_corr, _ = spearmanr(oracle_ranking[:min_len], spec_ranking[:min_len])
+                    if not np.isnan(spec_corr):
+                        for layer in range(32): # Duplicate for plotting
+                            records.append({
+                                'dataset': dataset_name,
+                                'sample': sample_key,
+                                'method': 'SpecPrefill',
+                                'layer': layer,
+                                'correlation': spec_corr
+                            })
 
     return pd.DataFrame(records)
-
