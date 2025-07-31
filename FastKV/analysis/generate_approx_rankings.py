@@ -301,28 +301,40 @@ def _patched_attention_forward_claa(
         key_states_rotated, value_states_for_cache, self_attn.layer_idx, {"cache_position": cache_position}
     )
     
-    # --- CLAA (VMAS) Ranking Logic ---
     if query_length > generator_obj.window_size:
-        # 1. Calculate QK Relevance Signal (using pre-softmax scores)
+        # 1. Calculate QK Relevance Signal (using POST-softmax probabilities)
         query_window = query_states_rotated[..., -generator_obj.window_size:, :]
-        key_prompt = hf_repeat_kv(key_states_for_sdpa[..., :-generator_obj.window_size, :], num_key_value_groups)
         
-        # Use raw dot-product scores (pre-softmax) for relevance
-        raw_qk_scores = torch.matmul(query_window, key_prompt.transpose(-1, -2))
-        relevance_signal = raw_qk_scores.sum(dim=-2) # Sum over queries in the window
+        # We need the FULL key tensor for correct softmax normalization context
+        key_full_repeated = hf_repeat_kv(key_states_for_sdpa, num_key_value_groups)
+        
+        # Calculate logits between the window queries and ALL keys
+        attn_logits = torch.matmul(query_window, key_full_repeated.transpose(-1, -2)) / math.sqrt(head_dim)
+        
+        # Apply causal mask to the window-to-window part to avoid leakage
+        # This is a small detail but good practice
+        mask = torch.full((generator_obj.window_size, generator_obj.window_size), torch.finfo(attn_logits.dtype).min, device=attn_logits.device)
+        mask_cond = torch.arange(mask.size(-1), device=attn_logits.device)
+        mask.masked_fill_(mask_cond < (mask_cond + 1).view(mask.size(-1), 1), 0)
+        attn_logits[..., -generator_obj.window_size:, -generator_obj.window_size:] += mask
+        
+        # Normalize over the full key length to get meaningful probabilities
+        attn_probs = F.softmax(attn_logits, dim=-1, dtype=torch.float32).to(query_states_rotated.dtype)
+        
+        # Now, sum the probabilities corresponding ONLY to the prompt tokens
+        relevance_signal = attn_probs[..., :-generator_obj.window_size].sum(dim=-2) # Sum over query window
         
         # Apply pooling if specified
         if generator_obj.pooling != 'none':
              relevance_signal = F.avg_pool1d(relevance_signal, kernel_size=generator_obj.kernel_size, padding=generator_obj.kernel_size//2, stride=1)
 
-        # 2. Calculate Value Substance Signal
+        # 2. Calculate Value Substance Signal (this part was correct)
         value_prompt = value_states_for_sdpa[..., :-generator_obj.window_size, :]
         value_magnitudes = torch.linalg.vector_norm(value_prompt, ord=2, dim=-1)
         
         # 3. Combine signals with alpha to get the final VMAS score
-        # Note: Summing over heads (dim=1) for both signals before multiplying
-        relevance_per_token = relevance_signal.sum(dim=1)
-        substance_per_token = value_magnitudes.sum(dim=1).pow(generator_obj.alpha)
+        relevance_per_token = relevance_signal.sum(dim=1) # Sum over heads
+        substance_per_token = value_magnitudes.sum(dim=1).pow(generator_obj.alpha) # Sum over KV heads
         
         final_scores = relevance_per_token * substance_per_token
         
@@ -348,7 +360,6 @@ def _patched_attention_forward_claa(
     attention_output = self_attn.o_proj(attention_output)
     
     return attention_output, None, past_key_value
-
 
 class CLAARankingGenerator(BaseRankingGenerator):
     def __init__(self, model: AutoModelForCausalLM, tokenizer: AutoTokenizer, args: argparse.Namespace):
