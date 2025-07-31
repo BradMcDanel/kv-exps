@@ -12,6 +12,7 @@ from collections import defaultdict
 
 import numpy as np
 import torch
+import pandas as pd
 from scipy.stats import spearmanr
 
 
@@ -337,3 +338,55 @@ def compute_adaptive_exit_metrics_for_dataset(
         'avg_adaptive_accuracy': np.mean(adaptive_accuracies),
         'avg_fixed_accuracy': np.mean(fixed_accuracies),
     }
+
+def get_per_sample_accuracies_long_form(dataset_name: str, all_results: dict) -> pd.DataFrame:
+    """
+    Calculates per-sample Spearman correlations and returns them in a long-form DataFrame.
+    This format is ideal for plotting with seaborn to show variance.
+    """
+    oracle_data = all_results.get('oracle', {}).get(dataset_name, {})
+    approx_8b_data = all_results.get('8B', {}).get(dataset_name, {})
+    approx_1b_data = all_results.get('1B', {}).get(dataset_name, {})
+
+    if not oracle_data or (not approx_8b_data and not approx_1b_data):
+        return pd.DataFrame()
+
+    records = []
+    
+    for sample_key, oracle_sample in oracle_data.items():
+        oracle_ranking = oracle_sample.get('ranking')
+        if oracle_ranking is None: continue
+
+        approx_sample_8b = approx_8b_data.get(sample_key, {})
+        approx_sample_1b = approx_1b_data.get(sample_key, {})
+
+        # Process GemFilter and FastKV
+        for method_key in ['gemfilter_rankings', 'fastkv_rankings']:
+            method_name = method_key.split('_')[0].capitalize()
+            if method_key in approx_sample_8b:
+                for layer, approx_ranking in approx_sample_8b[method_key].items():
+                    if oracle_ranking.shape == approx_ranking.shape:
+                        corr, _ = spearmanr(oracle_ranking, approx_ranking)
+                        records.append({
+                            'dataset': dataset_name,
+                            'sample': sample_key,
+                            'method': method_name,
+                            'layer': layer,
+                            'correlation': corr
+                        })
+
+        # Process Speculative Prefill
+        if 'speculative_rankings' in approx_sample_1b:
+            # For SpecPrefill, the value is constant across layers, so we add it for each layer
+            # to make plotting easier with seaborn.
+            spec_corr, _ = spearmanr(oracle_ranking, approx_sample_1b['speculative_rankings'])
+            for layer in range(32): # Assuming 32 layers for Llama 8B
+                 records.append({
+                    'dataset': dataset_name,
+                    'sample': sample_key,
+                    'method': 'SpecPrefill',
+                    'layer': layer,
+                    'correlation': spec_corr
+                })
+
+    return pd.DataFrame(records)
