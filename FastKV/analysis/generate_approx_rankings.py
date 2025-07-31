@@ -41,7 +41,7 @@ class BaseRankingGenerator:
                 layer.self_attn.forward = self.orig_fwds[i]
         self.orig_fwds.clear()
 
-# --- Strategy 1: FastKV (OPTIMIZED) ---
+# --- Strategy 1: FastKV ---
 
 def _patched_attention_forward_fastkv(
     self_attn: LlamaAttention,
@@ -79,7 +79,6 @@ def _patched_attention_forward_fastkv(
     key_states_for_sdpa = hf_repeat_kv(key_states_for_sdpa, num_key_value_groups)
     value_states_for_sdpa = hf_repeat_kv(value_states_for_sdpa, num_key_value_groups)
     
-    # OPTIMIZATION: This now runs for every layer and stores the result in a shared dictionary.
     if query_length > generator_obj.window_size:
         attn_weights = torch.matmul(query_states_rotated[..., -generator_obj.window_size:, :], key_states_for_sdpa.transpose(-1, -2)) / math.sqrt(head_dim)
         
@@ -100,7 +99,6 @@ def _patched_attention_forward_fastkv(
             
         if len(attn_cache.shape) == 3:
             final_scores = attn_cache.sum(dim=1)
-            # OPTIMIZATION: Store score in the central dict, keyed by layer index.
             generator_obj.all_scores[self_attn.layer_idx] = final_scores.squeeze(0)
         else:
             generator_obj.all_scores[self_attn.layer_idx] = attn_cache.squeeze(0)
@@ -128,11 +126,9 @@ class FastKVRankingGenerator(BaseRankingGenerator):
         self.window_size = args.window_size
         self.kernel_size = args.kernel_size
         self.pooling = args.pooling
-        # OPTIMIZATION: Central dictionary to hold scores from all layers.
         self.all_scores: Dict[int, torch.Tensor] = {}
         
     def _patch_all_layers(self):
-        # OPTIMIZATION: Patch all layers at once before the forward pass.
         for i, layer in enumerate(self.model.model.layers):
             if hasattr(layer, 'self_attn') and isinstance(layer.self_attn, LlamaAttention):
                 attn_module = layer.self_attn
@@ -143,7 +139,6 @@ class FastKVRankingGenerator(BaseRankingGenerator):
 
     @torch.no_grad()
     def generate_rankings(self, inputs: Dict[str, torch.Tensor]) -> Dict[int, torch.Tensor]:
-        # OPTIMIZATION: No longer loops over layers. Performs one pass.
         self.all_scores.clear()
         input_ids = inputs['input_ids']
         prompt_length = input_ids.shape[1]
@@ -151,7 +146,6 @@ class FastKVRankingGenerator(BaseRankingGenerator):
         self._patch_all_layers()
         
         try:
-            # OPTIMIZATION: Run a single forward pass to compute scores for all layers.
             position_ids = torch.arange(prompt_length, device=self.device).unsqueeze(0)
             with torch.no_grad():
                 _ = self.model(input_ids=input_ids, position_ids=position_ids, use_cache=True)
@@ -164,7 +158,7 @@ class FastKVRankingGenerator(BaseRankingGenerator):
         
         return self.all_scores.copy()
 
-# --- Strategy 2: GemFilter (OPTIMIZED) ---
+# --- Strategy 2: GemFilter ---
 
 def _patched_attention_forward_gemfilter(
     self_attn: LlamaAttention,
@@ -202,7 +196,6 @@ def _patched_attention_forward_gemfilter(
     key_states_for_sdpa = hf_repeat_kv(key_states_for_sdpa, num_key_value_groups)
     value_states_for_sdpa = hf_repeat_kv(value_states_for_sdpa, num_key_value_groups)
     
-    # OPTIMIZATION: This now runs for every layer and stores the result in a shared dictionary.
     if query_length >= 1:
         query_last_states = query_states_rotated[:, :, -1:, :]
         key_states_repeat = key_states_for_sdpa
@@ -218,7 +211,6 @@ def _patched_attention_forward_gemfilter(
             padding=generator_obj.kernel_size//2, 
             stride=1
         )
-        # OPTIMIZATION: Store score in the central dict, keyed by layer index.
         generator_obj.all_scores[self_attn.layer_idx] = pooled_scores.squeeze(0).squeeze(0)
     
     attn_mask_input = attention_mask
@@ -242,11 +234,9 @@ class GemFilterRankingGenerator(BaseRankingGenerator):
     def __init__(self, model: AutoModelForCausalLM, tokenizer: AutoTokenizer, args: argparse.Namespace):
         super().__init__(model, tokenizer, args)
         self.kernel_size = args.kernel_size
-        # OPTIMIZATION: Central dictionary to hold scores from all layers.
         self.all_scores: Dict[int, torch.Tensor] = {}
         
     def _patch_all_layers(self):
-        # OPTIMIZATION: Patch all layers at once before the forward pass.
         for i, layer in enumerate(self.model.model.layers):
             if hasattr(layer, 'self_attn') and isinstance(layer.self_attn, LlamaAttention):
                 attn_module = layer.self_attn
@@ -257,7 +247,6 @@ class GemFilterRankingGenerator(BaseRankingGenerator):
 
     @torch.no_grad()
     def generate_rankings(self, inputs: Dict[str, torch.Tensor]) -> Dict[int, torch.Tensor]:
-        # OPTIMIZATION: No longer loops over layers. Performs one pass.
         self.all_scores.clear()
         input_ids = inputs['input_ids']
         prompt_length = input_ids.shape[1]
@@ -265,7 +254,6 @@ class GemFilterRankingGenerator(BaseRankingGenerator):
         self._patch_all_layers()
         
         try:
-            # OPTIMIZATION: Run a single forward pass to compute scores for all layers.
             position_ids = torch.arange(prompt_length, device=self.device).unsqueeze(0)
             with torch.no_grad():
                 _ = self.model(input_ids=input_ids, position_ids=position_ids, use_cache=True)
@@ -278,8 +266,6 @@ class GemFilterRankingGenerator(BaseRankingGenerator):
         
         return self.all_scores.copy()
 
-
-# --- Strategy 3: CLAA (OPTIMIZED) ---
 
 def _patched_attention_forward_claa(
     self_attn: LlamaAttention,
@@ -314,42 +300,38 @@ def _patched_attention_forward_claa(
     key_states_for_sdpa, value_states_for_sdpa = past_key_value.update(
         key_states_rotated, value_states_for_cache, self_attn.layer_idx, {"cache_position": cache_position}
     )
+    
+    # --- CLAA (VMAS) Ranking Logic ---
+    if query_length > generator_obj.window_size:
+        # 1. Calculate QK Relevance Signal (using pre-softmax scores)
+        query_window = query_states_rotated[..., -generator_obj.window_size:, :]
+        key_prompt = hf_repeat_kv(key_states_for_sdpa[..., :-generator_obj.window_size, :], num_key_value_groups)
+        
+        # Use raw dot-product scores (pre-softmax) for relevance
+        raw_qk_scores = torch.matmul(query_window, key_prompt.transpose(-1, -2))
+        relevance_signal = raw_qk_scores.sum(dim=-2) # Sum over queries in the window
+        
+        # Apply pooling if specified
+        if generator_obj.pooling != 'none':
+             relevance_signal = F.avg_pool1d(relevance_signal, kernel_size=generator_obj.kernel_size, padding=generator_obj.kernel_size//2, stride=1)
+
+        # 2. Calculate Value Substance Signal
+        value_prompt = value_states_for_sdpa[..., :-generator_obj.window_size, :]
+        value_magnitudes = torch.linalg.vector_norm(value_prompt, ord=2, dim=-1)
+        
+        # 3. Combine signals with alpha to get the final VMAS score
+        # Note: Summing over heads (dim=1) for both signals before multiplying
+        relevance_per_token = relevance_signal.sum(dim=1)
+        substance_per_token = value_magnitudes.sum(dim=1).pow(generator_obj.alpha)
+        
+        final_scores = relevance_per_token * substance_per_token
+        
+        # Store the final score in the central dictionary
+        generator_obj.all_scores[self_attn.layer_idx] = final_scores.squeeze(0)
+
+    # --- Standard Attention Forward Pass (for model output) ---
     key_states_for_sdpa = hf_repeat_kv(key_states_for_sdpa, num_key_value_groups)
     value_states_for_sdpa = hf_repeat_kv(value_states_for_sdpa, num_key_value_groups)
-    
-    # OPTIMIZATION: This logic now correctly executes sequentially within a single forward pass.
-    if query_length > generator_obj.window_size:
-        attn_weights = torch.matmul(query_states_rotated[..., -generator_obj.window_size:, :], key_states_for_sdpa.transpose(-1, -2)) / math.sqrt(head_dim)
-        
-        mask = torch.full((generator_obj.window_size, generator_obj.window_size), torch.finfo(attn_weights.dtype).min, device=attn_weights.device)
-        mask_cond = torch.arange(mask.size(-1), device=attn_weights.device)
-        mask.masked_fill_(mask_cond < (mask_cond + 1).view(mask.size(-1), 1), 0)
-        attn_weights[:, :, -generator_obj.window_size:, -generator_obj.window_size:] += mask[None, None, :, :]
-        
-        attn_weights_softmax = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states_rotated.dtype)
-        attn_weights_sum = attn_weights_softmax[:, :, -generator_obj.window_size:, :-generator_obj.window_size].sum(dim=-2)
-        
-        if generator_obj.pooling == 'avgpool':
-            attn_cache = F.avg_pool1d(attn_weights_sum, kernel_size=generator_obj.kernel_size, padding=generator_obj.kernel_size//2, stride=1)
-        elif generator_obj.pooling == 'maxpool':
-            attn_cache = F.max_pool1d(attn_weights_sum, kernel_size=generator_obj.kernel_size, padding=generator_obj.kernel_size//2, stride=1)
-        else:
-            attn_cache = attn_weights_sum
-            
-        if len(attn_cache.shape) == 3:
-            attn_cache = attn_cache.sum(dim=1, keepdim=True)
-        
-        generator_obj.score_buffer.append(attn_cache)
-        if len(generator_obj.score_buffer) > generator_obj.last_n_layers:
-            generator_obj.score_buffer.pop(0)
-        
-        # If we have enough scores in the buffer, compute and store the final CLAA ranking for this layer.
-        if len(generator_obj.score_buffer) >= generator_obj.last_n_layers:
-            scores_tensor = torch.stack(generator_obj.score_buffer, dim=1)
-            flattened_scores = scores_tensor.flatten(start_dim=1, end_dim=2)
-            final_token_importance, _ = flattened_scores.max(dim=1)
-            # OPTIMIZATION: Store score in the central dict, keyed by layer index.
-            generator_obj.all_scores[self_attn.layer_idx] = final_token_importance.squeeze(0)
     
     attn_mask_input = attention_mask
     is_sdpa_causal = (query_length > 1) and (attn_mask_input is None)
@@ -374,13 +356,13 @@ class CLAARankingGenerator(BaseRankingGenerator):
         self.window_size = args.window_size
         self.kernel_size = args.kernel_size
         self.pooling = args.pooling
-        self.last_n_layers = 4
-        self.score_buffer = []
-        # OPTIMIZATION: Central dictionary to hold scores from all layers.
+        # Set alpha for the VMAS calculation.
+        self.alpha = 1.5
+        # Central dictionary to hold scores from all layers.
         self.all_scores: Dict[int, torch.Tensor] = {}
         
     def _patch_all_layers(self):
-        # OPTIMIZATION: Patch all layers at once before the forward pass.
+        # Patch all layers at once before the forward pass.
         for i, layer in enumerate(self.model.model.layers):
             if hasattr(layer, 'self_attn') and isinstance(layer.self_attn, LlamaAttention):
                 attn_module = layer.self_attn
@@ -391,9 +373,8 @@ class CLAARankingGenerator(BaseRankingGenerator):
 
     @torch.no_grad()
     def generate_rankings(self, inputs: Dict[str, torch.Tensor]) -> Dict[int, torch.Tensor]:
-        # OPTIMIZATION: No longer loops. Performs one pass and post-processes.
+        # This is now a simple, single-pass generator like FastKV.
         self.all_scores.clear()
-        self.score_buffer.clear()
         
         input_ids = inputs['input_ids']
         prompt_length = input_ids.shape[1]
@@ -401,31 +382,20 @@ class CLAARankingGenerator(BaseRankingGenerator):
         self._patch_all_layers()
         
         try:
-            # OPTIMIZATION: Run a single forward pass to compute scores for all valid layers.
+            # Run a single forward pass to compute scores for all layers.
             position_ids = torch.arange(prompt_length, device=self.device).unsqueeze(0)
             with torch.no_grad():
                 _ = self.model(input_ids=input_ids, position_ids=position_ids, use_cache=True)
                 
         finally:
             self._unpatch_model()
-            self.score_buffer.clear()
-        
-        # OPTIMIZATION: Post-process to add fallback for initial layers.
-        if self.all_scores:
-            first_valid_layer_idx = self.last_n_layers - 1
-            if first_valid_layer_idx in self.all_scores:
-                first_valid_scores = self.all_scores[first_valid_layer_idx]
-                for layer_idx in range(min(first_valid_layer_idx, self.config.num_hidden_layers)):
-                    if layer_idx not in self.all_scores:
-                         self.all_scores[layer_idx] = first_valid_scores.clone()
         
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         
         return self.all_scores.copy()
 
-
-# --- Strategy 4: Speculative (UNCHANGED) ---
+# --- Strategy 4: Speculative Prefill ---
 
 def _patched_attention_forward_speculative(
     self_attn: LlamaAttention,
