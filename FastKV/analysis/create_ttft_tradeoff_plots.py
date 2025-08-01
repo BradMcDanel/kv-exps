@@ -282,11 +282,6 @@ def main():
     # Create plots
     create_tradeoff_plots(df, args.output_dir)
     
-    # Save combined data
-    csv_file = f"{args.output_dir}/ttft_accuracy_combined.csv"
-    df.to_csv(csv_file, index=False)
-    print(f"  Generated: {csv_file}")
-    
     print(f"\nAnalysis complete! Check {args.output_dir}/ for results")
 
 if __name__ == "__main__":

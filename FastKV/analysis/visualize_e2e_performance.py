@@ -66,8 +66,8 @@ def create_stacked_bar_chart(results, output_dir):
     })
     
     # Create figure with subplots for each keep rate
-    fig, axes = plt.subplots(1, 3, figsize=(18, 8), sharey=True, dpi=300)
-    fig.suptitle('E2E Performance: Prefill vs Decode Time Breakdown', fontsize=32, fontweight='bold')
+    fig, axes = plt.subplots(1, 3, figsize=(16, 6.8), sharey=True, dpi=300)
+    fig.suptitle('E2E Performance: Prefill vs Decode Time Breakdown', fontsize=32, y=0.95)
     
     bar_width = 0.6
     
@@ -127,24 +127,23 @@ def create_stacked_bar_chart(results, output_dir):
             
             # KV cache annotation in the middle of the bar
             if total_time > 0:
-                ax.text(i, total_time/2, f'{kv_cache_gb:.1f}GB KV', 
-                       ha='center', va='center', fontweight='bold', fontsize=11,
-                       color='white', bbox=dict(boxstyle='round,pad=0.3', 
-                                              facecolor='black', alpha=0.8))
+                ax.text(i, total_time/2, f'{kv_cache_gb:.1f}\nGB', 
+                       ha='center', va='center', fontweight='bold', fontsize=16,
+                       color='white')
             
             # Throughput annotation above the bar, moved down
             if total_time > 0:
                 ax.text(i, total_time + max([ttft_times[j] + decode_times[j] for j in range(len(method_names))])*0.02, 
                        f'{throughput:.0f}\ntps', 
-                       ha='center', va='bottom', fontweight='bold', fontsize=12,
+                       ha='center', va='bottom', fontweight='bold', fontsize=16,
                        color=METHOD_COLORS[method])
         
         # Customize subplot to match other viz scripts
         if idx == 0:
             ax.set_ylabel('Time (ms)', fontsize=26)
-        ax.set_title(f'{keep_rate*100:.0f}% Keep Rate', fontsize=28, fontweight='bold')
+        ax.set_title(f'{keep_rate*100:.0f}% Keep Rate', fontsize=28)
         ax.set_xticks(x_pos)
-        ax.set_xticklabels(method_names, rotation=45, ha='right', fontsize=18)
+        ax.set_xticklabels(method_names, rotation=45, ha='right', fontsize=22)
         ax.grid(True, which='major', linestyle=':', linewidth=0.6)
         
         # Add more y-axis room for annotations
@@ -156,16 +155,17 @@ def create_stacked_bar_chart(results, output_dir):
     # Add legend at bottom left in single row
     handles, labels = axes[0].get_legend_handles_labels()
     fig.legend(handles, labels, loc='lower left', bbox_to_anchor=(0.1, -0.08), 
-               ncol=len(labels), fontsize=18, frameon=True, 
+               ncol=len(labels), fontsize=22, frameon=True, 
                facecolor='white', framealpha=0.9)
     
-    # Add annotation in bottom right, larger and lower
-    fig.text(0.9, -0.05, 'Sequence Length 10k, Decode 32 tokens', 
-             ha='right', va='bottom', fontsize=18, 
+    # Add annotation in bottom right, aligned with legend
+    fig.text(0.9, -0.04, 'Sequence Length 10k, Decode 32 tokens', 
+             ha='right', va='bottom', fontsize=22, 
              bbox=dict(boxstyle='round,pad=0.4', facecolor='lightgray', alpha=0.8),
              transform=fig.transFigure)
     
     plt.tight_layout()
+    plt.subplots_adjust(wspace=0.1)
     
     # Save the plot with same parameters as other viz scripts
     os.makedirs(output_dir, exist_ok=True)
@@ -213,13 +213,6 @@ def create_summary_table(results, output_dir):
                     'kv_cache_gb': kv_cache
                 })
     
-    # Save summary as JSON
-    os.makedirs(output_dir, exist_ok=True)
-    summary_file = os.path.join(output_dir, "e2e_performance_summary.json")
-    with open(summary_file, 'w') as f:
-        json.dump(summary_data, f, indent=2)
-    
-    print(f"\nSaved summary table: {summary_file}")
 
 def generate_debug_data():
     """Generate dummy data for testing visualization."""

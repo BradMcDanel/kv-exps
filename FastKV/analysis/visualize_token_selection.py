@@ -23,19 +23,6 @@ from .retrieval_metrics import (
     deserialize_rankings_in_sample,
 )
 
-# ==============================================================================
-# SCRIPT DESCRIPTION
-# This script generates a final, publication-ready 1x2 "difference plot".
-#
-# FINAL FEATURES:
-# 1. AGGREGATION & NORMALIZATION: As before, for robust statistics.
-# 2. DIFFERENCE PLOT: Shows (Method Density - Oracle Density) for clear error viz.
-# 3. TEXT ON PLOT: The Mean Absolute Density Error (MADE) score is displayed
-#    directly on each chart for immediate quantitative comparison.
-# 4. NEUTRAL VISUALS: Method-specific highlighting is removed for fair presentation.
-# 5. POLISHED AESTHETICS: Shared y-axis and clean layout.
-# ==============================================================================
-
 
 def generate_dummy_data_for_grid(k_percentage: float) -> Dict[str, Any]:
     """Generates random aggregated data for layout and debugging purposes."""
