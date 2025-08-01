@@ -157,7 +157,14 @@ def run_e2e_benchmark(args):
     if model:
         theoretical_kv_cache_gb = calculate_kv_cache_size(model, args.seqlen + args.num_decode_steps)
     else:
-        theoretical_kv_cache_gb = 0
+        # For pipeline methods, calculate theoretical size manually since we don't have direct model access
+        # Using Llama-3.1-8B specs: 32 layers, 8 KV heads, 128 head_dim
+        num_layers = 32
+        num_kv_heads = 8  # GQA
+        head_dim = 128
+        sequence_length = args.seqlen + args.num_decode_steps
+        kv_cache_size_bytes = sequence_length * num_layers * num_kv_heads * head_dim * 2 * 2
+        theoretical_kv_cache_gb = kv_cache_size_bytes / (1024**3)
     
     # Warmup
     for _ in range(args.num_warmups):
