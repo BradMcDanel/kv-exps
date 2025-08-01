@@ -369,11 +369,12 @@ def get_per_sample_accuracies_long_form(dataset_name: str, all_results: dict) ->
 
         method_name_map = {
             'gemfilter_rankings': 'GemFilter',
-            'fastkv_rankings': 'FastKV'
+            'fastkv_rankings': 'FastKV',
+            'claa_rankings': 'CLAA'
         }
 
-        # Process GemFilter and FastKV
-        for method_key in ['gemfilter_rankings', 'fastkv_rankings']:
+        # Process GemFilter, FastKV, and CLAA
+        for method_key in ['gemfilter_rankings', 'fastkv_rankings', 'claa_rankings']:
             method_name = method_name_map.get(method_key)
             rankings_dict = approx_sample_8b.get(method_key)
             

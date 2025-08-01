@@ -123,69 +123,50 @@ def combine_data(longbench_results, ttft_results):
     return pd.DataFrame(combined_data)
 
 def create_tradeoff_plots(df, output_dir):
-    """Create combined accuracy vs TTFT and memory vs TTFT plots."""
+    """Create accuracy vs TTFT plot."""
     set_publication_style()
     plt.rcParams.update({
         'axes.labelsize': 22,
     })
     os.makedirs(output_dir, exist_ok=True)
     
-    print(f"\nGenerating combined tradeoff plot in {output_dir}...")
+    print(f"\nGenerating accuracy vs TTFT plot in {output_dir}...")
     print(f"Data summary:")
-    print(df[['method_display', 'keep_rate_percent', 'ttft_ms', 'memory_gb']])
+    print(df[['method_display', 'keep_rate_percent', 'ttft_ms']])
     
-    # Create 2-subplot figure - much shorter for minipage placement
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5), dpi=300)
+    # Create single plot
+    fig, ax = plt.subplots(1, 1, figsize=(10, 6), dpi=300)
     
     for method in df['method_display'].unique():
         method_data = df[df['method_display'] == method]
         color = METHOD_COLORS[method]
         marker = METHOD_MARKERS[method]
         
-        # Plot on both subplots
-        ax1.scatter(method_data['ttft_ms'], method_data['avg_accuracy'], 
+        # Plot accuracy vs TTFT
+        ax.scatter(method_data['ttft_ms'], method_data['avg_accuracy'], 
                    c=color, marker=marker, s=100, alpha=0.8, label=method, 
-                   edgecolors='white', linewidth=1)
-        
-        ax2.scatter(method_data['ttft_ms'], method_data['memory_gb'], 
-                   c=color, marker=marker, s=100, alpha=0.8, label=method,
                    edgecolors='white', linewidth=1)
         
         # Connect points for each method (except FullKV)
         if method != "FullKV" and len(method_data) > 1:
             sorted_data = method_data.sort_values('keep_rate')
             
-            ax1.plot(sorted_data['ttft_ms'], sorted_data['avg_accuracy'], 
-                    color=color, alpha=0.3, linewidth=2, linestyle='--')
-            
-            ax2.plot(sorted_data['ttft_ms'], sorted_data['memory_gb'], 
+            ax.plot(sorted_data['ttft_ms'], sorted_data['avg_accuracy'], 
                     color=color, alpha=0.3, linewidth=2, linestyle='--')
         
         # Add keep rate annotations (only for non-FullKV)
         for _, row in method_data.iterrows():
             if method != "FullKV":
-                # Add annotations to both plots
-                ax1.annotate(f"{row['keep_rate_percent']:.0f}%", 
+                ax.annotate(f"{row['keep_rate_percent']:.0f}%", 
                            (row['ttft_ms'], row['avg_accuracy']), 
                            xytext=(5, 5), textcoords='offset points', 
                            fontsize=9, alpha=0.7)
-                
-                ax2.annotate(f"{row['keep_rate_percent']:.0f}%", 
-                           (row['ttft_ms'], row['memory_gb']), 
-                           xytext=(5, 5), textcoords='offset points', 
-                           fontsize=9, alpha=0.7)
     
-    # Format left subplot (Accuracy)
-    ax1.set_xlabel('Time to First Token (ms)')
-    ax1.set_ylabel('LongBench Accuracy (%)')
-    ax1.set_title('Accuracy vs TTFT', fontsize=24)
-    ax1.grid(True, which='major', linestyle=':', linewidth=0.6)
-    
-    # Format right subplot (Memory)
-    ax2.set_xlabel('Time to First Token (ms)')
-    ax2.set_ylabel('Peak Memory Usage (GB)')
-    ax2.set_title('Memory vs TTFT', fontsize=24)
-    ax2.grid(True, which='major', linestyle=':', linewidth=0.6)
+    # Format the plot
+    ax.set_xlabel('Time to First Token (ms)')
+    ax.set_ylabel('LongBench Accuracy (%)')
+    ax.set_title('Accuracy vs TTFT', fontsize=24)
+    ax.grid(True, which='major', linestyle=':', linewidth=0.6)
     
     # Create custom legend with lines through markers in specified order
     legend_order = ["FullKV", "Oracle", "GemFilter", "FastKV", "SpecPrefill", "CLAA"]
@@ -213,17 +194,17 @@ def create_tradeoff_plots(df, output_dir):
                                             label=method, markeredgecolor='white', 
                                             markeredgewidth=1))
     
-    ax2.legend(handles=legend_elements, loc='center right', fontsize=18, 
+    ax.legend(handles=legend_elements, loc='center right', fontsize=18, 
               frameon=True, facecolor='white', framealpha=0.9)
     
     plt.tight_layout()
     
-    # Save combined plot
-    plt.savefig(f"{output_dir}/ttft_tradeoff_analysis.pdf", dpi=300, bbox_inches='tight')
-    plt.savefig(f"{output_dir}/ttft_tradeoff_analysis.png", dpi=300, bbox_inches='tight')
+    # Save accuracy vs TTFT plot
+    plt.savefig(f"{output_dir}/ttft_accuracy_analysis.pdf", dpi=300, bbox_inches='tight')
+    plt.savefig(f"{output_dir}/ttft_accuracy_analysis.png", dpi=300, bbox_inches='tight')
     plt.close()
     
-    print("  Generated: ttft_tradeoff_analysis.pdf/png")
+    print("  Generated: ttft_accuracy_analysis.pdf/png")
 
 def generate_debug_data():
     """Generate dummy data for testing visualization."""

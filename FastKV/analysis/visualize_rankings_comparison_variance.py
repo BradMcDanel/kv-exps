@@ -90,6 +90,7 @@ def plot_paper_version_with_variance(full_df: pd.DataFrame, output_prefix: str):
                 hue_order=['GemFilter', 'FastKV', 'CLAA', 'SpecPrefill'],
                 style='method',
                 dashes={'GemFilter': '', 'FastKV': '', 'CLAA': '', 'SpecPrefill': (2, 2)},
+                errorbar='se',  # Use standard error instead of 95% CI
                 ax=ax,
                 legend=False # We will create a single legend later
             )
