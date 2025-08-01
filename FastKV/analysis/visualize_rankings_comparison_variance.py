@@ -44,6 +44,11 @@ def generate_dummy_data_long_form() -> pd.DataFrame:
                                     'correlation': np.clip(base_corr_fastkv * layer_factor + noise, -0.1, 0.9)})
                     records.append({'task_category': task_category, 'method': 'GemFilter', 'layer': layer, 
                                     'correlation': np.clip(base_corr_gemfilter * layer_factor + noise - 0.05, -0.1, 0.9)})
+                    # CLAA should perform slightly above FastKV but smoother (less noise)
+                    base_corr_claa = base_corr_fastkv + 0.03
+                    claa_noise = np.random.normal(0, 0.05)  # Half the noise of FastKV
+                    records.append({'task_category': task_category, 'method': 'CLAA', 'layer': layer,
+                                    'correlation': np.clip(base_corr_claa * layer_factor + claa_noise, -0.1, 0.9)})
                     # SpecPrefill is constant per sample but has variance across samples
                     records.append({'task_category': task_category, 'method': 'SpecPrefill', 'layer': layer, 
                                     'correlation': np.clip(base_corr_spec + np.random.normal(0, 0.05), -0.1, 0.9)})
@@ -79,11 +84,12 @@ def plot_paper_version_with_variance(full_df: pd.DataFrame, output_prefix: str):
                 palette={
                     'GemFilter': METHOD_COLORS['GemFilter'],
                     'FastKV': METHOD_COLORS['FastKV'],
+                    'CLAA': METHOD_COLORS['CLAA'],
                     'SpecPrefill': METHOD_COLORS['Speculative'],
                 },
-                hue_order=['GemFilter', 'FastKV', 'SpecPrefill'],
+                hue_order=['GemFilter', 'FastKV', 'CLAA', 'SpecPrefill'],
                 style='method',
-                dashes={'GemFilter': '', 'FastKV': '', 'SpecPrefill': (2, 2)},
+                dashes={'GemFilter': '', 'FastKV': '', 'CLAA': '', 'SpecPrefill': (2, 2)},
                 ax=ax,
                 legend=False # We will create a single legend later
             )
@@ -99,6 +105,7 @@ def plot_paper_version_with_variance(full_df: pd.DataFrame, output_prefix: str):
     legend_elements = [
         Line2D([0], [0], color=METHOD_COLORS['GemFilter'], lw=3, label='GemFilter'),
         Line2D([0], [0], color=METHOD_COLORS['FastKV'], lw=3, label='FastKV'),
+        Line2D([0], [0], color=METHOD_COLORS['CLAA'], lw=3, label='CLAA'),
         Line2D([0], [0], color=METHOD_COLORS['Speculative'], lw=3, linestyle='--', label='Spec. Prefill')
     ]
     axes.flat[-1].legend(handles=legend_elements, loc='lower right',
