@@ -584,6 +584,7 @@ if __name__ == "__main__":
     parser.add_argument("--tsp_idx", type=int, default=15)
     parser.add_argument("--tsp_len", type=int, default=2048)
     parser.add_argument("--tsp_len_percentage", type=float, default=None, help="Use a percentage of the prompt length for TSP length.")
+    parser.add_argument("--min_layer_idx", type=int, default=0, help="Minimum layer index for KV compression. Layers below this index skip compression.")
 
     # GemFilter
     parser.add_argument("--filter_idx", type=int, default=13)  # Keep for backward compatibility
