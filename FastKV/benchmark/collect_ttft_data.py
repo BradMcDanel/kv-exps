@@ -55,12 +55,13 @@ def run_ttft_benchmark(mode, model_name, seqlen, keep_rate=None, output_dir=None
             "--max_capacity_prompt_percentage", str(keep_rate)
         ])
     elif mode == "claa" and keep_rate is not None:
-        # CLAA: Same as FastKV but with last_n_layers=4
+        # CLAA: Same as FastKV but with last_n_layers=4 and min_layer_idx=4
         cmd.extend([
             "--tsp_idx", str(TSP_LAYER),
             "--tsp_len_percentage", str(keep_rate),
             "--max_capacity_prompt_percentage", str(keep_rate),
-            "--last_n_layers", "4"
+            "--last_n_layers", "4",
+            "--min_layer_idx", "4"
         ])
     elif mode == "oracle" and keep_rate is not None:
         # Oracle: Same as FastKV (uses dummy indices)
