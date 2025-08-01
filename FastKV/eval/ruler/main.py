@@ -454,6 +454,8 @@ def main():
     # CLAA
     parser.add_argument("--alpha", type=float, default=1.0,
                         help="Alpha parameter for CLAA value magnitude scaling.")
+    parser.add_argument("--last_n_layers", type=int, default=4,
+                        help="Number of recent layers to aggregate for CLAA cross-layer attention.")
     # Oracle
     parser.add_argument("--oracle_rankings_path", type=str, default="", 
                         help="Path to directory containing oracle rankings (.npz files)")

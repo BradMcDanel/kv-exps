@@ -613,7 +613,7 @@ if __name__ == "__main__":
     parser.add_argument("--chunk_size", type=int, default=64, help="Chunk size for Speculative Prefill")
     
     # CLAA
-    parser.add_argument("--last_n_layers", type=int, default=None, help="Number of last layers to use for CLAA aggregation")
+    parser.add_argument("--last_n_layers", type=int, default=4, help="Number of last layers to use for CLAA aggregation")
     
     # Evaluation
     parser.add_argument('-s', '--s_len', default=0, metavar='N', type=int)
