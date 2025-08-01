@@ -197,6 +197,14 @@ def run_e2e_benchmark(args):
                 total_e2e_time = total_start.elapsed_time(total_end)
                 decoding_time = total_e2e_time - ttft
                 prefill_time = ttft
+                
+                # Estimate KV cache size for pipeline methods based on keep rate
+                if hasattr(args, 'max_capacity_prompt_percentage') and args.max_capacity_prompt_percentage:
+                    # Use keep rate to estimate compressed KV cache size
+                    full_kv_size = theoretical_kv_cache_gb
+                    run_kv_cache_size = full_kv_size * args.max_capacity_prompt_percentage
+                else:
+                    run_kv_cache_size = 0
             else:
                 prefill_start.record()
                 outputs = model(input_ids, use_cache=True)
