@@ -312,6 +312,7 @@ if __name__ == "__main__":
     # CLAA
     parser.add_argument("--last_n_layers", type=int, default=None,
                         help="Number of last layers to use for CLAA aggregation. None uses all layers (default), 1 uses only last layer.")
+    parser.add_argument("--min_layer_idx", type=int, default=0, help="Minimum layer index for KV compression. Layers below this index skip compression.")
 
     parser.add_argument("--detailed_timing", action="store_true", help="Enable detailed, per-part timing with CUDA synchronization.")
 
