@@ -380,6 +380,10 @@ def get_per_sample_accuracies_long_form(dataset_name: str, all_results: dict) ->
             
             if rankings_dict:
                 for layer, approx_ranking in rankings_dict.items():
+                    # Skip CLAA data for layers 0-2 (only has duplicated/invalid data)
+                    if method_name == 'CLAA' and int(layer) < 3:
+                        continue
+                        
                     min_len = min(len(oracle_ranking), len(approx_ranking))
                     if min_len < 2:  # Need at least 2 points for correlation
                         continue
