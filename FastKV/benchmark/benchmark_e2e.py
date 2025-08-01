@@ -140,7 +140,11 @@ def run_e2e_benchmark(args):
             from baseline.claa.claa_utils import compress
             compress(model, args)
         elif args.mode == 'oracle':
-            from baseline.oracle.oracle_utils import compress
+            from baseline.oracle.oracle_utils import compress, set_oracle_rankings
+            # For benchmarking, use random rankings since we don't have precomputed ones
+            import numpy as np
+            random_rankings = np.random.rand(args.seqlen).astype(np.float32)
+            set_oracle_rankings(random_rankings)
             compress(model, args)
         elif args.mode == 'gemfilter':
             from baseline.gemfilter.gemfilter_utils import compress
@@ -324,6 +328,11 @@ if __name__ == "__main__":
     # GemFilter specific
     parser.add_argument("--filter_idx", type=int, default=13)
     parser.add_argument("--topk", type=int, default=1024)
+    parser.add_argument("--topk_percentage", type=float, default=None, help="Use a percentage of the prompt length for GemFilter topk")
+    parser.add_argument("--select_layer_idx", type=int, default=13, help="Layer index for GemFilter selection")
+    
+    # Oracle specific
+    parser.add_argument("--oracle_model", type=str, default=None, help="Oracle model path")
     
     args = parser.parse_args()
     if args.num_runs <= 2:

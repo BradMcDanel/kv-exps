@@ -43,9 +43,9 @@ def run_ttft_benchmark(mode, model_name, seqlen, keep_rate=None, output_dir=None
             "--max_capacity_prompt_percentage", str(keep_rate)
         ])
     elif mode == "gemfilter" and keep_rate is not None:
-        # GemFilter: filter_idx=15, topk_percentage
+        # GemFilter: select_layer_idx=15, topk_percentage
         cmd.extend([
-            "--filter_idx", str(TSP_LAYER),
+            "--select_layer_idx", str(TSP_LAYER),
             "--topk_percentage", str(keep_rate)
         ])
     elif mode == "speculative_prefill" and keep_rate is not None:
