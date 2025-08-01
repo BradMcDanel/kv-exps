@@ -33,7 +33,7 @@ def run_e2e_benchmark(mode, model_name, seqlen, num_decode_steps, keep_rate=None
         "--mode", mode,
         "--seqlen", str(seqlen),
         "--num_decode_steps", str(num_decode_steps),
-        "--num_runs", "5",
+        "--num_runs", "10",
         "--num_warmups", "3"
     ]
     
