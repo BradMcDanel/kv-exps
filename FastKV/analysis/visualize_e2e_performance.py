@@ -125,9 +125,9 @@ def create_stacked_bar_chart(results, output_dir):
             kv_cache_gb = data['kv_cache_size_gb']
             throughput = data['total_throughput_tps']
             
-            # Memory annotation in the middle of the bar
+            # KV cache annotation in the middle of the bar
             if total_time > 0:
-                ax.text(i, total_time/2, f'{memory_gb:.1f}GB\n{kv_cache_gb:.1f}GB KV', 
+                ax.text(i, total_time/2, f'{kv_cache_gb:.1f}GB KV', 
                        ha='center', va='center', fontweight='bold', fontsize=11,
                        color='white', bbox=dict(boxstyle='round,pad=0.3', 
                                               facecolor='black', alpha=0.8))
