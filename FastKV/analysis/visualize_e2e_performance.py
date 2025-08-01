@@ -1,378 +1,302 @@
 #!/usr/bin/env python3
 """
-Visualization script for E2E (prefill + decode) performance analysis.
-Shows throughput vs memory usage and KV cache size comparisons.
+E2E Performance Visualization with Stacked Bar Charts.
+Shows prefill vs decode time breakdown with memory annotations and throughput metrics.
 """
 
 import os
-import argparse
 import json
-import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 from pathlib import Path
+from collections import defaultdict
 
-from .viz_utils import set_publication_style, METHOD_COLORS
+try:
+    from .viz_utils import set_publication_style, METHOD_COLORS
+except ImportError:
+    import sys
+    sys.path.append('.')
+    from analysis.viz_utils import set_publication_style, METHOD_COLORS
 
-# Method display names and markers
+# Configuration
 METHOD_DISPLAY_NAMES = {
     "fullkv": "FullKV", "fastkv": "FastKV", "gemfilter": "GemFilter",
     "speculative_prefill": "SpecPrefill", "oracle": "Oracle", "claa": "CLAA"
 }
 
-METHOD_MARKERS = {
-    "FullKV": "s", "Oracle": "^", "FastKV": "o", 
-    "CLAA": "D", "GemFilter": "v", "SpecPrefill": "P"
-}
+KEEP_RATES = [0.1, 0.2, 0.4]  # 10%, 20%, 40%
+METHODS_ORDER = ["FullKV", "Oracle", "FastKV", "CLAA", "GemFilter", "SpecPrefill"]
 
-def generate_dummy_data():
-    """Generate dummy data for testing visualization."""
-    data = []
-    
-    # FullKV baseline
-    data.append({
-        "method": "fullkv", "keep_rate": 1.0, "min_layer_idx": 0,
-        "total_throughput_tps": 15.5, "max_memory_gb": 18.5, "kv_cache_size_gb": 4.2,
-        "seqlen": 4000, "num_decode_steps": 32
-    })
-    
-    # Other methods with multiple configurations
-    methods_configs = {
-        "fastkv": [
-            (0.1, 0, 45.2, 16.2, 0.42), (0.2, 0, 42.1, 16.35, 0.84), (0.4, 0, 38.7, 16.48, 1.68),
-            (0.1, 5, 43.8, 16.1, 0.35), (0.2, 5, 40.5, 16.25, 0.70), (0.4, 5, 37.2, 16.38, 1.40)
-        ],
-        "claa": [
-            (0.1, 0, 44.1, 16.15, 0.41), (0.2, 0, 41.2, 16.3, 0.82), (0.4, 0, 38.1, 16.45, 1.64),
-            (0.1, 5, 42.9, 16.05, 0.34), (0.2, 5, 39.8, 16.2, 0.68), (0.4, 5, 36.5, 16.35, 1.36)
-        ],
-        "oracle": [
-            (0.1, 0, 46.8, 16.0, 0.42), (0.2, 0, 43.9, 16.2, 0.84), (0.4, 0, 40.1, 16.35, 1.68)
-        ],
-        "gemfilter": [
-            (0.1, 0, 35.1, 16.1, 0.41), (0.2, 0, 32.8, 16.25, 0.82), (0.4, 0, 30.2, 16.4, 1.64)
-        ]
-    }
-    
-    for method, configs in methods_configs.items():
-        for keep_rate, min_layer, throughput, memory, kv_cache in configs:
-            data.append({
-                "method": method, "keep_rate": keep_rate, "min_layer_idx": min_layer,
-                "total_throughput_tps": throughput, "max_memory_gb": memory, "kv_cache_size_gb": kv_cache,
-                "seqlen": 4000, "num_decode_steps": 32
-            })
-    
-    return data
-
-def load_e2e_results(results_path):
+def load_e2e_results(results_dir):
     """Load E2E benchmark results from JSON files."""
-    results_path = Path(results_path)
-    results = []
+    results_dir = Path(results_dir)
+    results = defaultdict(dict)
     
-    if results_path.is_file() and results_path.suffix == '.json':
-        with open(results_path, 'r') as f:
-            data = json.load(f)
-            if isinstance(data, list):
-                results.extend(data)
-            else:
-                results.append(data)
-    elif results_path.is_dir():
-        for json_file in results_path.glob("*_e2e*.json"):
-            try:
-                with open(json_file, 'r') as f:
-                    data = json.load(f)
-                    if isinstance(data, list):
-                        results.extend(data)
-                    else:
-                        results.append(data)
-            except Exception as e:
-                print(f"Warning: Could not load {json_file}: {e}")
-    else:
-        raise ValueError(f"E2E results path must be a JSON file or directory: {results_path}")
+    print(f"Loading E2E results from {results_dir}...")
+    
+    # Load all result files
+    for json_file in results_dir.glob("*_e2e.json"):
+        try:
+            with open(json_file, 'r') as f:
+                data = json.load(f)
+                
+            method = data.get("method")
+            keep_rate = data.get("keep_rate")
+            
+            if method and keep_rate is not None:
+                method_display = METHOD_DISPLAY_NAMES.get(method, method)
+                results[method_display][keep_rate] = data
+                print(f"  Loaded {method_display} {keep_rate*100:.0f}%: "
+                      f"TTFT={data.get('ttft_ms', 0):.1f}ms, "
+                      f"Decode={data.get('decode_time_ms', 0):.1f}ms, "
+                      f"Throughput={data.get('total_throughput_tps', 0):.1f}tps, "
+                      f"Memory={data.get('max_memory_gb', 0):.1f}GB")
+                
+        except Exception as e:
+            print(f"  Warning: Could not load {json_file}: {e}")
     
     return results
 
-def process_results_to_dataframe(results):
-    """Convert results list to DataFrame with proper formatting."""
-    processed_data = []
-    
-    for result in results:
-        method = result.get("method")
-        method_display = METHOD_DISPLAY_NAMES.get(method, method)
-        keep_rate = result.get("keep_rate", 1.0)
-        
-        # Handle None keep_rate for fullkv
-        if keep_rate is None or method == "fullkv":
-            keep_rate = 1.0
-        
-        row = {
-            "method": method,
-            "method_display": method_display,
-            "keep_rate": keep_rate,
-            "keep_rate_percent": keep_rate * 100,
-            "min_layer_idx": result.get("min_layer_idx", 0),
-            "total_throughput_tps": result.get("total_throughput_tps", 0),
-            "decode_throughput_tps": result.get("decode_throughput_tps", 0),
-            "max_memory_gb": result.get("max_memory_gb", 0),
-            "kv_cache_size_gb": result.get("kv_cache_size_gb", 0),
-            "ttft_ms": result.get("ttft_ms", 0),
-            "e2e_time_ms": result.get("e2e_time_ms", 0),
-            "seqlen": result.get("seqlen", 0),
-            "num_decode_steps": result.get("num_decode_steps", 0),
-        }
-        processed_data.append(row)
-    
-    return pd.DataFrame(processed_data)
-
-def plot_throughput_vs_memory(df: pd.DataFrame, output_prefix: str):
-    """Create throughput vs memory usage plot."""
+def create_stacked_bar_chart(results, output_dir):
+    """Create stacked bar chart showing prefill vs decode time breakdown."""
     set_publication_style()
-    plt.rcParams.update({'axes.labelsize': 26})
+    plt.rcParams.update({
+        'axes.labelsize': 26,
+        'lines.linewidth': 3,
+    })
     
-    fig, ax = plt.subplots(1, 1, figsize=(10, 6), dpi=300)
+    # Create figure with subplots for each keep rate
+    fig, axes = plt.subplots(1, 3, figsize=(18, 8), sharey=True, dpi=300)
+    fig.suptitle('E2E Performance: Prefill vs Decode Time Breakdown', fontsize=32, fontweight='bold')
     
-    # Plot order for legend
-    legend_order = ["FullKV", "Oracle", "GemFilter", "FastKV", "SpecPrefill", "CLAA"]
-    legend_elements = []
+    bar_width = 0.6
     
-    for method in legend_order:
-        if method not in df['method_display'].unique():
+    for idx, keep_rate in enumerate(KEEP_RATES):
+        ax = axes[idx]
+        
+        # Collect data for this keep rate
+        methods_data = []
+        method_names = []
+        
+        for method in METHODS_ORDER:
+            if method in results and keep_rate in results[method]:
+                data = results[method][keep_rate]
+                methods_data.append({
+                    'method': method,
+                    'ttft_ms': data.get('ttft_ms', 0),
+                    'decode_time_ms': data.get('decode_time_ms', 0),
+                    'total_throughput_tps': data.get('total_throughput_tps', 0),
+                    'max_memory_gb': data.get('max_memory_gb', 0),
+                    'kv_cache_size_gb': data.get('kv_cache_size_gb', 0)
+                })
+                method_names.append(method)
+        
+        if not methods_data:
+            ax.text(0.5, 0.5, f'No data for {keep_rate*100:.0f}%', 
+                   ha='center', va='center', transform=ax.transAxes, fontsize=20)
+            ax.set_title(f'{keep_rate*100:.0f}% Keep Rate', fontsize=28)
             continue
+        
+        # Extract data arrays
+        ttft_times = [d['ttft_ms'] for d in methods_data]
+        decode_times = [d['decode_time_ms'] for d in methods_data]
+        throughputs = [d['total_throughput_tps'] for d in methods_data]
+        memories = [d['max_memory_gb'] for d in methods_data]
+        kv_caches = [d['kv_cache_size_gb'] for d in methods_data]
+        
+        # Create stacked bars
+        x_pos = np.arange(len(method_names))
+        
+        # Bottom bars (prefill time) - solid colors
+        bars1 = ax.bar(x_pos, ttft_times, bar_width, 
+                      color=[METHOD_COLORS[method] for method in method_names], 
+                      alpha=0.9, label='Prefill (TTFT)', linewidth=1, edgecolor='white')
+        
+        # Top bars (decode time) - lighter colors  
+        bars2 = ax.bar(x_pos, decode_times, bar_width, bottom=ttft_times,
+                      color=[METHOD_COLORS[method] for method in method_names], 
+                      alpha=0.5, label='Decode', linewidth=1, edgecolor='white')
+        
+        # Add memory annotations inside bars
+        for i, (method, data) in enumerate(zip(method_names, methods_data)):
+            total_time = data['ttft_ms'] + data['decode_time_ms']
+            memory_gb = data['max_memory_gb']
+            kv_cache_gb = data['kv_cache_size_gb']
+            throughput = data['total_throughput_tps']
             
-        method_data = df[df['method_display'] == method]
-        color = METHOD_COLORS[method]
-        marker = METHOD_MARKERS[method]
-        
-        # Plot throughput vs memory
-        ax.scatter(method_data['max_memory_gb'], method_data['total_throughput_tps'], 
-                   c=color, marker=marker, s=100, alpha=0.8, label=method, 
-                   edgecolors='white', linewidth=1)
-        
-        # Connect points for each method (except FullKV)
-        if method != "FullKV" and len(method_data) > 1:
-            sorted_data = method_data.sort_values('keep_rate')
-            ax.plot(sorted_data['max_memory_gb'], sorted_data['total_throughput_tps'], 
-                    color=color, alpha=0.3, linewidth=2, linestyle='--')
-        
-        # Add keep rate annotations (only for non-FullKV)
-        for _, row in method_data.iterrows():
-            if method != "FullKV":
-                ax.annotate(f"{row['keep_rate_percent']:.0f}%", 
-                           (row['max_memory_gb'], row['total_throughput_tps']), 
-                           xytext=(5, 5), textcoords='offset points', 
-                           fontsize=9, alpha=0.7)
-        
-        # Create legend elements
-        if method == "FullKV":
-            legend_elements.append(plt.Line2D([0], [0], marker=marker, color=color, 
-                                            markerfacecolor=color, markersize=8,
-                                            linestyle='None', label=method,
-                                            markeredgecolor='white', markeredgewidth=1))
-        else:
-            legend_elements.append(plt.Line2D([0], [0], marker=marker, color=color,
-                                            markerfacecolor=color, markersize=8,
-                                            linestyle='--', linewidth=2, alpha=1.0,
-                                            label=method, markeredgecolor='white', 
-                                            markeredgewidth=1))
-    
-    ax.set_xlabel('Peak Memory Usage (GB)')
-    ax.set_ylabel('Total Throughput (tokens/s)')
-    ax.set_title('E2E Throughput vs Memory Usage')
-    ax.grid(True, which='major', linestyle=':', linewidth=0.6)
-    
-    ax.legend(handles=legend_elements, loc='best', fontsize=18, 
-              frameon=True, facecolor='white', framealpha=0.9)
-    
-    plt.tight_layout()
-    
-    plt.savefig(f"{output_prefix}.pdf", format='pdf', dpi=300, bbox_inches='tight')
-    print(f"Saved throughput vs memory plot to: {output_prefix}.pdf")
-    plt.savefig(f"{output_prefix}.png", format='png', dpi=300, bbox_inches='tight')
-    print(f"Saved throughput vs memory plot to: {output_prefix}.png")
-    plt.close(fig)
-
-def plot_throughput_vs_kv_cache(df: pd.DataFrame, output_prefix: str):
-    """Create throughput vs KV cache size plot."""
-    set_publication_style()
-    plt.rcParams.update({'axes.labelsize': 26})
-    
-    fig, ax = plt.subplots(1, 1, figsize=(10, 6), dpi=300)
-    
-    # Plot order for legend
-    legend_order = ["FullKV", "Oracle", "GemFilter", "FastKV", "SpecPrefill", "CLAA"]
-    legend_elements = []
-    
-    for method in legend_order:
-        if method not in df['method_display'].unique():
-            continue
+            # Memory annotation in the middle of the bar
+            if total_time > 0:
+                ax.text(i, total_time/2, f'{memory_gb:.1f}GB\n{kv_cache_gb:.1f}GB KV', 
+                       ha='center', va='center', fontweight='bold', fontsize=11,
+                       color='white', bbox=dict(boxstyle='round,pad=0.3', 
+                                              facecolor='black', alpha=0.8))
             
-        method_data = df[df['method_display'] == method]
-        color = METHOD_COLORS[method]
-        marker = METHOD_MARKERS[method]
+            # Throughput annotation above the bar
+            if total_time > 0:
+                ax.text(i, total_time + max([ttft_times[j] + decode_times[j] for j in range(len(method_names))])*0.05, 
+                       f'{throughput:.0f}\ntps', 
+                       ha='center', va='bottom', fontweight='bold', fontsize=12,
+                       color=METHOD_COLORS[method])
         
-        # Plot KV cache size vs throughput
-        ax.scatter(method_data['kv_cache_size_gb'], method_data['total_throughput_tps'], 
-                   c=color, marker=marker, s=100, alpha=0.8, label=method, 
-                   edgecolors='white', linewidth=1)
+        # Customize subplot to match other viz scripts
+        ax.set_xlabel('Methods', fontsize=26)
+        if idx == 0:
+            ax.set_ylabel('Time (ms)', fontsize=26)
+        ax.set_title(f'{keep_rate*100:.0f}% Keep Rate', fontsize=28, fontweight='bold')
+        ax.set_xticks(x_pos)
+        ax.set_xticklabels(method_names, rotation=45, ha='right', fontsize=18)
+        ax.grid(True, which='major', linestyle=':', linewidth=0.6)
         
-        # Connect points for each method (except FullKV)
-        if method != "FullKV" and len(method_data) > 1:
-            sorted_data = method_data.sort_values('keep_rate')
-            ax.plot(sorted_data['kv_cache_size_gb'], sorted_data['total_throughput_tps'], 
-                    color=color, alpha=0.3, linewidth=2, linestyle='--')
-        
-        # Add keep rate annotations (only for non-FullKV)
-        for _, row in method_data.iterrows():
-            if method != "FullKV":
-                ax.annotate(f"{row['keep_rate_percent']:.0f}%", 
-                           (row['kv_cache_size_gb'], row['total_throughput_tps']), 
-                           xytext=(5, 5), textcoords='offset points', 
-                           fontsize=9, alpha=0.7)
-        
-        # Create legend elements
-        if method == "FullKV":
-            legend_elements.append(plt.Line2D([0], [0], marker=marker, color=color, 
-                                            markerfacecolor=color, markersize=8,
-                                            linestyle='None', label=method,
-                                            markeredgecolor='white', markeredgewidth=1))
-        else:
-            legend_elements.append(plt.Line2D([0], [0], marker=marker, color=color,
-                                            markerfacecolor=color, markersize=8,
-                                            linestyle='--', linewidth=2, alpha=1.0,
-                                            label=method, markeredgecolor='white', 
-                                            markeredgewidth=1))
-    
-    ax.set_xlabel('KV Cache Size (GB)')
-    ax.set_ylabel('Total Throughput (tokens/s)')
-    ax.set_title('Throughput vs KV Cache Size')
-    ax.grid(True, which='major', linestyle=':', linewidth=0.6)
-    
-    ax.legend(handles=legend_elements, loc='best', fontsize=18, 
-              frameon=True, facecolor='white', framealpha=0.9)
+        # Add legend only to first subplot, matching other scripts
+        if idx == 0:
+            ax.legend(loc='upper left', fontsize=18, frameon=True, 
+                     facecolor='white', framealpha=0.9)
     
     plt.tight_layout()
     
-    plt.savefig(f"{output_prefix}.pdf", format='pdf', dpi=300, bbox_inches='tight')
-    print(f"Saved throughput vs KV cache plot to: {output_prefix}.pdf")
-    plt.savefig(f"{output_prefix}.png", format='png', dpi=300, bbox_inches='tight')
-    print(f"Saved throughput vs KV cache plot to: {output_prefix}.png")
-    plt.close(fig)
+    # Save the plot with same parameters as other viz scripts
+    os.makedirs(output_dir, exist_ok=True)
+    output_path_pdf = os.path.join(output_dir, "e2e_performance.pdf")
+    output_path_png = os.path.join(output_dir, "e2e_performance.png")
+    
+    plt.savefig(output_path_pdf, dpi=300, bbox_inches='tight', facecolor='white')
+    plt.savefig(output_path_png, dpi=300, bbox_inches='tight', facecolor='white')
+    plt.close()
+    
+    print(f"Saved stacked bar chart: {output_path_pdf}")
+    print(f"Saved stacked bar chart: {output_path_png}")
 
-def plot_min_layer_analysis(df: pd.DataFrame, output_prefix: str):
-    """Create min_layer_idx impact analysis plot."""
-    if df['min_layer_idx'].nunique() <= 1:
-        print("Skipping min_layer analysis plot - not enough variation in min_layer_idx")
-        return
+def create_summary_table(results, output_dir):
+    """Create a summary table of all metrics."""
+    print("\nE2E Performance Summary:")
+    print("=" * 100)
+    print(f"{'Method':<12} {'Keep%':<6} {'TTFT(ms)':<10} {'Decode(ms)':<12} {'Total(ms)':<11} {'Throughput(tps)':<15} {'Memory(GB)':<12} {'KV Cache(GB)':<12}")
+    print("=" * 100)
     
-    set_publication_style()
-    plt.rcParams.update({'axes.labelsize': 26})
+    summary_data = []
     
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6), dpi=300)
-    
-    # Filter to methods that have min_layer variation
-    methods_with_variation = []
-    for method in df['method_display'].unique():
-        method_data = df[df['method_display'] == method]
-        if method_data['min_layer_idx'].nunique() > 1:
-            methods_with_variation.append(method)
-    
-    for method in methods_with_variation:
-        method_data = df[df['method_display'] == method]
-        color = METHOD_COLORS.get(method, '#000000')
-        marker = METHOD_MARKERS.get(method, 'o')
-        
-        # Group by keep_rate to show min_layer impact
-        for keep_rate in method_data['keep_rate'].unique():
-            rate_data = method_data[method_data['keep_rate'] == keep_rate]
-            if len(rate_data) > 1:
-                rate_data = rate_data.sort_values('min_layer_idx')
+    for keep_rate in KEEP_RATES:
+        for method in METHODS_ORDER:
+            if method in results and keep_rate in results[method]:
+                data = results[method][keep_rate]
                 
-                label = f"{method} ({keep_rate:.0%})" if keep_rate < 1.0 else f"{method}"
+                ttft = data.get('ttft_ms', 0)
+                decode = data.get('decode_time_ms', 0)
+                total = ttft + decode
+                throughput = data.get('total_throughput_tps', 0)
+                memory = data.get('max_memory_gb', 0)
+                kv_cache = data.get('kv_cache_size_gb', 0)
                 
-                # Plot 1: Throughput vs min_layer_idx
-                ax1.plot(rate_data['min_layer_idx'], rate_data['total_throughput_tps'],
-                        color=color, marker=marker, markersize=8, alpha=0.8,
-                        label=label, markeredgecolor='white', markeredgewidth=1)
+                print(f"{method:<12} {keep_rate*100:<6.0f} {ttft:<10.1f} {decode:<12.1f} {total:<11.1f} {throughput:<15.1f} {memory:<12.1f} {kv_cache:<12.2f}")
                 
-                # Plot 2: Memory vs min_layer_idx
-                ax2.plot(rate_data['min_layer_idx'], rate_data['max_memory_gb'],
-                        color=color, marker=marker, markersize=8, alpha=0.8,
-                        label=label, markeredgecolor='white', markeredgewidth=1)
+                summary_data.append({
+                    'method': method,
+                    'keep_rate': keep_rate,
+                    'ttft_ms': ttft,
+                    'decode_time_ms': decode,
+                    'total_time_ms': total,
+                    'throughput_tps': throughput,
+                    'memory_gb': memory,
+                    'kv_cache_gb': kv_cache
+                })
     
-    # Format left subplot
-    ax1.set_xlabel('Min Layer Index')
-    ax1.set_ylabel('Total Throughput (tokens/s)')
-    ax1.set_title('Throughput vs Min Layer Index')
-    ax1.grid(True, which='major', linestyle=':', linewidth=0.6)
-    ax1.legend(fontsize=14)
+    # Save summary as JSON
+    os.makedirs(output_dir, exist_ok=True)
+    summary_file = os.path.join(output_dir, "e2e_performance_summary.json")
+    with open(summary_file, 'w') as f:
+        json.dump(summary_data, f, indent=2)
     
-    # Format right subplot
-    ax2.set_xlabel('Min Layer Index')
-    ax2.set_ylabel('Peak Memory Usage (GB)')
-    ax2.set_title('Memory vs Min Layer Index')
-    ax2.grid(True, which='major', linestyle=':', linewidth=0.6)
-    ax2.legend(fontsize=14)
+    print(f"\nSaved summary table: {summary_file}")
+
+def generate_debug_data():
+    """Generate dummy data for testing visualization."""
+    results = defaultdict(dict)
     
-    plt.tight_layout()
+    # FullKV baseline (100%) - realistic values for 4K+32 tokens
+    results["FullKV"][1.0] = {
+        "ttft_ms": 850.0, "decode_time_ms": 450.0, "total_throughput_tps": 65.0, 
+        "max_memory_gb": 18.5, "kv_cache_size_gb": 2.8
+    }
     
-    plt.savefig(f"{output_prefix}.pdf", format='pdf', dpi=300, bbox_inches='tight')
-    print(f"Saved min layer analysis to: {output_prefix}.pdf")
-    plt.savefig(f"{output_prefix}.png", format='png', dpi=300, bbox_inches='tight')
-    print(f"Saved min layer analysis to: {output_prefix}.png")
-    plt.close(fig)
+    # Other methods with different keep rates
+    methods_data = {
+        "FastKV": [
+            (0.1, 120.0, 420.0, 70.5, 16.2, 0.28),
+            (0.2, 135.0, 430.0, 68.2, 16.35, 0.56), 
+            (0.4, 150.0, 440.0, 66.8, 16.48, 1.12)
+        ],
+        "GemFilter": [
+            (0.1, 125.0, 435.0, 67.8, 16.1, 0.28),
+            (0.2, 140.0, 445.0, 65.5, 16.25, 0.56),
+            (0.4, 155.0, 455.0, 63.2, 16.4, 1.12)
+        ],
+        "CLAA": [
+            (0.1, 118.0, 415.0, 71.2, 16.15, 0.28),
+            (0.2, 132.0, 425.0, 69.1, 16.3, 0.56),
+            (0.4, 148.0, 435.0, 67.5, 16.45, 1.12)
+        ],
+        "Oracle": [
+            (0.1, 115.0, 410.0, 72.1, 16.0, 0.28),
+            (0.2, 128.0, 420.0, 70.3, 16.2, 0.56),
+            (0.4, 145.0, 430.0, 68.8, 16.35, 1.12)
+        ],
+        "SpecPrefill": [
+            (0.1, 130.0, 485.0, 58.2, 24.8, 0.28),
+            (0.2, 145.0, 495.0, 56.8, 25.2, 0.56),
+            (0.4, 165.0, 510.0, 54.9, 25.7, 1.12)
+        ]
+    }
+    
+    for method, configs in methods_data.items():
+        for keep_rate, ttft, decode, throughput, memory, kv_cache in configs:
+            results[method][keep_rate] = {
+                "ttft_ms": ttft,
+                "decode_time_ms": decode, 
+                "total_throughput_tps": throughput,
+                "max_memory_gb": memory,
+                "kv_cache_size_gb": kv_cache
+            }
+    
+    return results
 
 def main():
     """Main execution function."""
-    parser = argparse.ArgumentParser(description="Visualize E2E benchmark performance")
-    parser.add_argument("--results_path", type=str, 
-                       help="Path to E2E results (JSON file or directory)")
+    import argparse
+    
+    parser = argparse.ArgumentParser(description="Create E2E performance bar charts")
+    parser.add_argument("--results_dir", type=str, default="e2e_results",
+                       help="Directory containing E2E benchmark results")
+    parser.add_argument("--output_dir", type=str, default="figures",
+                       help="Output directory for plots")
     parser.add_argument("--debug", action="store_true",
                        help="Use dummy data for testing")
     
     args = parser.parse_args()
     
-    print("Creating E2E performance visualizations...")
-    
-    # Create output directory
-    output_dir = "figures"
-    os.makedirs(output_dir, exist_ok=True)
+    print("E2E Performance Bar Chart Visualization")
+    print("=" * 50)
     
     if args.debug:
         print("--- Using --debug mode: Generating random dummy data ---")
-        results = generate_dummy_data()
-        df = process_results_to_dataframe(results)
-        print(f"Generated {len(df)} dummy data points")
+        results = generate_debug_data()
+        print(f"Generated data for {len(results)} methods")
     else:
-        if not args.results_path:
-            print("Error: --results_path required (or use --debug)")
+        if not os.path.exists(args.results_dir):
+            print(f"Error: Results directory {args.results_dir} not found")
+            print("Use --debug for testing with dummy data")
             return
-            
-        # Load data
-        results = load_e2e_results(args.results_path)
-        print(f"Loaded {len(results)} E2E benchmark results")
+        
+        results = load_e2e_results(args.results_dir)
         
         if not results:
-            print("Error: No results found!")
+            print("No E2E results found! Use --debug for testing")
             return
-        
-        df = process_results_to_dataframe(results)
-        print(f"Processed {len(df)} data points")
     
-    print(f"Methods found: {list(df['method_display'].unique())}")
-    print(f"Keep rates: {sorted(df['keep_rate'].unique())}")
-    print(f"Min layer indices: {sorted(df['min_layer_idx'].unique())}")
+    # Generate visualizations
+    create_stacked_bar_chart(results, args.output_dir)
+    create_summary_table(results, args.output_dir)
     
-    # Generate plots
-    plot_throughput_vs_memory(df, os.path.join(output_dir, "e2e_throughput_vs_memory"))
-    plot_throughput_vs_kv_cache(df, os.path.join(output_dir, "e2e_throughput_vs_kv_cache"))
-    plot_min_layer_analysis(df, os.path.join(output_dir, "e2e_min_layer_analysis"))
-    
-    # Save combined data
-    csv_file = os.path.join(output_dir, "e2e_combined.csv")
-    df.to_csv(csv_file, index=False)
-    print(f"Saved combined data to: {csv_file}")
-    
-    print("E2E performance visualization completed!")
+    print(f"\nVisualization complete! Check {args.output_dir}/ for results")
 
 if __name__ == "__main__":
     main()
