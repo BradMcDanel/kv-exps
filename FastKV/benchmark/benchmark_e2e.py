@@ -229,7 +229,8 @@ def run_e2e_benchmark(args):
     
     num_generated_tokens = args.num_decode_steps - 1
     decode_throughput = (num_generated_tokens / (mean_decode_time / 1000.0)) if num_generated_tokens > 0 and mean_decode_time > 0 else 0
-    total_throughput = ((args.seqlen + num_generated_tokens) / (mean_e2e_time / 1000.0)) if mean_e2e_time > 0 else 0
+    # E2E throughput should be decode tokens over total time (prefill + decode)
+    total_throughput = (num_generated_tokens / (mean_e2e_time / 1000.0)) if num_generated_tokens > 0 and mean_e2e_time > 0 else 0
     max_memory_gb = torch.cuda.max_memory_allocated() / (1024**3)
 
     # Clean up to release memory before returning
