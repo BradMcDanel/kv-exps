@@ -32,35 +32,26 @@ METHOD_MARKERS = {
 KEEP_RATES_DECIMAL = [0.1, 0.2, 0.4]
 TSP_LAYER = 15
 
-def load_longbench_results(longbench_path):
-    """Load LongBench accuracy results."""
+def load_longbench_results():
+    """Load hardcoded LongBench accuracy results."""
+    # Hardcoded accuracy results
+    accuracy_data = {
+        "fullkv": {1.0: 49.32},
+        "oracle": {0.1: 47.83, 0.2: 48.39, 0.4: 48.88},
+        "gemfilter": {0.1: 37.59, 0.2: 42.29, 0.4: 45.11},
+        "fastkv": {0.1: 46.81, 0.2: 47.33, 0.4: 47.68},
+        "speculative_prefill": {0.1: 41.99, 0.2: 44.57, 0.4: 46.55},
+        "claa": {0.1: 47.13, 0.2: 48.12, 0.4: 48.72}
+    }
+    
+    # Convert to expected format
     results = defaultdict(dict)
+    print("Loading hardcoded LongBench results...")
     
-    def process_folder(folder_name, method_root, keep_rate):
-        results_file = os.path.join(longbench_path, folder_name, "results.json")
-        try:
-            with open(results_file, 'r') as f:
-                method_scores = json.load(f)
-                valid_scores = [v for v in method_scores.values() if isinstance(v, (int, float))]
-                avg_score = sum(valid_scores) / len(valid_scores) if valid_scores else None
-                results[method_root][keep_rate] = {"avg_score": avg_score, "scores": method_scores}
-                print(f"  Loaded {method_root} {keep_rate*100:.0f}%: {avg_score:.2f}")
-        except Exception as e:
-            print(f"  Could not load {folder_name}: {e}")
-    
-    print("Loading LongBench results...")
-    
-    # Process fullkv
-    process_folder("fullkv", "fullkv", 1.0)
-    
-    # Process other methods
-    for rate in KEEP_RATES_DECIMAL:
-        for method_root in ["fastkv", "gemfilter", "speculative_prefill", "claa", "oracle"]:
-            if method_root == "speculative_prefill":
-                folder_name = f"specprefill_{rate}p"
-            else:
-                folder_name = f"{method_root}_l{TSP_LAYER}_{rate}p"
-            process_folder(folder_name, method_root, rate)
+    for method, keep_rates in accuracy_data.items():
+        for keep_rate, accuracy in keep_rates.items():
+            results[method][keep_rate] = {"avg_score": accuracy, "scores": {}}
+            print(f"  Loaded {method} {keep_rate*100:.0f}%: {accuracy:.2f}")
     
     return results
 
@@ -126,7 +117,8 @@ def create_tradeoff_plots(df, output_dir):
     """Create accuracy vs TTFT plot."""
     set_publication_style()
     plt.rcParams.update({
-        'axes.labelsize': 22,
+        'axes.labelsize': 26,
+        'lines.linewidth': 3,
     })
     os.makedirs(output_dir, exist_ok=True)
     
@@ -135,7 +127,7 @@ def create_tradeoff_plots(df, output_dir):
     print(df[['method_display', 'keep_rate_percent', 'ttft_ms']])
     
     # Create single plot
-    fig, ax = plt.subplots(1, 1, figsize=(10, 6), dpi=300)
+    fig, ax = plt.subplots(1, 1, figsize=(7, 6), dpi=300)
     
     for method in df['method_display'].unique():
         method_data = df[df['method_display'] == method]
@@ -144,7 +136,7 @@ def create_tradeoff_plots(df, output_dir):
         
         # Plot accuracy vs TTFT
         ax.scatter(method_data['ttft_ms'], method_data['avg_accuracy'], 
-                   c=color, marker=marker, s=100, alpha=0.8, label=method, 
+                   c=color, marker=marker, s=100, alpha=1.0, label=method, 
                    edgecolors='white', linewidth=1)
         
         # Connect points for each method (except FullKV)
@@ -152,20 +144,29 @@ def create_tradeoff_plots(df, output_dir):
             sorted_data = method_data.sort_values('keep_rate')
             
             ax.plot(sorted_data['ttft_ms'], sorted_data['avg_accuracy'], 
-                    color=color, alpha=0.3, linewidth=2, linestyle='--')
+                    color=color, alpha=1.0, linewidth=2)
         
-        # Add keep rate annotations (only for non-FullKV)
-        for _, row in method_data.iterrows():
-            if method != "FullKV":
+        # Add keep rate annotations only for Oracle points (upper left)
+        if method == "Oracle":
+            for _, row in method_data.iterrows():
                 ax.annotate(f"{row['keep_rate_percent']:.0f}%", 
                            (row['ttft_ms'], row['avg_accuracy']), 
-                           xytext=(5, 5), textcoords='offset points', 
-                           fontsize=9, alpha=0.7)
+                           xytext=(-15, 8), textcoords='offset points', 
+                           fontsize=12, color='black', fontweight='bold')
+        
+        # Add 100% annotation directly under FullKV point
+        if method == "FullKV":
+            for _, row in method_data.iterrows():
+                ax.annotate("100%", 
+                           (row['ttft_ms'], row['avg_accuracy']), 
+                           xytext=(-5, -15), textcoords='offset points', 
+                           fontsize=12, color='black', fontweight='bold', ha='center')
+        
     
     # Format the plot
     ax.set_xlabel('Time to First Token (ms)')
-    ax.set_ylabel('LongBench Accuracy (%)')
-    ax.set_title('Accuracy vs TTFT', fontsize=24)
+    ax.set_ylabel('Accuracy (%)')
+    ax.set_title('LongBench Accuracy vs TTFT', fontsize=24)
     ax.grid(True, which='major', linestyle=':', linewidth=0.6)
     
     # Create custom legend with lines through markers in specified order
@@ -190,11 +191,12 @@ def create_tradeoff_plots(df, output_dir):
             # Other methods have connected points, so line + marker
             legend_elements.append(plt.Line2D([0], [0], marker=marker, color=color,
                                             markerfacecolor=color, markersize=8,
-                                            linestyle='--', linewidth=2, alpha=1.0,
+                                            linestyle='-', linewidth=2, alpha=1.0,
                                             label=method, markeredgecolor='white', 
                                             markeredgewidth=1))
     
-    ax.legend(handles=legend_elements, loc='center right', fontsize=18, 
+    # Place legend in lower right
+    ax.legend(handles=legend_elements, loc='lower right', fontsize=18, 
               frameon=True, facecolor='white', framealpha=0.9)
     
     plt.tight_layout()
@@ -219,11 +221,11 @@ def generate_debug_data():
     
     # Other methods with multiple keep rates (realistic memory values)
     methods_data = {
-        "FastKV": [(0.1, 46.81, 126.87, 16.2), (0.2, 47.33, 140.5, 16.35), (0.4, 47.68, 158.2, 16.48)],
-        "GemFilter": [(0.1, 37.59, 130.22, 16.1), (0.2, 42.29, 145.8, 16.25), (0.4, 45.11, 163.7, 16.4)], 
-        "CLAA": [(0.1, 47.13, 126.75, 16.15), (0.2, 48.12, 141.2, 16.3), (0.4, 48.72, 159.8, 16.45)],
-        "Oracle": [(0.1, 47.83, 127.84, 16.0), (0.2, 48.39, 142.1, 16.2), (0.4, 48.88, 160.4, 16.35)],
-        "SpecPrefill": [(0.1, 41.99, 135.5, 24.8), (0.2, 44.57, 152.3, 25.2), (0.4, 46.55, 171.2, 25.7)]  # Outlier memory usage
+        "FastKV": [(0.1, 46.81, 500, 16.2), (0.2, 47.33, 580, 16.35), (0.4, 47.68, 670, 16.48)],
+        "GemFilter": [(0.1, 37.59, 520, 16.1), (0.2, 42.29, 600, 16.25), (0.4, 45.11, 690, 16.4)], 
+        "CLAA": [(0.1, 47.13, 510, 16.15), (0.2, 48.12, 590, 16.3), (0.4, 48.72, 680, 16.45)],
+        "Oracle": [(0.1, 47.83, 505, 16.0), (0.2, 48.39, 585, 16.2), (0.4, 48.88, 675, 16.35)],
+        "SpecPrefill": [(0.1, 41.99, 530, 24.8), (0.2, 44.57, 610, 25.2), (0.4, 46.55, 700, 25.7)]  # Outlier memory usage
     }
     
     for method, configs in methods_data.items():
@@ -257,12 +259,12 @@ def main():
         df = generate_debug_data()
         print(f"Generated {len(df)} dummy data points")
     else:
-        if not args.longbench_path or not args.ttft_data:
-            print("Error: --longbench_path and --ttft_data required (or use --debug)")
+        if not args.ttft_data:
+            print("Error: --ttft_data required (or use --debug)")
             return
             
         # Load data
-        longbench_results = load_longbench_results(args.longbench_path)
+        longbench_results = load_longbench_results()
         ttft_results = load_ttft_results(args.ttft_data)
         
         print(f"\nFound {len(longbench_results)} methods in LongBench results")
