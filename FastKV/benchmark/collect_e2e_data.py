@@ -67,11 +67,12 @@ def run_e2e_benchmark(mode, model_name, seqlen, num_decode_steps, keep_rate=None
             "--min_layer_idx", "4"
         ])
     elif mode == "oracle" and keep_rate is not None:
-        # Oracle: Same as FastKV (uses dummy indices)
+        # Oracle: Same as FastKV but needs oracle_model parameter
         cmd.extend([
             "--tsp_idx", str(TSP_LAYER),
             "--tsp_len_percentage", str(keep_rate),
-            "--max_capacity_prompt_percentage", str(keep_rate)
+            "--max_capacity_prompt_percentage", str(keep_rate),
+            "--oracle_model", model_name
         ])
     
     print(f"  Command: {' '.join(cmd)}")
