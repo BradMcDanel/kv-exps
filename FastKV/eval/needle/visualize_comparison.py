@@ -101,7 +101,7 @@ def main(args):
         ("gemfilter", "GemFilter"),
         ("fastkv", "FastKV"), 
         ("speculative_prefill", "Speculative Prefill"),
-        ("claa", "CLAA")
+        ("fastkv_dc", "FastKV + DC")
     ]
     
     # Set high-quality plotting parameters
