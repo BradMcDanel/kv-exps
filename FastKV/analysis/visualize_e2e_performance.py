@@ -25,7 +25,7 @@ METHOD_DISPLAY_NAMES = {
 }
 
 KEEP_RATES = [0.1, 0.2, 0.4]  # 10%, 20%, 40%
-METHODS_ORDER = ["FullKV", "Oracle", "FastKV", "CLAA", "GemFilter", "SpecPrefill"]
+METHODS_ORDER = ["FullKV", "Oracle", "GemFilter", "FastKV", "SpecPrefill", "CLAA"]
 
 def load_e2e_results(results_dir):
     """Load E2E benchmark results from JSON files."""
@@ -107,10 +107,11 @@ def create_stacked_bar_chart(results, output_dir):
         # Create stacked bars
         x_pos = np.arange(len(method_names))
         
-        # Bottom bars (prefill time) - solid colors
+        # Bottom bars (prefill time) - solid colors with diagonal hatching
         bars1 = ax.bar(x_pos, ttft_times, bar_width, 
                       color=[METHOD_COLORS[method] for method in method_names], 
-                      alpha=0.9, label='Prefill (TTFT)', linewidth=1, edgecolor='white')
+                      alpha=0.9, label='Prefill (TTFT)', linewidth=1, edgecolor='white',
+                      hatch='//')
         
         # Top bars (decode time) - lighter colors  
         bars2 = ax.bar(x_pos, decode_times, bar_width, bottom=ttft_times,
@@ -131,15 +132,14 @@ def create_stacked_bar_chart(results, output_dir):
                        color='white', bbox=dict(boxstyle='round,pad=0.3', 
                                               facecolor='black', alpha=0.8))
             
-            # Throughput annotation above the bar
+            # Throughput annotation above the bar, moved down
             if total_time > 0:
-                ax.text(i, total_time + max([ttft_times[j] + decode_times[j] for j in range(len(method_names))])*0.05, 
+                ax.text(i, total_time + max([ttft_times[j] + decode_times[j] for j in range(len(method_names))])*0.02, 
                        f'{throughput:.0f}\ntps', 
                        ha='center', va='bottom', fontweight='bold', fontsize=12,
                        color=METHOD_COLORS[method])
         
         # Customize subplot to match other viz scripts
-        ax.set_xlabel('Methods', fontsize=26)
         if idx == 0:
             ax.set_ylabel('Time (ms)', fontsize=26)
         ax.set_title(f'{keep_rate*100:.0f}% Keep Rate', fontsize=28, fontweight='bold')
@@ -147,10 +147,23 @@ def create_stacked_bar_chart(results, output_dir):
         ax.set_xticklabels(method_names, rotation=45, ha='right', fontsize=18)
         ax.grid(True, which='major', linestyle=':', linewidth=0.6)
         
-        # Add legend only to first subplot, matching other scripts
-        if idx == 0:
-            ax.legend(loc='upper left', fontsize=18, frameon=True, 
-                     facecolor='white', framealpha=0.9)
+        # Add more y-axis room for annotations
+        if methods_data:
+            max_total_time = max([d['ttft_ms'] + d['decode_time_ms'] for d in methods_data])
+            ax.set_ylim(0, max_total_time * 1.15)
+        
+    
+    # Add legend at bottom left in single row
+    handles, labels = axes[0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc='lower left', bbox_to_anchor=(0.1, -0.08), 
+               ncol=len(labels), fontsize=18, frameon=True, 
+               facecolor='white', framealpha=0.9)
+    
+    # Add annotation in bottom right, larger and lower
+    fig.text(0.9, -0.05, 'Sequence Length 10k, Decode 32 tokens', 
+             ha='right', va='bottom', fontsize=18, 
+             bbox=dict(boxstyle='round,pad=0.4', facecolor='lightgray', alpha=0.8),
+             transform=fig.transFigure)
     
     plt.tight_layout()
     
